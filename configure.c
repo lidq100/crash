@@ -894,7 +894,13 @@ build_configure(struct supported_gdb_version *sp)
                         fprintf(fp2, "%s\n", sp->GDB);
                         sprintf(target_data.gdb_version, "%s", &sp->GDB[4]);
 		} else if (strncmp(buf, "LDFLAGS=", strlen("LDFLAGS=")) == 0) {
-                       	fprintf(fp2, "LDFLAGS=%s\n", ldflags ? ldflags : "");
+			fprintf(fp2, "LDFLAGS=%s", ldflags ? ldflags : "");
+			if (target == TARGET_ARM64) {
+				fprintf(fp2, "-static -static-libgcc -s -L/lib/x86_64-linux-gnu -lmpfr -lgmp -ldl -lm -ltinfo");
+			} else if (target == TARGET_ARM) {
+				fprintf(fp2, "-static -static-libgcc -s -L/lib/i386-linux-gnu -lmpfr -lgmp -ldl -lm -ltinfo");
+			}
+			fprintf(fp2, "\n");
 		} else
 			fprintf(fp2, "%s", buf);
 

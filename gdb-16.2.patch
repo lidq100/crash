@@ -35,8 +35,35 @@
  LDFLAGS = @LDFLAGS@
  LIBCFLAGS = $(CFLAGS)
  CXXFLAGS = @CXXFLAGS@
+@@ -31593,7 +31599,7 @@
+ 	  $$s/$$module_srcdir/configure \
+ 	  --srcdir=$${topdir}/$$module_srcdir \
+ 	  $(HOST_CONFIGARGS) --build=${build_alias} --host=${host_alias} \
+-	  --target=${target_alias}  \
++	  --target=${target_alias} --enable-static \
+ 	  || exit 1
+ @endif readline
+ 
+@@ -40793,7 +40799,7 @@
+ 	  $$s/$$module_srcdir/configure \
+ 	  --srcdir=$${topdir}/$$module_srcdir \
+ 	  $(HOST_CONFIGARGS) --build=${build_alias} --host=${host_alias} \
+-	  --target=${target_alias} --enable-shared \
++	  --target=${target_alias} --enable-static --disable-shared \
+ 	  || exit 1
+ @endif libcc1
+ 
 --- gdb-16.2/gdb/Makefile.in.orig
 +++ gdb-16.2/gdb/Makefile.in
+@@ -148,7 +148,7 @@ LIBTOOL = @LIBTOOL@
+ # Set this up with gcc if you have gnu ld and the loader will print out
+ # line numbers for undefined references.
+ #CC_LD = g++ -static
+-CC_LD = $(LIBTOOL) $(SILENT_FLAG) --mode=link $(CXX) $(CXX_DIALECT)
++CC_LD = $(LIBTOOL) $(SILENT_FLAG) --mode=link $(CXX) -all-static $(CXX_DIALECT)
+
+ # Where is our "include" directory?  Typically $(srcdir)/../include.
+ # This is essentially the header file directory for the library
 @@ -603,7 +603,7 @@ CONFIG_DEP_SUBDIR = $(addsuffix /$(DEPDIR),$(CONFIG_SRC_SUBDIR))
  # It is also possible that you will need to add -I/usr/include/sys if
  # your system doesn't have fcntl.h in /usr/include (which is where it
@@ -248,6 +275,45 @@
    /* If the input stream is connected to a terminal, turn on editing.
       However, that is only allowed on the main UI, as we can only have
       one instance of readline.  Also, INSTREAM might be nullptr when
+--- gdb-16.2/gdb/f-lang.c.orig	2025-03-24 19:26:48.767422340 +0800
++++ gdb-16.2/gdb/f-lang.c	2025-03-24 19:25:20.085456536 +0800
+@@ -804,6 +804,12 @@
+ 
+ /* A helper function for BINOP_MOD.  */
+ 
++#if defined(__i386__) || defined(_M_IX86)
++static double _fmod(double x, double y) {
++    return x - y * ((int)(x / y));
++}
++#endif
++
+ struct value *
+ eval_op_f_mod (struct type *expect_type, struct expression *exp,
+ 	       enum noside noside,
+@@ -823,7 +829,11 @@
+ 	double d2
+ 	  = target_float_to_host_double (arg2->contents ().data (),
+ 					 arg2->type ());
++#if defined(__i386__) || defined(_M_IX86)
++	double d3 = _fmod (d1, d2);
++#else
+ 	double d3 = fmod (d1, d2);
++#endif
+ 	return value_from_host_double (type, d3);
+       }
+     case TYPE_CODE_INT:
+@@ -948,7 +958,11 @@
+ 	double p
+ 	  = target_float_to_host_double (arg2->contents ().data (),
+ 					 arg2->type ());
++#if defined(__i386__) || defined(_M_IX86)
++	double result = _fmod (a, p);
++#else
+ 	double result = fmod (a, p);
++#endif
+ 	if (result != 0 && (a < 0.0) != (p < 0.0))
+ 	  result += p;
+ 	return value_from_host_double (type, result);
 --- gdb-16.2/gdb/frame.c.orig
 +++ gdb-16.2/gdb/frame.c
 @@ -966,6 +966,10 @@ frame_find_by_id (struct frame_id id)
@@ -1771,6 +1837,17 @@
    if (!have_warned)
      {
        have_warned = 1;
+--- gdb-16.2/gdbserver/Makefile.in.orig
++++ gdb-16.2/gdbserver/Makefile.in
+@@ -83,7 +83,7 @@ 
+ # Set this up with gcc if you have gnu ld and the loader will print out
+ # line numbers for undefinded refs.
+ #CC_LD = g++ -static
+-CC_LD = $(CXX) $(CXX_DIALECT)
++CC_LD = $(CXX) -static $(CXX_DIALECT)
+
+ # Where is the "include" directory?  Traditionally ../include or ./include
+ INCLUDE_DIR = ${srcdir}/../include
 --- gdb-16.2/libiberty/Makefile.in.orig
 +++ gdb-16.2/libiberty/Makefile.in
 @@ -181,6 +181,7 @@ REQUIRED_OFILES =							\
@@ -1891,3 +1968,12 @@
  # Only allow gdbserver on some systems.
  if test -d ${srcdir}/gdbserver; then
      if test x$enable_gdbserver = x; then
+@@ -10404,7 +10404,7 @@ case " $configdirs " in
+   *" lto-plugin "* | *" libcc1 "* | *" gdbserver "*)
+     # When these are to be built as shared libraries, the same applies to
+     # libiberty.
+-    extra_host_libiberty_configure_flags=--enable-shared
++    extra_host_libiberty_configure_flags="--enable-static --disable-shared"
+     ;;
+ esac
+
