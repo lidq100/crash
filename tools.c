@@ -1,8 +1,8 @@
 /* tools.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2013 David Anderson
- * Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2019 David Anderson
+ * Copyright (C) 2002-2019 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,6 +18,11 @@
 #include "defs.h"
 #include <ctype.h>
 
+#ifdef VALGRIND
+#include <valgrind/valgrind.h>
+#include <valgrind/memcheck.h>
+#endif
+
 static void print_number(struct number_option *, int, int);
 static long alloc_hq_entry(void);
 struct hq_entry;
@@ -25,8 +30,56 @@ static void dealloc_hq_entry(struct hq_entry *);
 static void show_options(void);
 static void dump_struct_members(struct list_data *, int, ulong);
 static void rbtree_iteration(ulong, struct tree_data *, char *);
-static void rdtree_iteration(ulong, struct tree_data *, char *, ulong, uint);
-static void dump_struct_members_for_tree(struct tree_data *, int, ulong);
+void dump_struct_members_for_tree(struct tree_data *, int, ulong);
+
+struct req_entry {
+	char *arg, *name, **member;
+	int *is_str, *is_ptr;
+	ulong *width, *offset;
+	int count;
+};
+
+static void print_value(struct req_entry *, unsigned int, ulong, unsigned int);
+struct req_entry *fill_member_offsets(char *);
+void dump_struct_members_fast(struct req_entry *, int, ulong);
+
+FILE *
+set_error(char *target)
+{
+	FILE *tmp_fp = NULL;
+	char *tmp_str = NULL;
+
+	if (STREQ(target, pc->error_path))
+		return pc->error_fp;
+
+	tmp_str = malloc(strlen(target) + 1);
+	if (tmp_str == NULL)
+		return NULL;
+	strcpy(tmp_str, target);
+
+	if (STREQ(target, "default"))
+		tmp_fp = stdout;
+	else if (STREQ(target, "redirect"))
+		tmp_fp = fp;
+	else {
+		tmp_fp = fopen(target, "a");
+		if (tmp_fp == NULL) {
+			error(INFO, "invalid path: %s\n", target);
+			return NULL;
+		}
+	}
+
+	if (pc->error_fp != NULL && pc->error_fp != stdout && pc->error_fp != fp)
+		fclose(pc->error_fp);
+	if (pc->error_path)
+		free(pc->error_path);
+
+	pc->error_fp = tmp_fp;
+	pc->error_path = tmp_str;
+
+	return pc->error_fp;
+}
+
 
 /*
  *  General purpose error reporting routine.  Type INFO prints the message
@@ -48,6 +101,9 @@ __error(int type, char *fmt, ...)
         void *retaddr[NUMBER_STACKFRAMES] = { 0 };
 	va_list ap;
 
+	if (STREQ(pc->error_path, "redirect"))
+		pc->error_fp = fp;
+
 	if (CRASHDEBUG(1) || (pc->flags & DROP_CORE)) {
 		SAVE_RETURN_ADDRESS(retaddr);
 		console("error() trace: %lx => %lx => %lx => %lx\n",
@@ -59,7 +115,7 @@ __error(int type, char *fmt, ...)
         va_end(ap);
 
 	if (!fmt && FATAL_ERROR(type)) {
-		fprintf(stdout, "\n");
+		fprintf(pc->error_fp, "\n");
 		clean_exit(1);
 	}
 
@@ -75,7 +131,8 @@ __error(int type, char *fmt, ...)
 	else
 		spacebuf = NULL;
 
-	if (pc->stdpipe) {
+	if (pc->stdpipe && 
+	    (STREQ(pc->error_path, "default") || STREQ(pc->error_path, "redirect"))) {
 		fprintf(pc->stdpipe, "%s%s%s %s%s", 
 			new_line ? "\n" : "", 
 			type == CONT ? spacebuf : pc->curcmd, 
@@ -85,21 +142,22 @@ __error(int type, char *fmt, ...)
 			buf);
 		fflush(pc->stdpipe);
 	} else { 
-		fprintf(stdout, "%s%s%s %s%s", 
+		fprintf(pc->error_fp, "%s%s%s %s%s",
 			new_line || end_of_line ? "\n" : "",
 			type == WARNING ? "WARNING" : 
 			type == NOTE ? "NOTE" : 
 			type == CONT ? spacebuf : pc->curcmd,
 			type == CONT ? " " : ":",
 			buf, end_of_line ? "\n" : "");
-		fflush(stdout);
+		fflush(pc->error_fp);
 	}
 
-        if ((fp != stdout) && (fp != pc->stdpipe) && (fp != pc->tmpfile)) {
-                fprintf(fp, "%s%s%s %s", new_line ? "\n" : "",
-			type == WARNING ? "WARNING" : 
-			type == NOTE ? "NOTE" : 
-			type == CONT ? spacebuf : pc->curcmd, 
+	if ((STREQ(pc->error_path, "default")) &&
+	    (fp != stdout) && (fp != pc->stdpipe) && (fp != pc->tmpfile)) {
+		fprintf(fp, "%s%s%s %s", new_line ? "\n" : "",
+			type == WARNING ? "WARNING" :
+			type == NOTE ? "NOTE" :
+			type == CONT ? spacebuf : pc->curcmd,
 			type == CONT ? " " : ":",
 			buf);
 		fflush(fp);
@@ -158,7 +216,8 @@ parse_line(char *str, char *argv[])
                 return(0);
 
         i = j = k = 0;
-        string = expression = FALSE;
+        string = FALSE;
+	expression = 0;
 
 	/*
 	 * Special handling for when the first character is a '"'.
@@ -210,11 +269,37 @@ next:
 	                i++;
 	            }
 
-                    if (!string && str[i] == '(') {     
-                        expression = TRUE;
-                    }
-	
-	
+		    /*
+		     *  Make an expression encompassed by a set of parentheses 
+		     *  a single argument.  Also account for embedded sets.
+		     */
+		    if (!string && str[i] == '(') {     
+			argv[j++] = &str[i];
+			expression = 1;
+			while (expression > 0) {
+				i++;
+				switch (str[i])
+				{
+				case '(':
+					expression++;
+					break;
+				case ')':
+					expression--;
+					break;
+				case NULLCHAR:
+				case '\n':
+					expression = -1;
+					break;
+				default:
+					break;
+				}
+			}
+			if (expression == 0) {
+				i++;
+				continue;
+			}
+		    }
+
 	            if (str[i] != NULLCHAR && str[i] != '\n') {
 	                argv[j++] = &str[i];
 	                if (string) {
@@ -224,11 +309,6 @@ next:
 	                        if (str[i] == '"')
 	                                str[i] = ' ';
 	                }
-                        if (expression) {
-                                expression = FALSE;
-                                while (str[i] != ')' && str[i] != NULLCHAR)
-                                        i++;
-                        }
 	                break;
 	            }
 	                        /* else fall through */
@@ -413,9 +493,10 @@ strip_hex(char *line)
  *  Turn a string into upper-case.
  */
 char *
-upper_case(char *s, char *buf)
+upper_case(const char *s, char *buf)
 {
-	char *p1, *p2;
+	const char *p1;
+	char *p2;
 
 	p1 = s;
 	p2 = buf;
@@ -1021,7 +1102,7 @@ int
 decimal(char *s, int count)
 {
     	char *p;
-	int cnt;
+	int cnt, digits;
 
 	if (!count) {
 		strip_line_end(s);
@@ -1029,7 +1110,7 @@ decimal(char *s, int count)
 	} else
 		cnt = count;
 
-    	for (p = &s[0]; *p; p++) {
+    	for (p = &s[0], digits = 0; *p; p++) {
 	        switch(*p)
 	        {
 	            case '0':
@@ -1042,6 +1123,7 @@ decimal(char *s, int count)
 	            case '7':
 	            case '8':
 	            case '9':
+			digits++;
 	            case ' ':
 	                break;
 	            default:
@@ -1052,7 +1134,7 @@ decimal(char *s, int count)
 			break;
     	}
 
-    	return TRUE;
+    	return (digits ? TRUE : FALSE);
 }
 
 /*
@@ -1068,7 +1150,7 @@ extract_hex(char *s, ulong *result, char stripchar, ulong first_instance)
 	ulong value;
 	char *buf;
 
-	buf = GETBUF(strlen(s));
+	buf = GETBUF(strlen(s) + 1);
 	strcpy(buf, s);
 	argc = parse_line(buf, arglist);
 
@@ -1102,7 +1184,7 @@ extract_hex(char *s, ulong *result, char stripchar, ulong first_instance)
 
 
 /*
- *  Determine whether a string contains only printable ASCII characters.
+ *  Determine whether a string contains only ASCII characters.
  */
 int
 ascii_string(char *s)
@@ -1111,6 +1193,22 @@ ascii_string(char *s)
 
         for (p = &s[0]; *p; p++) {
 		if (!ascii(*p)) 
+			return FALSE;
+        }
+
+        return TRUE;
+}
+
+/*
+ *  Check whether a string contains only printable ASCII characters.
+ */
+int
+printable_string(char *s)
+{
+        char *p;
+
+        for (p = &s[0]; *p; p++) {
+		if (!isprint(*p)) 
 			return FALSE;
         }
 
@@ -1126,7 +1224,7 @@ int
 hexadecimal(char *s, int count)
 {
     	char *p;
-	int cnt;
+	int cnt, digits;
 
 	if (!count) {
 		strip_line_end(s);
@@ -1134,7 +1232,7 @@ hexadecimal(char *s, int count)
 	} else
 		cnt = count;
 
-	for (p = &s[0]; *p; p++) {
+	for (p = &s[0], digits = 0; *p; p++) {
         	switch(*p) 
 		{
 	        case 'a':
@@ -1159,6 +1257,7 @@ hexadecimal(char *s, int count)
 	        case '8':
 	        case '9':
 	        case '0':
+			digits++;
 	        case 'x':
 	        case 'X':
 	                break;
@@ -1176,7 +1275,7 @@ hexadecimal(char *s, int count)
 			break;
     	}
 
-    	return TRUE;
+    	return (digits ? TRUE : FALSE);
 }
 
 /*
@@ -1599,10 +1698,13 @@ mkstring(char *s, int size, ulong flags, const char *opt)
 	int left;
 	int right;
 
-	switch (flags & (LONG_DEC|LONG_HEX|INT_HEX|INT_DEC|LONGLONG_HEX|ZERO_FILL)) 
+	switch (flags & (LONG_DEC|SLONG_DEC|LONG_HEX|INT_HEX|INT_DEC|LONGLONG_HEX|ZERO_FILL))
 	{
 	case LONG_DEC:
 		sprintf(s, "%lu", (ulong)opt);
+		break;
+	case SLONG_DEC:
+		sprintf(s, "%ld", (ulong)opt);
 		break;
 	case LONG_HEX:
 		sprintf(s, "%lx", (ulong)opt);
@@ -1769,7 +1871,7 @@ cmd_set(void)
 				return;
 
 			if (ACTIVE()) {
-				set_context(NO_TASK, pc->program_pid);
+				set_context(tt->this_task, NO_PID, TRUE);
 				show_context(CURRENT_CONTEXT());
 				return;
 			}
@@ -1778,7 +1880,7 @@ cmd_set(void)
                 		error(INFO, "no panic task found!\n");
 				return;
 			}
-        		set_context(tt->panic_task, NO_PID);
+			set_context(tt->panic_task, NO_PID, TRUE);
 			show_context(CURRENT_CONTEXT());
 			return;
 
@@ -2297,6 +2399,30 @@ cmd_set(void)
 					*gdb_stop_print_at_null ? "on" : "off");
 			return;
 
+                } else if (STREQ(args[optind], "print_array")) {
+			optind++;
+			if (args[optind]) {
+				if (!runtime)
+					defer();
+				else if (STREQ(args[optind], "on"))
+					*gdb_prettyprint_arrays = 1;
+				else if (STREQ(args[optind], "off"))
+					*gdb_prettyprint_arrays = 0;
+				else if (IS_A_NUMBER(args[optind])) {
+					value = stol(args[optind],
+						FAULT_ON_ERROR, NULL);
+					if (value)
+						*gdb_prettyprint_arrays = 1;
+					else
+						*gdb_prettyprint_arrays = 0;
+					} else
+						goto invalid_set_command;
+			}
+			if (runtime)
+				fprintf(fp, "print_array: %s\n", 
+					*gdb_prettyprint_arrays ? "on" : "off");
+			return;
+
                 } else if (STREQ(args[optind], "namelist")) {
 			optind++;
                         if (!runtime && args[optind]) {
@@ -2363,6 +2489,64 @@ cmd_set(void)
 					"on" : "off");
 			return;
 
+                } else if (STREQ(args[optind], "offline")) {
+
+                        if (args[optind+1]) {
+                                optind++;
+				if (from_rc_file)
+					already_done();
+                                else if (STREQ(args[optind], "show"))
+                                        pc->flags2 &= ~OFFLINE_HIDE;
+                                else if(STREQ(args[optind], "hide"))
+                                        pc->flags2 |= OFFLINE_HIDE;
+                                else
+                                        goto invalid_set_command;
+                        }
+
+			if (runtime)
+				fprintf(fp, "      offline: %s\n",
+					pc->flags2 & OFFLINE_HIDE ? "hide" : "show");
+
+			return;
+
+		} else if (STREQ(args[optind], "redzone")) {
+                        if (args[optind+1]) {
+                                optind++;
+                                if (STREQ(args[optind], "on"))
+                                        pc->flags2 |= REDZONE;
+                                else if (STREQ(args[optind], "off"))
+                                        pc->flags2 &= ~REDZONE;
+                                else if (IS_A_NUMBER(args[optind])) {
+                                        value = stol(args[optind],
+                                                FAULT_ON_ERROR, NULL);
+                                        if (value)
+                                                pc->flags2 |= REDZONE;
+                                        else
+                                                pc->flags2 &= ~REDZONE;
+                                } else
+                                        goto invalid_set_command;
+                        }
+		
+			if (runtime) {
+				fprintf(fp, "redzone: %s\n",
+					pc->flags2 & REDZONE ? 
+					"on" : "off");
+			}
+			return;
+
+                } else if (STREQ(args[optind], "error")) {
+                        if (args[optind+1]) {
+                                optind++;
+                                if (!set_error(args[optind]))
+                                        return;
+                        }
+
+                        if (runtime) {
+                                fprintf(fp, "error: %s\n",
+                                        pc->error_path);
+                        }
+                        return;
+
 		} else if (XEN_HYPER_MODE()) {
 			error(FATAL, "invalid argument for the Xen hypervisor\n");
 		} else if (pc->flags & MINIMAL_MODE) {
@@ -2375,14 +2559,14 @@ cmd_set(void)
 	                case STR_PID:
                                 pid = value;
                                 task = NO_TASK;
-                        	if (set_context(task, pid))
+                                if (set_context(task, pid, TRUE))
                                 	show_context(CURRENT_CONTEXT());
 	                        break;
 	
 	                case STR_TASK:
                                 task = value;
                                 pid = NO_PID;
-                                if (set_context(task, pid))
+                                if (set_context(task, pid, TRUE))
                                         show_context(CURRENT_CONTEXT()); 
 	                        break;
 	
@@ -2447,6 +2631,7 @@ show_options(void)
                 pc->output_radix == 16 ? "hexadecimal" : "unknown");
 	fprintf(fp, "       refresh: %s\n", tt->flags & TASK_REFRESH ? "on" : "off");
 	fprintf(fp, "     print_max: %d\n", *gdb_print_max);
+	fprintf(fp, "   print_array: %s\n", *gdb_prettyprint_arrays ? "on" : "off");
 	fprintf(fp, "       console: %s\n", pc->console ? 
 		pc->console : "(not assigned)");
 	fprintf(fp, "         debug: %ld\n", pc->debug);
@@ -2457,7 +2642,9 @@ show_options(void)
 	fprintf(fp, "      namelist: %s\n", pc->namelist);
 	fprintf(fp, "      dumpfile: %s\n", pc->dumpfile);
 	fprintf(fp, "        unwind: %s\n", kt->flags & DWARF_UNWIND ? "on" : "off");
-	fprintf(fp, " zero_excluded: %s\n", *diskdump_flags & ZERO_EXCLUDED ? "on" : "off");
+	fprintf(fp, " zero_excluded: %s\n",
+		(*diskdump_flags & ZERO_EXCLUDED) || sadump_is_zero_excluded() ?
+		"on" : "off");
 	fprintf(fp, "     null-stop: %s\n", *gdb_stop_print_at_null ? "on" : "off");
 	fprintf(fp, "           gdb: %s\n", pc->flags2 & GDB_CMD_MODE ? "on" : "off");
 	fprintf(fp, "         scope: %lx ", pc->scope);
@@ -2465,6 +2652,9 @@ show_options(void)
 		fprintf(fp, "(%s)\n", value_to_symstr(pc->scope, buf, 0));
 	else
 		fprintf(fp, "(not set)\n");
+	fprintf(fp, "       offline: %s\n", pc->flags2 & OFFLINE_HIDE ? "hide" : "show");
+	fprintf(fp, "       redzone: %s\n", pc->flags2 & REDZONE ? "on" : "off");
+	fprintf(fp, "         error: %s\n", pc->error_path);
 }
 
 
@@ -3153,18 +3343,23 @@ void
 cmd_list(void)
 {
 	int c;
+	long head_member_offset = 0; /* offset for head like denty.d_subdirs */
 	struct list_data list_data, *ld;
 	struct datatype_member struct_member, *sm;
 	struct syment *sp;
-	ulong value; 
+	ulong value, struct_list_offset; 
 
 	sm = &struct_member;
 	ld = &list_data;
 	BZERO(ld, sizeof(struct list_data));
+	struct_list_offset = 0;
 
-        while ((c = getopt(argcnt, args, "Hhrs:e:o:xd")) != EOF) {
+	while ((c = getopt(argcnt, args, "BHhrs:S:e:o:O:xdl:")) != EOF) {
                 switch(c)
 		{
+		case 'B':
+			ld->flags |= LIST_BRENT_ALGO;
+			break;
 		case 'H':
 			ld->flags |= LIST_HEAD_FORMAT;
 			ld->flags |= LIST_HEAD_POINTER;
@@ -3175,13 +3370,44 @@ cmd_list(void)
 			break;
 
 		case 'r':
+			ld->flags |= LIST_HEAD_FORMAT;
 			ld->flags |= LIST_HEAD_REVERSE;
 			break;
 
 		case 's':
-			if (ld->structname_args++ == 0) 
+		case 'S':
+			if (ld->structname_args++ == 0)
 				hq_open();
 			hq_enter((ulong)optarg);
+			ld->flags |= (c == 's') ? LIST_PARSE_MEMBER : LIST_READ_MEMBER;
+			if (count_bits_long(ld->flags & (LIST_PARSE_MEMBER|LIST_READ_MEMBER)) > 1)
+				error(FATAL, "-S and -s options are mutually exclusive\n");
+			break;
+
+		case 'l':
+                        if (IS_A_NUMBER(optarg))
+                                struct_list_offset = stol(optarg,
+                                        FAULT_ON_ERROR, NULL);
+                        else if (arg_to_datatype(optarg,
+                                sm, RETURN_ON_ERROR) > 1)
+                                struct_list_offset = sm->member_offset;
+			else
+				error(FATAL, "invalid -l option: %s\n", 
+					optarg);
+			break;
+
+		case 'O':
+			if (ld->flags & LIST_HEAD_OFFSET_ENTERED)
+				error(FATAL, "offset value %d (0x%lx) already entered\n",
+					head_member_offset, head_member_offset);
+			else if (IS_A_NUMBER(optarg))
+				head_member_offset = stol(optarg, FAULT_ON_ERROR, NULL);
+			else if (arg_to_datatype(optarg, sm, RETURN_ON_ERROR) > 1)
+				head_member_offset = sm->member_offset;
+			else
+				error(FATAL, "invalid -O argument: %s\n", optarg);
+
+			ld->flags |= LIST_HEAD_OFFSET_ENTERED;
 			break;
 
 		case 'o':
@@ -3237,7 +3463,11 @@ cmd_list(void)
 	if (ld->structname_args) {
 		ld->structname = (char **)GETBUF(sizeof(char *) * ld->structname_args);
 		retrieve_list((ulong *)ld->structname, ld->structname_args); 
-		hq_close();
+		hq_close(); 
+		ld->struct_list_offset = struct_list_offset;
+	} else if (struct_list_offset) {
+		error(INFO, "-l option can only be used with -s or -S option\n");
+		cmd_usage(pc->curcmd, SYNOPSIS);
 	}
 
 	while (args[optind]) {
@@ -3365,6 +3595,11 @@ next_arg:
 		cmd_usage(pc->curcmd, SYNOPSIS);
 	}
 
+	if ((ld->flags & LIST_OFFSET_ENTERED) && ld->struct_list_offset) {
+		error(INFO, "-l and -o are mutually exclusive\n");
+                cmd_usage(pc->curcmd, SYNOPSIS);
+	}
+
 	if (ld->flags & LIST_HEAD_FORMAT) {
 		ld->list_head_offset = ld->member_offset;
 		if (ld->flags & LIST_HEAD_REVERSE)
@@ -3380,21 +3615,158 @@ next_arg:
 				fprintf(fp, "(empty)\n");
 				return;
 			}
-		} else
-			ld->start += ld->list_head_offset;
+		} else {
+			if (ld->flags & LIST_HEAD_OFFSET_ENTERED) {
+				if (!ld->end)
+					ld->end = ld->start + head_member_offset;
+				readmem(ld->start + head_member_offset, KVADDR, &ld->start,
+					sizeof(void *), "LIST_HEAD contents", FAULT_ON_ERROR);
+				if (ld->start == ld->end) {
+					fprintf(fp, "(empty)\n");
+					return;
+				}
+			} else
+				ld->start += ld->list_head_offset;
+		}
 	}
 
 	ld->flags &= ~(LIST_OFFSET_ENTERED|LIST_START_ENTERED);
 	ld->flags |= VERBOSE;
 
-	hq_open();
-	c = do_list(ld);
-	hq_close();
+	if (ld->flags & LIST_BRENT_ALGO)
+		c = do_list_no_hash(ld);
+	else {
+		hq_open();
+		c = do_list(ld);
+		hq_close();
+	}
 
         if (ld->structname_args)
 		FREEBUF(ld->structname);
 }
 
+void
+dump_struct_members_fast(struct req_entry *e, int radix, ulong p)
+{
+	unsigned int i;
+	char b[BUFSIZE];
+
+	if (!(e && IS_KVADDR(p)))
+		return;
+
+	if (!radix)
+		radix = *gdb_output_radix;
+
+	for (i = 0; i < e->count; i++) {
+		if (0 < e->width[i] && (e->width[i] <= 8 || e->is_str[i])) {
+			print_value(e, i, p, e->is_ptr[i] ? 16 : radix);
+		} else if (e->width[i] == 0 || e->width[i] > 8) {
+			snprintf(b, BUFSIZE, "%s.%s", e->name, e->member[i]);
+			dump_struct_member(b, p, radix);
+		}
+	}
+}
+
+struct req_entry *
+fill_member_offsets(char *arg)
+{
+	int j;
+	char *p, m;
+	struct req_entry *e;
+	char buf[BUFSIZE];
+
+	if (!(arg && *arg))
+		return NULL;
+
+	j = count_chars(arg, ',') + 1;
+	e = (struct req_entry *)GETBUF(sizeof(*e));
+
+	e->arg = GETBUF(strlen(arg + 1));
+	strcpy(e->arg, arg);
+
+	m = ((p = strchr(e->arg, '.')) != NULL);
+	if (!p++)
+		p = e->arg + strlen(e->arg) + 1;
+
+	e->name = GETBUF(p - e->arg);
+	strncpy(e->name, e->arg, p - e->arg - 1);
+
+	if (!m)
+		return e;
+
+	e->count  = count_chars(p, ',') + 1;
+	e->width  = (ulong *)GETBUF(e->count * sizeof(ulong));
+	e->is_ptr = (int *)GETBUF(e->count * sizeof(int));
+	e->is_str = (int *)GETBUF(e->count * sizeof(int));
+	e->member = (char **)GETBUF(e->count * sizeof(char *));
+	e->offset = (ulong *)GETBUF(e->count * sizeof(ulong));
+
+	replace_string(p, ",", ' ');
+	parse_line(p, e->member);
+
+	for (j = 0; j < e->count; j++) {
+		e->offset[j] = MEMBER_OFFSET(e->name, e->member[j]);
+		if (e->offset[j] == INVALID_OFFSET)
+			e->offset[j] = ANON_MEMBER_OFFSET(e->name, e->member[j]);
+		if (e->offset[j] == INVALID_OFFSET)
+			error(FATAL, "Can't get offset of '%s.%s'\n",
+				e->name, e->member[j]);
+
+		e->is_ptr[j] = MEMBER_TYPE(e->name, e->member[j]) == TYPE_CODE_PTR;
+		e->is_str[j] = is_string(e->name, e->member[j]);
+
+		/* Dirty hack for obtaining size of particular field */
+		snprintf(buf, BUFSIZE, "%s + 1", e->member[j]);
+		e->width[j] = ANON_MEMBER_OFFSET(e->name, buf) - e->offset[j];
+	}
+
+	return e;
+}
+
+static void
+print_value(struct req_entry *e, unsigned int i, ulong addr, unsigned int radix)
+{
+	union { uint64_t v64; uint32_t v32;
+		uint16_t v16; uint8_t v8;
+	} v;
+	char buf[BUFSIZE];
+	struct syment *sym;
+
+	addr += e->offset[i];
+
+	/* Read up to 8 bytes, counters, pointers, etc. */
+	if (e->width[i] <= 8 && !readmem(addr, KVADDR, &v, e->width[i],
+	    "structure value", RETURN_ON_ERROR | QUIET)) {
+		error(INFO, "cannot access member: %s at %lx\n", e->member[i], addr);
+		return;
+	}
+	snprintf(buf, BUFSIZE, "  %%s = %s%%%s%s",
+		 (radix == 16 ? "0x" : ""),
+		 (e->width[i] == 8 ? "l" : ""),
+		 (radix == 16 ? "x" : "u" )
+		);
+
+	switch (e->width[i]) {
+		case 1: fprintf(fp, buf, e->member[i], v.v8); break;
+		case 2: fprintf(fp, buf, e->member[i], v.v16); break;
+		case 4: fprintf(fp, buf, e->member[i], v.v32); break;
+		case 8: fprintf(fp, buf, e->member[i], v.v64); break;
+	}
+
+
+	if (e->is_str[i]) {
+		if (e->is_ptr[i]) {
+			read_string(v.v64, buf, BUFSIZE);
+			fprintf(fp, "  \"%s\"", buf);
+		} else {
+			read_string(addr, buf, e->width[i]);
+			fprintf(fp, "  %s = \"%s\"", e->member[i], buf);
+		}
+	} else if ((sym = value_search(v.v64, 0)) && is_symbol_text(sym))
+		fprintf(fp, " <%s>", sym->name);
+
+	fprintf(fp, "\n");
+}
 
 /*
  *  Does the work for cmd_list() and any other function that requires the
@@ -3403,14 +3775,15 @@ next_arg:
 int
 do_list(struct list_data *ld)
 {
-	ulong next, last, first;
+	ulong next, last, first, offset;
 	ulong searchfor, readflag;
 	int i, count, others, close_hq_on_return;
 	unsigned int radix;
+	struct req_entry **e = NULL;
 
 	if (CRASHDEBUG(1)) {
 		others = 0;
-		console("           flags: %lx (", ld->flags);
+		console("             flags: %lx (", ld->flags);
 		if (ld->flags & VERBOSE)
 			console("%sVERBOSE", others++ ? "|" : "");
 		if (ld->flags & LIST_OFFSET_ENTERED)
@@ -3433,19 +3806,26 @@ do_list(struct list_data *ld)
 			console("%sLIST_STRUCT_RADIX_16", others++ ? "|" : "");
 		if (ld->flags & LIST_ALLOCATE)
 			console("%sLIST_ALLOCATE", others++ ? "|" : "");
+		if (ld->flags & LIST_CALLBACK)
+			console("%sLIST_CALLBACK", others++ ? "|" : "");
+		if (ld->flags & CALLBACK_RETURN)
+			console("%sCALLBACK_RETURN", others++ ? "|" : "");
 		console(")\n");
-		console("           start: %lx\n", ld->start);
-		console("   member_offset: %ld\n", ld->member_offset);
-		console("list_head_offset: %ld\n", ld->list_head_offset);
-		console("             end: %lx\n", ld->end);
-		console("       searchfor: %lx\n", ld->searchfor);
-		console(" structname_args: %lx\n", ld->structname_args);
+		console("             start: %lx\n", ld->start);
+		console("     member_offset: %ld\n", ld->member_offset);
+		console("  list_head_offset: %ld\n", ld->list_head_offset);
+		console("               end: %lx\n", ld->end);
+		console("         searchfor: %lx\n", ld->searchfor);
+		console("   structname_args: %lx\n", ld->structname_args);
 		if (!ld->structname_args)
-			console("      structname: (unused)\n");
+			console("        structname: (unused)\n");
 		for (i = 0; i < ld->structname_args; i++)	
-			console("   structname[%d]: %s\n", i, ld->structname[i]);
-		console("          header: %s\n", ld->header);
-		console("        list_ptr: %lx\n", (ulong)ld->list_ptr);
+			console("     structname[%d]: %s\n", i, ld->structname[i]);
+		console("            header: %s\n", ld->header);
+		console("          list_ptr: %lx\n", (ulong)ld->list_ptr);
+		console("     callback_func: %lx\n", (ulong)ld->callback_func);
+		console("     callback_data: %lx\n", (ulong)ld->callback_data);
+		console("struct_list_offset: %lx\n", ld->struct_list_offset);
 	}
 
 	count = 0;
@@ -3485,6 +3865,14 @@ do_list(struct list_data *ld)
 	if (ld->header)
 		fprintf(fp, "%s", ld->header);
 
+	offset = ld->list_head_offset + ld->struct_list_offset;
+
+	if (ld->structname && (ld->flags & LIST_READ_MEMBER)) {
+		e = (struct req_entry **)GETBUF(sizeof(*e) * ld->structname_args);
+		for (i = 0; i < ld->structname_args; i++)
+			e[i] = fill_member_offsets(ld->structname[i]);
+	}
+
 	while (1) {
 		if (ld->flags & VERBOSE) {
 			fprintf(fp, "%lx\n", next - ld->list_head_offset);
@@ -3494,16 +3882,16 @@ do_list(struct list_data *ld)
 					switch (count_chars(ld->structname[i], '.'))
 					{
 					case 0:
-						dump_struct(ld->structname[i], 
-							next - ld->list_head_offset, radix);
-						break;
-					case 1:
-						dump_struct_members(ld, i, next);
+						dump_struct(ld->structname[i],
+							next - offset, radix);
 						break;
 					default:
-						error(FATAL, 
-						    "invalid structure reference: %s\n",
-							ld->structname[i]);
+						if (ld->flags & LIST_PARSE_MEMBER)
+							dump_struct_members(ld, i, next);
+						else if (ld->flags & LIST_READ_MEMBER)
+							dump_struct_members_fast(e[i],
+								radix, next - offset);
+						break;
 					}
 				}
 			}
@@ -3528,6 +3916,11 @@ do_list(struct list_data *ld)
 		count++;
                 last = next;
 
+		if ((ld->flags & LIST_CALLBACK) &&
+		    ld->callback_func((void *)(next - ld->list_head_offset),
+		    ld->callback_data) && (ld->flags & CALLBACK_RETURN))
+			break;
+
                 if (!readmem(next + ld->member_offset, KVADDR, &next, 
 		    sizeof(void *), "list entry", readflag)) {
 			error(INFO, "\ninvalid list entry: %lx\n", next);
@@ -3537,6 +3930,12 @@ do_list(struct list_data *ld)
 		}
 
 		if (next == 0) {
+			if (ld->flags & LIST_HEAD_FORMAT) {
+				error(INFO, "\ninvalid list entry: 0\n");
+				if (close_hq_on_return)
+					hq_close();
+				return -1;
+			}
 			if (CRASHDEBUG(1))
 				console("do_list end: next:%lx\n", next);
 			break;
@@ -3584,6 +3983,283 @@ do_list(struct list_data *ld)
 	return count;
 }
 
+static void 
+do_list_debug_entry(struct list_data *ld)
+{
+	int i, others;
+
+	if (CRASHDEBUG(1)) {
+		others = 0;
+		console("             flags: %lx (", ld->flags);
+		if (ld->flags & VERBOSE)
+			console("%sVERBOSE", others++ ? "|" : "");
+		if (ld->flags & LIST_OFFSET_ENTERED)
+			console("%sLIST_OFFSET_ENTERED", others++ ? "|" : "");
+		if (ld->flags & LIST_START_ENTERED)
+			console("%sLIST_START_ENTERED", others++ ? "|" : "");
+		if (ld->flags & LIST_HEAD_FORMAT)
+			console("%sLIST_HEAD_FORMAT", others++ ? "|" : "");
+		if (ld->flags & LIST_HEAD_POINTER)
+			console("%sLIST_HEAD_POINTER", others++ ? "|" : "");
+		if (ld->flags & RETURN_ON_DUPLICATE)
+			console("%sRETURN_ON_DUPLICATE", others++ ? "|" : "");
+		if (ld->flags & RETURN_ON_LIST_ERROR)
+			console("%sRETURN_ON_LIST_ERROR", others++ ? "|" : "");
+		if (ld->flags & RETURN_ON_LIST_ERROR)
+			console("%sRETURN_ON_LIST_ERROR", others++ ? "|" : "");
+		if (ld->flags & LIST_STRUCT_RADIX_10)
+			console("%sLIST_STRUCT_RADIX_10", others++ ? "|" : "");
+		if (ld->flags & LIST_STRUCT_RADIX_16)
+			console("%sLIST_STRUCT_RADIX_16", others++ ? "|" : "");
+		if (ld->flags & LIST_ALLOCATE)
+			console("%sLIST_ALLOCATE", others++ ? "|" : "");
+		if (ld->flags & LIST_CALLBACK)
+			console("%sLIST_CALLBACK", others++ ? "|" : "");
+		if (ld->flags & CALLBACK_RETURN)
+			console("%sCALLBACK_RETURN", others++ ? "|" : "");
+		console(")\n");
+		console("             start: %lx\n", ld->start);
+		console("     member_offset: %ld\n", ld->member_offset);
+		console("  list_head_offset: %ld\n", ld->list_head_offset);
+		console("               end: %lx\n", ld->end);
+		console("         searchfor: %lx\n", ld->searchfor);
+		console("   structname_args: %lx\n", ld->structname_args);
+		if (!ld->structname_args)
+			console("        structname: (unused)\n");
+		for (i = 0; i < ld->structname_args; i++)
+			console("     structname[%d]: %s\n", i, ld->structname[i]);
+		console("            header: %s\n", ld->header);
+		console("          list_ptr: %lx\n", (ulong)ld->list_ptr);
+		console("     callback_func: %lx\n", (ulong)ld->callback_func);
+		console("     callback_data: %lx\n", (ulong)ld->callback_data);
+		console("struct_list_offset: %lx\n", ld->struct_list_offset);
+	}
+}
+
+
+static void 
+do_list_output_struct(struct list_data *ld, ulong next, ulong offset,
+				  unsigned int radix, struct req_entry **e)
+{
+	int i;
+
+	for (i = 0; i < ld->structname_args; i++) {
+		switch (count_chars(ld->structname[i], '.'))
+		{
+			case 0:
+				dump_struct(ld->structname[i],
+					    next - offset, radix);
+				break;
+			default:
+				if (ld->flags & LIST_PARSE_MEMBER)
+					dump_struct_members(ld, i, next);
+				else if (ld->flags & LIST_READ_MEMBER)
+					dump_struct_members_fast(e[i],
+						 radix, next - offset);
+				break;
+		}
+	}
+}
+
+static int 
+do_list_no_hash_readmem(struct list_data *ld, ulong *next_ptr,
+				   ulong readflag)
+{
+	if (!readmem(*next_ptr + ld->member_offset, KVADDR, next_ptr,
+		     sizeof(void *), "list entry", readflag)) {
+		error(INFO, "\ninvalid list entry: %lx\n", *next_ptr);
+		return -1;
+	}
+	return 0;
+}
+
+static ulong brent_x; /* tortoise */
+static ulong brent_y; /* hare */
+static ulong brent_r; /* power */
+static ulong brent_lambda; /* loop length */
+static ulong brent_mu; /* distance to start of loop */
+static ulong brent_loop_detect;
+static ulong brent_loop_exit;
+/*
+ * 'ptr': representative of x or y; modified on return
+ */
+static int 
+brent_f(ulong *ptr, struct list_data *ld, ulong readflag)
+{
+       return do_list_no_hash_readmem(ld, ptr, readflag);
+}
+
+/*
+ * Similar to do_list() but without the hash_table or LIST_ALLOCATE.
+ * Useful for the 'list' command and other callers needing faster list
+ * enumeration.
+ */
+int
+do_list_no_hash(struct list_data *ld)
+{
+	ulong next, last, first, offset;
+	ulong searchfor, readflag;
+	int i, count, ret;
+	unsigned int radix;
+	struct req_entry **e = NULL;
+
+	do_list_debug_entry(ld);
+
+	count = 0;
+	searchfor = ld->searchfor;
+	ld->searchfor = 0;
+	if (ld->flags & LIST_STRUCT_RADIX_10)
+		radix = 10;
+	else if (ld->flags & LIST_STRUCT_RADIX_16)
+		radix = 16;
+	else
+		radix = 0;
+	next = ld->start;
+
+	readflag = ld->flags & RETURN_ON_LIST_ERROR ?
+		(RETURN_ON_ERROR|QUIET) : FAULT_ON_ERROR;
+
+	if (!readmem(next + ld->member_offset, KVADDR, &first, sizeof(void *),
+            "first list entry", readflag)) {
+                error(INFO, "\ninvalid list entry: %lx\n", next);
+		return -1;
+	}
+
+	if (ld->header)
+		fprintf(fp, "%s", ld->header);
+
+	offset = ld->list_head_offset + ld->struct_list_offset;
+
+	if (ld->structname && (ld->flags & LIST_READ_MEMBER)) {
+		e = (struct req_entry **)GETBUF(sizeof(*e) * ld->structname_args);
+		for (i = 0; i < ld->structname_args; i++)
+			e[i] = fill_member_offsets(ld->structname[i]);
+	}
+
+	brent_loop_detect = brent_loop_exit = 0;
+	brent_lambda = 0;
+	brent_r = 2;
+	brent_x = brent_y = next;
+	ret = brent_f(&brent_y, ld, readflag);
+	if (ret == -1)
+		return -1;
+	while (1) {
+		if (!brent_loop_detect && ld->flags & VERBOSE) {
+			fprintf(fp, "%lx\n", next - ld->list_head_offset);
+			if (ld->structname) {
+				do_list_output_struct(ld, next, offset, radix, e);
+			}
+		}
+
+                if (next && brent_loop_exit) {
+			if (ld->flags &
+			    (RETURN_ON_DUPLICATE|RETURN_ON_LIST_ERROR)) {
+				error(INFO, "\nduplicate list entry: %lx\n",
+					brent_x);
+				return -1;
+			}
+			error(FATAL, "\nduplicate list entry: %lx\n", brent_x);
+		}
+
+		if ((searchfor == next) ||
+		    (searchfor == (next - ld->list_head_offset)))
+			ld->searchfor = searchfor;
+
+		count++;
+                last = next;
+
+		if ((ld->flags & LIST_CALLBACK) &&
+		    ld->callback_func((void *)(next - ld->list_head_offset),
+		    ld->callback_data) && (ld->flags & CALLBACK_RETURN))
+			break;
+
+		ret = do_list_no_hash_readmem(ld, &next, readflag);
+		if (ret == -1)
+			return -1;
+
+		if (!brent_loop_detect) {
+			if (count > 1 && brent_x == brent_y) {
+				brent_loop_detect = 1;
+				error(INFO, "loop detected, loop length: %ld\n", brent_lambda);
+				/* reset x and y to start; advance y loop length */
+				brent_mu = 0;
+				brent_x = brent_y = ld->start;
+				while (brent_lambda--) {
+					ret = brent_f(&brent_y, ld, readflag);
+					if (ret == -1)
+						return -1;
+				}
+			} else {
+				if (brent_r == brent_lambda) {
+					brent_x = brent_y;
+					brent_r *= 2;
+					brent_lambda = 0;
+				}
+				brent_y = next;
+				brent_lambda++;
+			}
+		} else {
+			if (!brent_loop_exit && brent_x == brent_y) {
+				brent_loop_exit = 1;
+				error(INFO, "length from start to loop: %lx",
+					brent_mu);
+			} else {
+				ret = brent_f(&brent_x, ld, readflag);
+				if (ret == -1)
+					return -1;
+				ret = brent_f(&brent_y, ld, readflag);
+				if (ret == -1)
+					return -1;
+				brent_mu++;
+			}
+		}
+
+		if (next == 0) {
+			if (ld->flags & LIST_HEAD_FORMAT) {
+				error(INFO, "\ninvalid list entry: 0\n");
+				return -1;
+			}
+			if (CRASHDEBUG(1))
+				console("do_list end: next:%lx\n", next);
+
+			break;
+		}
+
+		if (next == ld->end) {
+			if (CRASHDEBUG(1))
+				console("do_list end: next:%lx == end:%lx\n",
+					next, ld->end);
+			break;
+		}
+
+		if (next == ld->start) {
+			if (CRASHDEBUG(1))
+				console("do_list end: next:%lx == start:%lx\n",
+					next, ld->start);
+			break;
+		}
+
+		if (next == last) {
+			if (CRASHDEBUG(1))
+				console("do_list end: next:%lx == last:%lx\n",
+					next, last);
+			break;
+		}
+
+		if ((next == first) && (count != 1)) {
+			if (CRASHDEBUG(1))
+		      console("do_list end: next:%lx == first:%lx (count %d)\n",
+				next, last, count);
+			break;
+		}
+	}
+
+	if (CRASHDEBUG(1))
+		console("do_list count: %d\n", count);
+
+	return count;
+}
+
 /*
  *  Issue a dump_struct_member() call for one or more structure
  *  members.  Multiple members are passed in a comma-separated
@@ -3621,7 +4297,8 @@ dump_struct_members(struct list_data *ld, int idx, ulong next)
 	for (i = 0; i < argc; i++) {
 		*p1 = NULLCHAR;
 		strcat(structname, arglist[i]);
- 		dump_struct_member(structname, next - ld->list_head_offset, radix);
+ 		dump_struct_member(structname, 
+			next - ld->list_head_offset - ld->struct_list_offset, radix);
 	}
 
 	FREEBUF(structname);
@@ -3630,6 +4307,8 @@ dump_struct_members(struct list_data *ld, int idx, ulong next)
 
 #define RADIXTREE_REQUEST (0x1)
 #define RBTREE_REQUEST    (0x2)
+#define XARRAY_REQUEST    (0x4)
+#define MAPLE_REQUEST     (0x8)
 
 void
 cmd_tree()
@@ -3640,6 +4319,7 @@ cmd_tree()
 	struct datatype_member struct_member, *sm;
 	struct syment *sp;
 	ulong value;
+	char *type_name = NULL;
 
 	type_flag = 0;
 	root_offset = 0;
@@ -3647,24 +4327,41 @@ cmd_tree()
 	td = &tree_data;
 	BZERO(td, sizeof(struct tree_data));
 
-	while ((c = getopt(argcnt, args, "xdt:r:o:s:pN")) != EOF) {
+	while ((c = getopt(argcnt, args, "xdt:r:o:s:S:plNv")) != EOF) {
 		switch (c)
 		{
 		case 't':
-			if (type_flag & (RADIXTREE_REQUEST|RBTREE_REQUEST)) {
+			if (type_flag & (RADIXTREE_REQUEST|RBTREE_REQUEST|XARRAY_REQUEST|MAPLE_REQUEST)) {
 				error(INFO, "multiple tree types may not be entered\n");
 				cmd_usage(pc->curcmd, SYNOPSIS);
 			}
 
 			if (STRNEQ(optarg, "ra"))
-				type_flag = RADIXTREE_REQUEST;
-			else if (STRNEQ(optarg, "rb"))
+				if (MEMBER_EXISTS("radix_tree_root", "xa_head")) {
+					type_flag = XARRAY_REQUEST;
+					type_name = "Xarrays";
+				} else {
+					type_flag = RADIXTREE_REQUEST;
+					type_name = "radix trees";
+				}
+			else if (STRNEQ(optarg, "rb")) {
 				type_flag = RBTREE_REQUEST;
-			else {
+				type_name = "rbtrees";
+			} else if (STRNEQ(optarg, "x")) {
+				type_flag = XARRAY_REQUEST;
+				type_name = "Xarrays";
+			} else if (STRNEQ(optarg, "m")) {
+				type_flag = MAPLE_REQUEST;
+				type_name = "maple trees";
+			} else {
 				error(INFO, "invalid tree type: %s\n", optarg);
 				cmd_usage(pc->curcmd, SYNOPSIS);
 			}
 				
+			break;
+
+		case 'l':
+			td->flags |= TREE_LINEAR_ORDER;
 			break;
 
 		case 'r':
@@ -3701,9 +4398,13 @@ cmd_tree()
 			break;
 
 		case 's':
+		case 'S':
 			if (td->structname_args++ == 0) 
 				hq_open();
 			hq_enter((ulong)optarg);
+			td->flags |= (c == 's') ? TREE_PARSE_MEMBER : TREE_READ_MEMBER;
+			if (count_bits_long(td->flags & (TREE_PARSE_MEMBER|TREE_READ_MEMBER)) > 1)
+				error(FATAL, "-S and -s options are mutually exclusive\n");
 			break;
 
 		case 'p':
@@ -3727,6 +4428,9 @@ cmd_tree()
 					"-d and -x are mutually exclusive\n");
 			td->flags |= TREE_STRUCT_RADIX_10;
 			break;
+		case 'v':
+			td->flags |= TREE_STRUCT_VERBOSE;
+			break;
 		default:
 			argerrs++;
 			break;
@@ -3736,12 +4440,21 @@ cmd_tree()
 	if (argerrs)
 		cmd_usage(pc->curcmd, SYNOPSIS);
 
-	if ((type_flag & RADIXTREE_REQUEST) && (td->flags & TREE_NODE_OFFSET_ENTERED))
-		error(FATAL, "-o option is not applicable to radix trees\n");
+	if ((type_flag & (XARRAY_REQUEST|RADIXTREE_REQUEST|MAPLE_REQUEST)) &&
+	    (td->flags & TREE_LINEAR_ORDER))
+		error(FATAL, "-l option is not applicable to %s\n", type_name);
+
+	if ((type_flag & (XARRAY_REQUEST|RADIXTREE_REQUEST|MAPLE_REQUEST)) &&
+	    (td->flags & TREE_NODE_OFFSET_ENTERED))
+		error(FATAL, "-o option is not applicable to %s\n", type_name);
+
+	if ((type_flag & (RBTREE_REQUEST|XARRAY_REQUEST|RADIXTREE_REQUEST)) &&
+	    (td->flags & TREE_STRUCT_VERBOSE))
+		error(FATAL, "-v option is not applicable to %s\n", type_name);
 
 	if ((td->flags & TREE_ROOT_OFFSET_ENTERED) && 
 	    (td->flags & TREE_NODE_POINTER))
-		error(INFO, "-r and -N options are mutually exclusive\n");
+		error(FATAL, "-r and -N options are mutually exclusive\n");
 
 	if (!args[optind]) {
 		error(INFO, "a starting address is required\n");
@@ -3811,9 +4524,30 @@ next_arg:
 		if (td->flags & TREE_STRUCT_RADIX_16)
 			fprintf(fp, "%sTREE_STRUCT_RADIX_16",
 				others++ ? "|" : "");
+		if (td->flags & TREE_PARSE_MEMBER)
+			fprintf(fp, "%sTREE_PARSE_MEMBER",
+				others++ ? "|" : "");
+		if (td->flags & TREE_READ_MEMBER)
+			fprintf(fp, "%sTREE_READ_MEMBER",
+				others++ ? "|" : "");
+		if (td->flags & TREE_LINEAR_ORDER)
+			fprintf(fp, "%sTREE_LINEAR_ORDER",
+				others++ ? "|" : "");
+		if (td->flags & TREE_STRUCT_VERBOSE)
+			fprintf(fp, "%sTREE_STRUCT_VERBOSE",
+				others++ ? "|" : "");
 		fprintf(fp, ")\n");
-		fprintf(fp, "              type: %s\n",
-			type_flag & RADIXTREE_REQUEST ? "radix" : "red-black");
+		fprintf(fp, "              type: ");
+			if (type_flag & RADIXTREE_REQUEST)
+				fprintf(fp, "radix\n");
+			else if (type_flag & XARRAY_REQUEST)
+				fprintf(fp, "xarray\n");
+			else if (type_flag & MAPLE_REQUEST)
+				fprintf(fp, "maple\n");
+			else
+				fprintf(fp, "red-black%s", 
+					type_flag & RBTREE_REQUEST ? 
+					"\n" : " (default)\n");
 		fprintf(fp, "      node pointer: %s\n",
 			td->flags & TREE_NODE_POINTER ? "yes" : "no");
 		fprintf(fp, "             start: %lx\n", td->start);
@@ -3828,6 +4562,10 @@ next_arg:
 	hq_open();
 	if (type_flag & RADIXTREE_REQUEST)
 		do_rdtree(td);
+	else if (type_flag & XARRAY_REQUEST)
+		do_xatree(td);
+	else if (type_flag & MAPLE_REQUEST)
+		do_mptree(td);
 	else
 		do_rbtree(td);
 	hq_close();
@@ -3840,146 +4578,413 @@ static ulong RADIX_TREE_MAP_SHIFT = UNINITIALIZED;
 static ulong RADIX_TREE_MAP_SIZE = UNINITIALIZED;
 static ulong RADIX_TREE_MAP_MASK = UNINITIALIZED;
 
-int
-do_rdtree(struct tree_data *td)
+#define RADIX_TREE_ENTRY_MASK		3UL
+#define RADIX_TREE_INTERNAL_NODE	1UL
+
+static void do_radix_tree_iter(ulong node, uint height, char *path,
+			       ulong index, struct radix_tree_ops *ops)
 {
-	long nlen;
+	uint off;
+
+	if (!hq_enter(node))
+		error(FATAL,
+			"\nduplicate tree node: %lx\n", node);
+
+	for (off = 0; off < RADIX_TREE_MAP_SIZE; off++) {
+		ulong slot;
+		ulong shift = (height - 1) * RADIX_TREE_MAP_SHIFT;
+
+		readmem(node + OFFSET(radix_tree_node_slots) +
+			sizeof(void *) * off, KVADDR, &slot, sizeof(void *),
+			"radix_tree_node.slot[off]", FAULT_ON_ERROR);
+		if (!slot)
+			continue;
+
+		if (slot & RADIX_TREE_INTERNAL_NODE)
+			slot &= ~RADIX_TREE_INTERNAL_NODE;
+
+		if (height == 1)
+			ops->entry(node, slot, path, index | off, ops->private);
+		else {
+			ulong child_index = index | (off << shift);
+			char child_path[BUFSIZE];
+			sprintf(child_path, "%s/%d", path, off);
+			do_radix_tree_iter(slot, height - 1,
+					   child_path, child_index, ops);
+		}
+	}
+}
+
+int do_radix_tree_traverse(ulong ptr, int is_root, struct radix_tree_ops *ops)
+{
+	static ulong max_height = UNINITIALIZED;
 	ulong node_p;
-	uint print_radix, height;
-	char pos[BUFSIZE];
+	long nlen;
+	uint height, is_internal;
+	unsigned char shift;
+	char path[BUFSIZE];
 
 	if (!VALID_STRUCT(radix_tree_root) || !VALID_STRUCT(radix_tree_node) ||
-	    !VALID_MEMBER(radix_tree_root_height) ||
-	    !VALID_MEMBER(radix_tree_root_rnode) ||
-	    !VALID_MEMBER(radix_tree_node_slots) ||
-	    !ARRAY_LENGTH(height_to_maxindex)) 
+	    ((!VALID_MEMBER(radix_tree_root_height) ||
+	      !VALID_MEMBER(radix_tree_root_rnode) ||
+	      !VALID_MEMBER(radix_tree_node_slots) ||
+	      !ARRAY_LENGTH(height_to_maxindex)) &&
+	     (!VALID_MEMBER(radix_tree_root_rnode) ||
+	      !VALID_MEMBER(radix_tree_node_shift) ||
+	      !VALID_MEMBER(radix_tree_node_slots) ||
+	      !ARRAY_LENGTH(height_to_maxnodes))))
 		error(FATAL, "radix trees do not exist or have changed "
 			"their format\n");
 
 	if (RADIX_TREE_MAP_SHIFT == UNINITIALIZED) {
 		if (!(nlen = MEMBER_SIZE("radix_tree_node", "slots")))
-			error(FATAL, "cannot determine length of " 
+			error(FATAL, "cannot determine length of "
 				     "radix_tree_node.slots[] array\n");
 		nlen /= sizeof(void *);
 		RADIX_TREE_MAP_SHIFT = ffsl(nlen) - 1;
 		RADIX_TREE_MAP_SIZE = (1UL << RADIX_TREE_MAP_SHIFT);
 		RADIX_TREE_MAP_MASK = (RADIX_TREE_MAP_SIZE-1);
+
+		if (ARRAY_LENGTH(height_to_maxindex))
+			max_height = ARRAY_LENGTH(height_to_maxindex);
+		else
+			max_height = ARRAY_LENGTH(height_to_maxnodes);
 	}
 
-	if (td->flags & TREE_STRUCT_RADIX_10)
-		print_radix = 10;
-	else if (td->flags & TREE_STRUCT_RADIX_16)
-		print_radix = 16;
-	else
-		print_radix = 0;
+	height = 0;
+	if (!is_root) {
+		node_p = ptr;
 
-	if (td->flags & TREE_NODE_POINTER) {
-		node_p = td->start;
-
-		if (node_p & 1)
-			node_p &= ~1;
+		if (node_p & RADIX_TREE_INTERNAL_NODE)
+			node_p &= ~RADIX_TREE_INTERNAL_NODE;
 
 		if (VALID_MEMBER(radix_tree_node_height)) {
 			readmem(node_p + OFFSET(radix_tree_node_height), KVADDR,
 				&height, sizeof(uint), "radix_tree_node height",
 				FAULT_ON_ERROR);
-
-			if (height > ARRAY_LENGTH(height_to_maxindex)) {
-				fprintf(fp, "radix_tree_node at %lx\n", node_p);
-				dump_struct("radix_tree_node", node_p, print_radix);
-				error(FATAL, "height %d is greater than "
-					"height_to_maxindex[] index %ld\n",
-					height, ARRAY_LENGTH(height_to_maxindex));
-			}
-		} else 
+		} else if (VALID_MEMBER(radix_tree_node_shift)) {
+			readmem(node_p + OFFSET(radix_tree_node_shift), KVADDR,
+				&shift, sizeof(shift), "radix_tree_node shift",
+				FAULT_ON_ERROR);
+			height = (shift / RADIX_TREE_MAP_SHIFT) + 1;
+		} else
 			error(FATAL, "-N option is not supported or applicable"
 				" for radix trees on this architecture or kernel\n");
+		if (height > max_height)
+			goto error_height;
 	} else {
-		readmem(td->start + OFFSET(radix_tree_root_height), KVADDR, &height,
-			sizeof(uint), "radix_tree_root height", FAULT_ON_ERROR);
-
-		if (height > ARRAY_LENGTH(height_to_maxindex)) {
-			fprintf(fp, "radix_tree_root at %lx\n", td->start);
-			dump_struct("radix_tree_root", (ulong)td->start, print_radix);
-			error(FATAL, "height %d is greater than "
-				"height_to_maxindex[] index %ld\n",
-				height, ARRAY_LENGTH(height_to_maxindex));
+		if (VALID_MEMBER(radix_tree_root_height)) {
+			readmem(ptr + OFFSET(radix_tree_root_height), KVADDR, &height,
+				sizeof(uint), "radix_tree_root height", FAULT_ON_ERROR);
 		}
 
-		readmem(td->start + OFFSET(radix_tree_root_rnode), KVADDR, &node_p,
+		readmem(ptr + OFFSET(radix_tree_root_rnode), KVADDR, &node_p,
 			sizeof(void *), "radix_tree_root rnode", FAULT_ON_ERROR);
+		is_internal = (node_p & RADIX_TREE_INTERNAL_NODE);
+		if (node_p & RADIX_TREE_INTERNAL_NODE)
+			node_p &= ~RADIX_TREE_INTERNAL_NODE;
+
+		if (is_internal && VALID_MEMBER(radix_tree_node_shift)) {
+			readmem(node_p + OFFSET(radix_tree_node_shift), KVADDR, &shift,
+				sizeof(shift), "radix_tree_node shift", FAULT_ON_ERROR);
+			height = (shift / RADIX_TREE_MAP_SHIFT) + 1;
+		}
+
+		if (height > max_height) {
+			node_p = ptr;
+			goto error_height;
+		}
 	}
 
-	if (node_p & 1)
-		node_p &= ~1;
+	if (CRASHDEBUG(1)) {
+		fprintf(fp, "radix_tree_node.slots[%ld]\n",
+			RADIX_TREE_MAP_SIZE);
+		fprintf(fp, "max_height %ld: ", max_height);
+		fprintf(fp, "\n");
+		fprintf(fp, "pointer at %lx (is_root? %s):\n",
+			node_p, is_root ? "yes" : "no");
+		if (is_root)
+			dump_struct("radix_tree_root", ptr, RADIX(ops->radix));
+		else
+			dump_struct("radix_tree_node", node_p, RADIX(ops->radix));
+	}
 
-	sprintf(pos, "root");
+	if (height == 0) {
+		strcpy(path, "direct");
+		ops->entry(node_p, node_p, path, 0, ops->private);
+	} else {
+		strcpy(path, "root");
+		do_radix_tree_iter(node_p, height, path, 0, ops);
+	}
 
-	rdtree_iteration(node_p, td, pos, -1, height);
+	return 0;
 
-	return td->count;
+error_height:
+	fprintf(fp, "radix_tree_node at %lx\n", node_p);
+	dump_struct("radix_tree_node", node_p, RADIX(ops->radix));
+	error(FATAL, "height %d is greater than "
+	      "maximum radix tree height index %ld\n",
+	      height, max_height);
+	return -1;
 }
 
-void 
-rdtree_iteration(ulong node_p, struct tree_data *td, char *ppos, ulong indexnum, uint height)
+static ulong XA_CHUNK_SHIFT = UNINITIALIZED;
+static ulong XA_CHUNK_SIZE = UNINITIALIZED;
+static ulong XA_CHUNK_MASK = UNINITIALIZED;
+
+static void 
+do_xarray_iter(ulong node, uint height, char *path,
+	       ulong index, struct xarray_ops *ops)
 {
-	ulong slot;
-	int i, index;
-	uint print_radix;
-	char pos[BUFSIZE];
+	uint off;
 
-	if (indexnum != -1)
-		sprintf(pos, "%s/%ld", ppos, indexnum);
-	else
-		sprintf(pos, "%s", ppos);
+	if (!hq_enter(node))
+		error(FATAL,
+			"\nduplicate tree node: %lx\n", node);
 
-	for (index = 0; index < RADIX_TREE_MAP_SIZE; index++) {
-		readmem((ulong)node_p + OFFSET(radix_tree_node_slots) +
-			sizeof(void *) * index, KVADDR, &slot, sizeof(void *),
-			"radix_tree_node.slot[index]", FAULT_ON_ERROR);
+	for (off = 0; off < XA_CHUNK_SIZE; off++) {
+		ulong slot;
+		ulong shift = (height - 1) * XA_CHUNK_SHIFT;
+
+		readmem(node + OFFSET(xa_node_slots) +
+			sizeof(void *) * off, KVADDR, &slot, sizeof(void *),
+			"xa_node.slots[off]", FAULT_ON_ERROR);
 		if (!slot)
 			continue;
-		if (height == 1) {
-			if (hq_enter(slot))
-				td->count++;
-			else
-				error(FATAL, "\nduplicate tree entry: %lx\n", node_p);
 
-			if (td->flags & VERBOSE)
-				fprintf(fp, "%lx\n",slot);
+		if ((slot & XARRAY_TAG_MASK) == XARRAY_TAG_INTERNAL)
+			slot &= ~XARRAY_TAG_INTERNAL;
 
-			if (td->flags & TREE_POSITION_DISPLAY)
-				fprintf(fp, "  position: %s/%d\n", pos, index);
-
-			if (td->structname) {
-				if (td->flags & TREE_STRUCT_RADIX_10)
-					print_radix = 10;
-				else if (td->flags & TREE_STRUCT_RADIX_16)
-					print_radix = 16;
-				else
-					print_radix = 0;
-
-				for (i = 0; i < td->structname_args; i++) {
-					switch(count_chars(td->structname[i], '.'))
-					{
-					case 0:
-						dump_struct(td->structname[i],
-							slot, print_radix);
-						break;
-					case 1:
-						dump_struct_members_for_tree(td, i,
-							slot);
-						break;
-					default:
-						error(FATAL,
-						  "invalid struct reference: %s\n",
-							td->structname[i]);
-					}
-				}
-			}
-		} else 
-			rdtree_iteration(slot, td, pos, index, height-1);
+		if (height == 1)
+			ops->entry(node, slot, path, index | off, ops->private);
+		else {
+			ulong child_index = index | (off << shift);
+			char child_path[BUFSIZE];
+			sprintf(child_path, "%s/%d", path, off);
+			do_xarray_iter(slot, height - 1,
+					   child_path, child_index, ops);
+		}
 	}
+}
+
+int 
+do_xarray_traverse(ulong ptr, int is_root, struct xarray_ops *ops)
+{
+	ulong node_p;
+	long nlen;
+	uint height, is_internal;
+	unsigned char shift;
+	char path[BUFSIZE];
+
+	if (!VALID_STRUCT(xarray) || !VALID_STRUCT(xa_node) ||
+	      !VALID_MEMBER(xarray_xa_head) ||
+	      !VALID_MEMBER(xa_node_slots) ||
+	      !VALID_MEMBER(xa_node_shift)) 
+		error(FATAL, 
+			"xarray facility does not exist or has changed its format\n");
+
+	if (XA_CHUNK_SHIFT == UNINITIALIZED) {
+		if ((nlen = MEMBER_SIZE("xa_node", "slots")) <= 0)
+			error(FATAL, "cannot determine length of xa_node.slots[] array\n");
+		nlen /= sizeof(void *);
+		XA_CHUNK_SHIFT = ffsl(nlen) - 1;
+		XA_CHUNK_SIZE = (1UL << XA_CHUNK_SHIFT);
+		XA_CHUNK_MASK = (XA_CHUNK_SIZE-1);
+	}
+
+	height = 0;
+	if (!is_root) {
+		node_p = ptr;
+
+		if ((node_p & XARRAY_TAG_MASK) == XARRAY_TAG_INTERNAL)
+			node_p &= ~XARRAY_TAG_MASK;
+
+		if (VALID_MEMBER(xa_node_shift)) {
+			readmem(node_p + OFFSET(xa_node_shift), KVADDR,
+				&shift, sizeof(shift), "xa_node shift",
+				FAULT_ON_ERROR);
+			height = (shift / XA_CHUNK_SHIFT) + 1;
+		} else
+			error(FATAL, "-N option is not supported or applicable"
+				" for xarrays on this architecture or kernel\n");
+	} else {
+		readmem(ptr + OFFSET(xarray_xa_head), KVADDR, &node_p,
+			sizeof(void *), "xarray xa_head", FAULT_ON_ERROR);
+		is_internal = ((node_p & XARRAY_TAG_MASK) == XARRAY_TAG_INTERNAL);
+		if (node_p & XARRAY_TAG_MASK)
+			node_p &= ~XARRAY_TAG_MASK;
+
+		if (is_internal && VALID_MEMBER(xa_node_shift)) {
+			readmem(node_p + OFFSET(xa_node_shift), KVADDR, &shift,
+				sizeof(shift), "xa_node shift", FAULT_ON_ERROR);
+			height = (shift / XA_CHUNK_SHIFT) + 1;
+		}
+	}
+
+	if (CRASHDEBUG(1)) {
+		fprintf(fp, "xa_node.slots[%ld]\n", XA_CHUNK_SIZE);
+		fprintf(fp, "pointer at %lx (is_root? %s):\n",
+			node_p, is_root ? "yes" : "no");
+		if (is_root)
+			dump_struct("xarray", ptr, RADIX(ops->radix));
+		else
+			dump_struct("xa_node", node_p, RADIX(ops->radix));
+	}
+
+	if (height == 0) {
+		strcpy(path, "direct");
+		ops->entry(node_p, node_p, path, 0, ops->private);
+	} else {
+		strcpy(path, "root");
+		do_xarray_iter(node_p, height, path, 0, ops);
+	}
+
+	return 0;
+}
+
+static void do_rdtree_entry(ulong node, ulong slot, const char *path,
+			    ulong index, void *private)
+{
+	struct tree_data *td = private;
+	static struct req_entry **e = NULL;
+	uint print_radix;
+	int i;
+
+	if (!td->count && td->structname_args) {
+		/*
+		 * Retrieve all members' info only once (count == 0)
+		 * After last iteration all memory will be freed up
+		 */
+		e = (struct req_entry **)GETBUF(sizeof(*e) * td->structname_args);
+		for (i = 0; i < td->structname_args; i++)
+			e[i] = fill_member_offsets(td->structname[i]);
+	}
+
+	td->count++;
+
+	if (td->flags & VERBOSE)
+		fprintf(fp, "%lx\n", slot);
+
+	if (td->flags & TREE_POSITION_DISPLAY) {
+		fprintf(fp, "  index: %ld  position: %s/%ld\n", index,
+			path, index & RADIX_TREE_MAP_MASK);
+	}
+
+	if (td->structname) {
+		if (td->flags & TREE_STRUCT_RADIX_10)
+			print_radix = 10;
+		else if (td->flags & TREE_STRUCT_RADIX_16)
+			print_radix = 16;
+		else
+			print_radix = 0;
+
+		for (i = 0; i < td->structname_args; i++) {
+			switch (count_chars(td->structname[i], '.')) {
+			case 0:
+				dump_struct(td->structname[i], slot, print_radix);
+				break;
+			default:
+				if (td->flags & TREE_PARSE_MEMBER)
+					dump_struct_members_for_tree(td, i, slot);
+				else if (td->flags & TREE_READ_MEMBER)
+					dump_struct_members_fast(e[i], print_radix, slot);
+				break;
+			}
+		}
+	}
+}
+
+int do_rdtree(struct tree_data *td)
+{
+	struct radix_tree_ops ops = {
+		.entry		= do_rdtree_entry,
+		.private	= td,
+	};
+	int is_root = !(td->flags & TREE_NODE_POINTER);
+
+	if (td->flags & TREE_STRUCT_RADIX_10)
+		ops.radix = 10;
+	else if (td->flags & TREE_STRUCT_RADIX_16)
+		ops.radix = 16;
+	else
+		ops.radix = 0;
+
+	do_radix_tree_traverse(td->start, is_root, &ops);
+
+	return 0;
+}
+
+
+static void do_xarray_entry(ulong node, ulong slot, const char *path,
+			    ulong index, void *private)
+{
+	struct tree_data *td = private;
+	static struct req_entry **e = NULL;
+	uint print_radix;
+	int i;
+
+	if (!td->count && td->structname_args) {
+		/*
+		 * Retrieve all members' info only once (count == 0)
+		 * After last iteration all memory will be freed up
+		 */
+		e = (struct req_entry **)GETBUF(sizeof(*e) * td->structname_args);
+		for (i = 0; i < td->structname_args; i++)
+			e[i] = fill_member_offsets(td->structname[i]);
+	}
+
+	td->count++;
+
+	if (td->flags & VERBOSE)
+		fprintf(fp, "%lx\n", slot);
+
+	if (td->flags & TREE_POSITION_DISPLAY) {
+		fprintf(fp, "  index: %ld  position: %s/%ld\n", index,
+			path, index & XA_CHUNK_MASK);
+	}
+
+	if (td->structname) {
+		if (td->flags & TREE_STRUCT_RADIX_10)
+			print_radix = 10;
+		else if (td->flags & TREE_STRUCT_RADIX_16)
+			print_radix = 16;
+		else
+			print_radix = 0;
+
+		for (i = 0; i < td->structname_args; i++) {
+			switch (count_chars(td->structname[i], '.')) {
+			case 0:
+				dump_struct(td->structname[i], slot, print_radix);
+				break;
+			default:
+				if (td->flags & TREE_PARSE_MEMBER)
+					dump_struct_members_for_tree(td, i, slot);
+				else if (td->flags & TREE_READ_MEMBER)
+					dump_struct_members_fast(e[i], print_radix, slot);
+				break;
+			}
+		}
+	}
+}
+
+int do_xatree(struct tree_data *td)
+{
+	struct xarray_ops ops = {
+		.entry		= do_xarray_entry,
+		.private	= td,
+	};
+	int is_root = !(td->flags & TREE_NODE_POINTER);
+
+	if (td->flags & TREE_STRUCT_RADIX_10)
+		ops.radix = 10;
+	else if (td->flags & TREE_STRUCT_RADIX_16)
+		ops.radix = 16;
+	else
+		ops.radix = 0;
+
+	do_xarray_traverse(td->start, is_root, &ops);
+
+	return 0;
 }
 
 int
@@ -4011,16 +5016,40 @@ rbtree_iteration(ulong node_p, struct tree_data *td, char *pos)
 {
 	int i;
 	uint print_radix;
-	ulong struct_p, left_p, right_p;
-	char left_pos[BUFSIZE], right_pos[BUFSIZE];
+	ulong struct_p, new_p, test_p;
+	char new_pos[BUFSIZE];
+	static struct req_entry **e;
 
 	if (!node_p)
 		return;
+
+	if (!td->count && td->structname_args) {
+		/*
+		 * Retrieve all members' info only once (count == 0)
+		 * After last iteration all memory will be freed up
+		 */
+		e = (struct req_entry **)GETBUF(sizeof(*e) *
+			td->structname_args);
+		for (i = 0; i < td->structname_args; i++)
+			e[i] = fill_member_offsets(td->structname[i]);
+	}
 
 	if (hq_enter(node_p))
 		td->count++;
 	else
 		error(FATAL, "\nduplicate tree entry: %lx\n", node_p);
+
+	if ((td->flags & TREE_LINEAR_ORDER) &&
+	    readmem(node_p+OFFSET(rb_node_rb_left), KVADDR, &new_p,
+	    sizeof(void *), "rb_node rb_left", RETURN_ON_ERROR) && new_p) {
+		if (readmem(new_p+OFFSET(rb_node_rb_left), KVADDR, &test_p,
+			sizeof(void *), "rb_node rb_left", RETURN_ON_ERROR|QUIET)) {
+			sprintf(new_pos, "%s/l", pos);
+			rbtree_iteration(new_p, td, new_pos);
+		} else
+			error(INFO, "rb_node: %lx: corrupted rb_left pointer: %lx\n",
+					node_p, new_p);
+	}
 
 	struct_p = node_p - td->node_member_offset;
 
@@ -4044,26 +5073,39 @@ rbtree_iteration(ulong node_p, struct tree_data *td, char *pos)
 			case 0:
 				dump_struct(td->structname[i], struct_p, print_radix);
 				break;
-			case 1:
-				dump_struct_members_for_tree(td, i, struct_p);
-				break;
 			default:
-				error(FATAL, "invalid struct reference: %s\n",
-					td->structname[i]);
+				if (td->flags & TREE_PARSE_MEMBER)
+					dump_struct_members_for_tree(td, i, struct_p);
+				else if (td->flags & TREE_READ_MEMBER)
+					dump_struct_members_fast(e[i], print_radix,
+						struct_p);
+				break;
 			}
 		}
 	}
 
-	readmem(node_p+OFFSET(rb_node_rb_left), KVADDR, &left_p,
-		sizeof(void *), "rb_node rb_left", FAULT_ON_ERROR);
-	readmem(node_p+OFFSET(rb_node_rb_right), KVADDR, &right_p,
-		sizeof(void *), "rb_node rb_right", FAULT_ON_ERROR);
+	if (!(td->flags & TREE_LINEAR_ORDER) &&
+	    readmem(node_p+OFFSET(rb_node_rb_left), KVADDR, &new_p,
+	    sizeof(void *), "rb_node rb_left", RETURN_ON_ERROR) && new_p) {
+		if (readmem(new_p+OFFSET(rb_node_rb_left), KVADDR, &test_p,
+			sizeof(void *), "rb_node rb_left", RETURN_ON_ERROR|QUIET)) {
+			sprintf(new_pos, "%s/l", pos);
+			rbtree_iteration(new_p, td, new_pos);
+		} else
+			error(INFO, "rb_node: %lx: corrupted rb_left pointer: %lx\n",
+					node_p, new_p);
+	}
 
-	sprintf(left_pos, "%s/l", pos);
-	sprintf(right_pos, "%s/r", pos);
-
-	rbtree_iteration(left_p, td, left_pos);
-	rbtree_iteration(right_p, td, right_pos);		
+	if (readmem(node_p+OFFSET(rb_node_rb_right), KVADDR, &new_p,
+	    sizeof(void *), "rb_node rb_right", RETURN_ON_ERROR) && new_p) {
+		if (readmem(new_p+OFFSET(rb_node_rb_left), KVADDR, &test_p,
+			sizeof(void *), "rb_node rb_left", RETURN_ON_ERROR|QUIET)) {
+			sprintf(new_pos, "%s/r", pos);
+			rbtree_iteration(new_p, td, new_pos);
+		} else
+			error(INFO, "rb_node: %lx: corrupted rb_right pointer: %lx\n",
+					node_p, new_p);
+	}
 }
 
 void
@@ -4126,9 +5168,9 @@ dump_struct_members_for_tree(struct tree_data *td, int idx, ulong struct_p)
 #define HASH_QUEUE_CLOSED     (0x8)
 
 #define HQ_ENTRY_CHUNK   (1024)
-#define NR_HASH_QUEUES   (HQ_ENTRY_CHUNK/8)
+#define NR_HASH_QUEUES_DEFAULT   (32768UL)
 #define HQ_SHIFT         (machdep->pageshift)
-#define HQ_INDEX(X)      (((X) >> HQ_SHIFT) % NR_HASH_QUEUES)
+#define HQ_INDEX(X)      (((X) >> HQ_SHIFT) % pc->nr_hash_queues)
 
 struct hq_entry {
         int next;
@@ -4143,7 +5185,7 @@ struct hq_head {
 
 struct hash_table {
 	ulong flags;
-	struct hq_head queue_heads[NR_HASH_QUEUES];
+	struct hq_head *queue_heads;
 	struct hq_entry *memptr;
 	long count;
 	long index;
@@ -4160,6 +5202,18 @@ hq_init(void)
 	struct hash_table *ht;
 
 	ht = &hash_table;
+
+	if (pc->nr_hash_queues == 0)
+		pc->nr_hash_queues = NR_HASH_QUEUES_DEFAULT;
+
+        if ((ht->queue_heads = (struct hq_head *)malloc(pc->nr_hash_queues *
+	    sizeof(struct hq_head))) == NULL) {
+		error(INFO, "cannot malloc memory for hash queue heads: %s\n",
+			strerror(errno));
+		ht->flags = HASH_QUEUE_NONE;
+		pc->flags &= ~HASH;
+		return;
+	}
 
         if ((ht->memptr = (struct hq_entry *)malloc(HQ_ENTRY_CHUNK * 
 	    sizeof(struct hq_entry))) == NULL) {
@@ -4241,7 +5295,7 @@ hq_open(void)
 		return FALSE;
 
 	ht->flags &= ~(HASH_QUEUE_FULL|HASH_QUEUE_CLOSED);
-	BZERO(ht->queue_heads, sizeof(struct hq_head) * NR_HASH_QUEUES);
+	BZERO(ht->queue_heads, sizeof(struct hq_head) * pc->nr_hash_queues);
 	BZERO(ht->memptr, ht->count * sizeof(struct hq_entry));
 	ht->index = 0;
 
@@ -4403,7 +5457,7 @@ dump_hash_table(int verbose)
         if (ht->flags & HASH_QUEUE_FULL)
                 fprintf(fp, "%sHASH_QUEUE_FULL", others++ ? "|" : "");
 	fprintf(fp, ")\n");
-	fprintf(fp, "   queue_heads[%d]: %lx\n", NR_HASH_QUEUES, 
+	fprintf(fp, "  queue_heads[%ld]: %lx\n", pc->nr_hash_queues, 
 		(ulong)ht->queue_heads);
 	fprintf(fp, "             memptr: %lx\n", (ulong)ht->memptr);
 	fprintf(fp, "              count: %ld  ", ht->count);
@@ -4416,7 +5470,7 @@ dump_hash_table(int verbose)
 	minq = ~(0);
 	maxq = 0;
 
-	for (i = 0; i < NR_HASH_QUEUES; i++) {
+	for (i = 0; i < pc->nr_hash_queues; i++) {
                	if (ht->queue_heads[i].next == 0) {
 			minq = 0;
                        	continue;
@@ -4448,8 +5502,8 @@ dump_hash_table(int verbose)
 	if (elements != ht->index)
         	fprintf(fp, "     elements found: %ld (expected %ld)\n", 
 			elements, ht->index);
-        fprintf(fp, "      queues in use: %ld of %d\n", queues_in_use, 
-		NR_HASH_QUEUES);
+        fprintf(fp, "      queues in use: %ld of %ld\n", queues_in_use, 
+		pc->nr_hash_queues);
 	fprintf(fp, " queue length range: %d to %d\n", minq, maxq);
 
 	if (verbose) {
@@ -4690,8 +5744,21 @@ buf_init(void)
 
 	bp->smallest = 0x7fffffff; 
 	bp->total = 0.0;
-}
 
+#ifdef VALGRIND
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_1K, sizeof(bp->buf_1K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_2K, sizeof(bp->buf_2K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_4K, sizeof(bp->buf_4K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_8K, sizeof(bp->buf_8K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_32K, sizeof(bp->buf_32K));
+
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_1K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_2K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_4K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_8K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_32K, 0, 1);
+#endif
+}
 
 /*
  *  Free up all buffers used by the last command.
@@ -4715,11 +5782,29 @@ void free_all_bufs(void)
 		}
 	}
 
-	if (bp->mallocs != bp->frees) {
-		dump_shared_bufs();
-		error(FATAL, "malloc-free mismatch (%ld-%ld)\n",
+	if (bp->mallocs != bp->frees)
+		error(WARNING, "malloc/free mismatch (%ld/%ld)\n",
 			bp->mallocs, bp->frees);
-	}
+
+#ifdef VALGRIND
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_1K);
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_2K);
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_4K);
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_8K);
+	VALGRIND_DESTROY_MEMPOOL(&bp->buf_32K);
+
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_1K, sizeof(bp->buf_1K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_2K, sizeof(bp->buf_2K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_4K, sizeof(bp->buf_4K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_8K, sizeof(bp->buf_8K));
+	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_32K, sizeof(bp->buf_32K));
+
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_1K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_2K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_4K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_8K, 0, 1);
+	VALGRIND_CREATE_MEMPOOL(&bp->buf_32K, 0, 1);
+#endif
 }
 
 /*
@@ -4744,6 +5829,9 @@ freebuf(char *addr)
 	for (i = 0; i < NUMBER_1K_BUFS; i++) {
 		if (addr == (char *)&bp->buf_1K[i]) {
 			bp->buf_inuse[B1K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_1K, addr);
+#endif
 			return;
 		}
 	}
@@ -4751,6 +5839,9 @@ freebuf(char *addr)
 	for (i = 0; i < NUMBER_2K_BUFS; i++) {
 		if (addr == (char *)&bp->buf_2K[i]) {
 			bp->buf_inuse[B2K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_2K, addr);
+#endif
 			return;
 		}
 	}
@@ -4758,6 +5849,9 @@ freebuf(char *addr)
 	for (i = 0; i < NUMBER_4K_BUFS; i++) {
 		if (addr == (char *)&bp->buf_4K[i]) {
 			bp->buf_inuse[B4K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_4K, addr);
+#endif
 			return;
 		}
 	}
@@ -4765,6 +5859,9 @@ freebuf(char *addr)
 	for (i = 0; i < NUMBER_8K_BUFS; i++) {
 		if (addr == (char *)&bp->buf_8K[i]) {
 			bp->buf_inuse[B8K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_8K, addr);
+#endif
 			return;
 		}
 	}
@@ -4772,6 +5869,9 @@ freebuf(char *addr)
         for (i = 0; i < NUMBER_32K_BUFS; i++) {
                 if (addr == (char *)&bp->buf_32K[i]) {
                         bp->buf_inuse[B32K] &= ~(1 << i);
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_FREE(&bp->buf_32K, addr);
+#endif
                         return;
                 }
         }
@@ -4866,8 +5966,8 @@ dump_shared_bufs(void)
 	fprintf(fp, "  max_embedded: %ld\n", bp->max_embedded);
 	fprintf(fp, "       mallocs: %ld\n", bp->mallocs);
 	fprintf(fp, "         frees: %ld\n", bp->frees);
-	fprintf(fp, "    reqs/total: %ld/%.1f\n", bp->reqs, bp->total);
-	fprintf(fp, "  average size: %.1f\n", bp->total/bp->reqs);
+	fprintf(fp, "    reqs/total: %ld/%.0f\n", bp->reqs, bp->total);
+	fprintf(fp, "  average size: %.0f\n", bp->total/bp->reqs);
 }
 
 /*
@@ -4937,6 +6037,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B1K] |= (1 << bdx);
 			bp->buf_1K_maxuse = MAX(bp->buf_1K_maxuse, 
 				count_bits_int(bp->buf_inuse[B1K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_1K, bufp, 1024);
+#endif
                         BZERO(bufp, 1024);
                         return(bufp);
                 }
@@ -4951,6 +6054,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B2K] |= (1 << bdx);
                         bp->buf_2K_maxuse = MAX(bp->buf_2K_maxuse,
                                 count_bits_int(bp->buf_inuse[B2K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_2K, bufp, 2048);
+#endif
                         BZERO(bufp, 2048);
                         return(bufp);
                 }
@@ -4965,6 +6071,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B4K] |= (1 << bdx);
                         bp->buf_4K_maxuse = MAX(bp->buf_4K_maxuse,
                                 count_bits_int(bp->buf_inuse[B4K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_4K, bufp, 4096);
+#endif
                         BZERO(bufp, 4096);
                         return(bufp);
                 }
@@ -4979,6 +6088,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B8K] |= (1 << bdx);
                         bp->buf_8K_maxuse = MAX(bp->buf_8K_maxuse,
                                 count_bits_int(bp->buf_inuse[B8K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_8K, bufp, 8192);
+#endif
                         BZERO(bufp, 8192);
                         return(bufp);
                 }
@@ -4993,6 +6105,9 @@ getbuf(long reqsize)
                         bp->buf_inuse[B32K] |= (1 << bdx);
                         bp->buf_32K_maxuse = MAX(bp->buf_32K_maxuse,
                                 count_bits_int(bp->buf_inuse[B32K]));
+#ifdef VALGRIND
+			VALGRIND_MEMPOOL_ALLOC(&bp->buf_32K, bufp, 32768);
+#endif
                         BZERO(bufp, 32768);
                         return(bufp);
                 }
@@ -5004,8 +6119,7 @@ getbuf(long reqsize)
 		if (bp->malloc_bp[i])
 			continue;
 
-		if ((bp->malloc_bp[i] = (char *)malloc(reqsize))) {
-			BZERO(bp->malloc_bp[i], reqsize);
+		if ((bp->malloc_bp[i] = (char *)calloc(reqsize, 1))) {
 			bp->mallocs++;
 			return(bp->malloc_bp[i]);
 		}
@@ -5036,6 +6150,19 @@ resizebuf(char *oldbuf, long oldsize, long newsize)
 	FREEBUF(oldbuf);
 
 	return newbuf;
+}
+
+/*
+ *  Duplicate a string into a buffer allocated with GETBUF().
+ */
+char *
+strdupbuf(char *oldstring)
+{
+	char *newstring;
+
+	newstring = GETBUF(strlen(oldstring)+1);
+	strcpy(newstring, oldstring);
+	return newstring;
 }
 
 /*
@@ -5121,7 +6248,7 @@ lowest_bit_long(ulong val)
 void
 drop_core(char *s)
 {
-	volatile int *nullptr;
+	volatile int *ptr;
 	int i ATTRIBUTE_UNUSED;
 
 	if (s && ascii_string(s))
@@ -5129,9 +6256,9 @@ drop_core(char *s)
 
 	kill((pid_t)pc->program_pid, 3);
 
-	nullptr = NULL;
+	ptr = NULL;
 	while (TRUE)
-		i = *nullptr;
+		i = *ptr;
 }
 
 
@@ -5146,7 +6273,7 @@ drop_core(char *s)
  *  The first time it's called, the device will be opened.
  */
 int
-console(char *fmt, ...)
+console(const char *fmt, ...)
 {
         char output[BUFSIZE*2];
 	va_list ap;
@@ -5319,6 +6446,38 @@ convert_time(ulonglong count, char *buf)
 }
 
 /*
+ * Convert a calendar time into a null-terminated string like ctime(), but
+ * the result string contains the time zone string and does not ends with a
+ * linefeed ('\n').  If localtime() or strftime() fails, fails back to return
+ * POSIX time (seconds since the Epoch) or ctime() string respectively.
+ *
+ * NOTE: The return value points to a statically allocated string which is
+ * overwritten by subsequent calls.
+ */
+char *
+ctime_tz(time_t *timep)
+{
+	static char buf[64];
+	struct tm *tm;
+	size_t size;
+
+	if (!timep)
+		return NULL;
+
+	tm = localtime(timep);
+	if (!tm) {
+		snprintf(buf, sizeof(buf), "%ld", *timep);
+		return buf;
+	}
+
+	size = strftime(buf, sizeof(buf), "%a %b %e %T %Z %Y", tm);
+	if (!size)
+		return strip_linefeeds(ctime(timep));
+
+	return buf;
+}
+
+/*
  *  Stall for a number of microseconds.
  */
 void
@@ -5340,7 +6499,7 @@ char *
 pages_to_size(ulong pages, char *buf)
 {
 	double total;
-	char *p1, *p2;
+	char *p;
 
 	if (pages == 0) {
 		sprintf(buf, "0");
@@ -5356,11 +6515,8 @@ pages_to_size(ulong pages, char *buf)
         else
         	sprintf(buf, "%ld KB", (ulong)(total/(double)KILOBYTES(1)));
 
-	if ((p1 = strstr(buf, ".0 "))) {
-		p2 = p1 + 3;
-		*p1++ = ' ';
-		strcpy(p1, p2);
-	}
+	if ((p = strstr(buf, ".0 ")))
+		memmove(p, p + 2, sizeof(" GB"));
 
 	return buf;
 }
@@ -5492,12 +6648,12 @@ endian_mismatch(char *file, char dumpfile_endian, ulong query)
 	case ELFDATA2LSB:
 		if (__BYTE_ORDER == __LITTLE_ENDIAN)
 			return FALSE;
-		endian = "big-endian";
+		endian = "little-endian";
 		break;
 	case ELFDATA2MSB:
 		if (__BYTE_ORDER == __BIG_ENDIAN)	
 			return FALSE;
-		endian = "little-endian";
+		endian = "big-endian";
 		break;
 	default:
 		endian = "unknown";	
@@ -5539,6 +6695,22 @@ swap32(uint32_t val, int swap)
 		return val;
 }
 
+uint64_t
+swap64(uint64_t val, int swap)
+{
+	if (swap)
+		return (((val & 0x00000000000000ffULL) << 56) |
+			((val & 0x000000000000ff00ULL) << 40) |
+			((val & 0x0000000000ff0000ULL) << 24) |
+			((val & 0x00000000ff000000ULL) <<  8) |
+			((val & 0x000000ff00000000ULL) >>  8) |
+			((val & 0x0000ff0000000000ULL) >> 24) |
+			((val & 0x00ff000000000000ULL) >> 40) |
+			((val & 0xff00000000000000ULL) >> 56));
+	else
+		return val;
+}
+
 /*
  *  Get a sufficiently large buffer for cpumask.
  *  You should call FREEBUF() on the result when you no longer need it.
@@ -5546,24 +6718,31 @@ swap32(uint32_t val, int swap)
 ulong *
 get_cpumask_buf(void)
 {
-	int cpulen;
-	if ((cpulen = STRUCT_SIZE("cpumask_t")) < 0)
-		cpulen = DIV_ROUND_UP(kt->cpus, BITS_PER_LONG) * sizeof(ulong);
+	int cpulen, len_cpumask;
+
+	cpulen = DIV_ROUND_UP(kt->cpus, BITS_PER_LONG) * sizeof(ulong);
+	len_cpumask = VALID_SIZE(cpumask_t) ? SIZE(cpumask_t) : 0;
+	if (len_cpumask > 0)
+		cpulen = len_cpumask > cpulen ? cpulen : len_cpumask;
+
 	return (ulong *)GETBUF(cpulen);
 }
 
 int
 make_cpumask(char *s, ulong *mask, int flags, int *errptr)
 {
-	char *p, *q;
+	char *p, *q, *orig;
 	int start, end;
 	int i;
 
 	if (s == NULL) {
 		if (!(flags & QUIET))
-			error(INFO, "received NULL string\n");
+			error(INFO, "make_cpumask: received NULL string\n");
+		orig = NULL;
 		goto make_cpumask_error;
 	}
+
+	orig = strdup(s);
 
 	p = strtok(s, ",");
 	while (p) {
@@ -5582,6 +6761,11 @@ make_cpumask(char *s, ulong *mask, int flags, int *errptr)
 			if (end == -1)
 				end = start;
 		}
+		if ((start < 0) || (start >= kt->cpus) || 
+		    (end < 0) || (end >= kt->cpus)) {
+			error(INFO, "invalid cpu specification: %s\n", orig);
+			goto make_cpumask_error;
+		}
 
 		for (i = start; i <= end; i++)
 			SET_BIT(mask, i);
@@ -5589,9 +6773,13 @@ make_cpumask(char *s, ulong *mask, int flags, int *errptr)
 		p = strtok(s, ",");
 	}
 
+	free(orig);
+
 	return TRUE;
 
 make_cpumask_error:
+	free(orig);
+
 	switch (flags & (FAULT_ON_ERROR|RETURN_ON_ERROR))
 	{
 	case FAULT_ON_ERROR:
@@ -5612,7 +6800,7 @@ make_cpumask_error:
  * always be NULL-terminated.
  */
 size_t 
-strlcpy(char *dest, char *src, size_t size)
+strlcpy(char *dest, const char *src, size_t size)
 {
 	size_t ret = strlen(src);
 
@@ -5751,4 +6939,75 @@ rb_last(struct rb_root *root)
 	}
 
 	return node;
+}
+
+long
+percpu_counter_sum_positive(ulong fbc)
+{
+	int i, count;
+	ulong addr;
+	long ret;
+
+	if (INVALID_MEMBER(percpu_counter_count))
+		return 0;
+
+	readmem(fbc + OFFSET(percpu_counter_count), KVADDR, &ret,
+		sizeof(long long), "percpu_counter.count", FAULT_ON_ERROR);
+
+	if (INVALID_MEMBER(percpu_counter_counters)) /* !CONFIG_SMP */
+		return (ret < 0) ? 0 : ret;
+
+	readmem(fbc + OFFSET(percpu_counter_counters), KVADDR, &addr,
+		sizeof(void *), "percpu_counter.counters", FAULT_ON_ERROR);
+
+	for (i = 0; i < kt->cpus; i++) {
+		readmem(addr + kt->__per_cpu_offset[i], KVADDR, &count,
+			sizeof(int), "percpu_counter.counters count", FAULT_ON_ERROR);
+		ret += count;
+	}
+
+	return (ret < 0) ? 0 : ret;
+}
+
+ulong
+get_subsys_private(char *kset_name, char *target_name)
+{
+	ulong kset_addr, kset_list, name_addr, private = 0;
+	struct list_data list_data, *ld;
+	char buf[32];
+	int i, cnt;
+
+	if (!symbol_exists(kset_name))
+		return 0;
+
+	ld = &list_data;
+	BZERO(ld, sizeof(struct list_data));
+
+	get_symbol_data(kset_name, sizeof(ulong), &kset_addr);
+	readmem(kset_addr + OFFSET(kset_list), KVADDR, &kset_list,
+		sizeof(ulong), "kset.list", FAULT_ON_ERROR);
+
+	ld->flags |= LIST_ALLOCATE;
+	ld->start = kset_list;
+	ld->end = kset_addr + OFFSET(kset_list);
+	ld->list_head_offset = OFFSET(kobject_entry);
+
+	cnt = do_list(ld);
+
+	for (i = 0; i < cnt; i++) {
+		readmem(ld->list_ptr[i] + OFFSET(kobject_name), KVADDR, &name_addr,
+			sizeof(ulong), "kobject.name", FAULT_ON_ERROR);
+		read_string(name_addr, buf, sizeof(buf)-1);
+		if (CRASHDEBUG(1))
+			fprintf(fp, "kobject: %lx name: %s\n", ld->list_ptr[i], buf);
+		if (STREQ(buf, target_name)) {
+			/* entry is subsys_private.subsys.kobj. See bus_to_subsys(). */
+			private = ld->list_ptr[i] - OFFSET(kset_kobj)
+					- OFFSET(subsys_private_subsys);
+			break;
+		}
+	}
+	FREEBUF(ld->list_ptr);
+
+	return private;
 }

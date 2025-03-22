@@ -1,8 +1,8 @@
 /* gdb_interface.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2013 David Anderson
- * Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2015,2018-2019 David Anderson
+ * Copyright (C) 2002-2015,2018-2019 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,18 +17,21 @@
 
 #include "defs.h"
 
+#if !defined(GDB_10_2) && !defined(GDB_16_2)
 static void exit_after_gdb_info(void);
+#endif
 static int is_restricted_command(char *, ulong);
 static void strip_redirection(char *);
 int get_frame_offset(ulong);
 
 int *gdb_output_format;
 unsigned int *gdb_print_max;
-int *gdb_prettyprint_structs;
-int *gdb_prettyprint_arrays;
-int *gdb_repeat_count_threshold;
-int *gdb_stop_print_at_null;
+unsigned char *gdb_prettyprint_structs;
+unsigned char *gdb_prettyprint_arrays;
+unsigned int *gdb_repeat_count_threshold;
+unsigned char *gdb_stop_print_at_null;
 unsigned int *gdb_output_radix;
+static void gdb_error_debug(void);
 
 static ulong gdb_user_print_option_address(char *);
 
@@ -68,10 +71,12 @@ gdb_main_loop(int argc, char **argv)
 	}
 
         optind = 0;
+#if !defined(GDB_10_2) && !defined(GDB_16_2)
 #if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1)
         command_loop_hook = main_loop;
 #else
 	deprecated_command_loop_hook = main_loop;
+#endif
 #endif
         gdb_main_entry(argc, argv);
 }
@@ -117,22 +122,26 @@ void
 display_gdb_banner(void)
 {
 	optind = 0;
+#if !defined(GDB_10_2) && !defined(GDB_16_2)
 #if defined(GDB_5_3) || defined(GDB_6_0) || defined(GDB_6_1)
         command_loop_hook = exit_after_gdb_info;
 #else
         deprecated_command_loop_hook = exit_after_gdb_info;
+#endif
 #endif
 	args[0] = "gdb";
 	args[1] = "-version";
 	gdb_main_entry(2, args);
 }
 
+#if !defined(GDB_10_2) && !defined(GDB_16_2)
 static void
 exit_after_gdb_info(void)
 {
         fprintf(fp, "\n");
         clean_exit(0);
 }
+#endif
 
 /* 
  *  Stash a copy of the gdb version locally.  This can be called before
@@ -150,13 +159,15 @@ get_gdb_version(void)
 	}
 }
 
+extern void *current_program_space;
+
 void
 gdb_session_init(void)
 {
 	struct gnu_request *req;
 	int debug_data_pulled_in;
 
-        if (!have_partial_symbols() && !have_full_symbols())
+        if (!have_partial_symbols(current_program_space) && !have_full_symbols(current_program_space))
 		no_debugging_data(FATAL);
 
 	/*
@@ -186,13 +197,13 @@ gdb_session_init(void)
 		gdb_user_print_option_address("output_format");
 	gdb_print_max = (unsigned int *)
 		gdb_user_print_option_address("print_max");
-	gdb_prettyprint_structs = (int *)
+	gdb_prettyprint_structs = (unsigned char *)
 		gdb_user_print_option_address("prettyprint_structs");
-	gdb_prettyprint_arrays = (int *)
+	gdb_prettyprint_arrays = (unsigned char *)
 		gdb_user_print_option_address("prettyprint_arrays");
-	gdb_repeat_count_threshold = (int *)
+	gdb_repeat_count_threshold = (unsigned int *)
 		gdb_user_print_option_address("repeat_count_threshold");
-	gdb_stop_print_at_null = (int *)
+	gdb_stop_print_at_null = (unsigned char *)
 		gdb_user_print_option_address("stop_print_at_null");
 	gdb_output_radix = (unsigned int *)
 		gdb_user_print_option_address("output_radix");
@@ -291,6 +302,19 @@ retry:
 	sprintf(req->buf, "set width 0");
 	gdb_interface(req);
 
+#if defined(GDB_10_2) || defined(GDB_16_2)
+	req->command = GNU_PASS_THROUGH;
+	req->name = NULL, req->flags = 0;
+	sprintf(req->buf, "set max-value-size unlimited");
+	gdb_interface(req);
+
+	req->command = GNU_PASS_THROUGH;
+	req->name = NULL, req->flags = 0;
+	sprintf(req->buf, "set max-completions unlimited");
+	gdb_interface(req);
+#endif
+
+#if 0
        /*
         *  Patch gdb's symbol values with the correct values from either
         *  the System.map or non-debug vmlinux, whichever is in effect.
@@ -303,6 +327,9 @@ retry:
         	if (req->flags & GNU_COMMAND_FAILED)
 			error(FATAL, "patching of gdb symbol values failed\n");
 	} else if (!(pc->flags & SILENT))
+#else
+        if (!(pc->flags & SILENT))
+#endif
 		fprintf(fp, "\n");
 
 
@@ -364,19 +391,6 @@ gdb_interface(struct gnu_request *req)
 	pc->cur_req = req;
 	pc->cur_gdb_cmd = req->command;
 
-	if (req->flags & GNU_RETURN_ON_ERROR) {
-		error_hook = gdb_error_hook;
-        	if (setjmp(pc->gdb_interface_env)) {
-			pc->last_gdb_cmd = pc->cur_gdb_cmd;
-			pc->cur_gdb_cmd = 0;
-			pc->cur_req = NULL;
-			req->flags |= GNU_COMMAND_FAILED;
-			pc->flags &= ~IN_GDB;
-			return;
-		}
-	} else
-		error_hook = NULL;
-
 	if (CRASHDEBUG(2))
 		dump_gnu_request(req, IN_GDB);
 
@@ -400,10 +414,12 @@ gdb_interface(struct gnu_request *req)
 	SIGACTION(SIGINT, restart, &pc->sigaction, NULL);
 	SIGACTION(SIGSEGV, SIG_DFL, &pc->sigaction, NULL);
 
+        if (req->flags & GNU_COMMAND_FAILED)
+                gdb_error_debug();
+
 	if (CRASHDEBUG(2))
 		dump_gnu_request(req, !IN_GDB);
 
-	error_hook = NULL;
         pc->last_gdb_cmd = pc->cur_gdb_cmd;
         pc->cur_gdb_cmd = 0;
 	pc->cur_req = NULL;
@@ -512,6 +528,10 @@ dump_gnu_request(struct gnu_request *req, int in_gdb)
 	console("member_offset: %ld\n", req->member_offset);
 	console("member_length: %ld\n", req->member_length);
         console("member_typecode: %d\n", req->member_typecode);
+	console("member_main_type_name: %s\n", req->member_main_type_name);
+	console("member_main_type_tag_name: %s\n", req->member_main_type_tag_name);
+	console("member_target_type_name: %s\n", req->member_target_type_name);
+	console("member_target_type_tag_name: %s\n", req->member_target_type_tag_name);
 	console("value: %lx ", req->value);
 	console("tagname: \"%s\" ", req->tagname);
 	console("pc: %lx  ", req->pc);
@@ -592,6 +612,9 @@ gdb_command_string(int cmd, char *buf, int live)
         case GNU_SET_CRASH_BLOCK:
                 sprintf(buf, "GNU_SET_CRASH_BLOCK");
 		break;
+	case GNU_GET_FUNCTION_RANGE:
+                sprintf(buf, "GNU_GET_FUNCTION_RANGE");
+                break;
 	case 0:
 		buf[0] = NULLCHAR;
 		break;
@@ -619,8 +642,6 @@ restore_gdb_sanity(void)
 
         *gdb_prettyprint_structs = 1;   /* these may piss somebody off... */
 	*gdb_repeat_count_threshold = 0x7fffffff;
-
-	error_hook = NULL;
 
 	if (st->flags & ADD_SYMBOL_FILE) {
 		error(INFO, 
@@ -691,11 +712,10 @@ static char *prohibited_list[] = {
 	"run", "r", "break", "b", "tbreak", "hbreak", "thbreak", "rbreak",
 	"watch", "rwatch", "awatch", "attach", "continue", "c", "fg", "detach", 
 	"finish", "handle", "interrupt", "jump", "kill", "next", "nexti", 
-	"signal", "step", "s", "stepi", "target", "thread", "until", "delete", 
-	"clear", "disable", "enable", "condition", "ignore", "frame", 
-	"select-frame", "f", "up", "down", "catch", "tcatch", "return",
-	"file", "exec-file", "core-file", "symbol-file", "load", "si", "ni", 
-	"shell", 
+	"signal", "step", "s", "stepi", "target", "until", "delete", 
+	"clear", "disable", "enable", "condition", "ignore", "catch",
+	"tcatch", "return", "file", "exec-file", "core-file", "symbol-file",
+	"load", "si", "ni", "shell", "sy",
 	NULL  /* must be last */
 };
 
@@ -734,7 +754,7 @@ is_restricted_command(char *cmd, ulong flags)
 				newline, newline, pc->program_name);
 		}
 	}
-	
+
 	return FALSE;
 }
 
@@ -788,7 +808,7 @@ cmd_gdb(void)
 	 */
 	if (!is_restricted_command(*argv, FAULT_ON_ERROR)) {
 		if (STREQ(pc->command_line, "gdb")) {
-			strcpy(buf, &pc->orig_line[3]);
+			strcpy(buf, first_space(pc->orig_line));
 			strip_beginning_whitespace(buf);
 		} else
 			strcpy(buf, pc->orig_line);
@@ -810,14 +830,26 @@ int
 gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 { 
 	char locbuf[SIZEOF_32BIT], *p1;
-	uint32_t *p2;
 	int memtype;
+	ulong readflags;
 
 	if (write)
 		return FALSE;
 
+	if (!(pc->cur_req)) {
+		return(readmem(addr, KVADDR, buf, len, 
+			"gdb_readmem_callback", RETURN_ON_ERROR));
+	}
+
 	if (pc->cur_req->flags & GNU_NO_READMEM)
 		return TRUE;
+
+	readflags = pc->curcmd_flags & PARTIAL_READ_OK ?
+		RETURN_ON_ERROR|RETURN_PARTIAL : RETURN_ON_ERROR;
+
+	if (STREQ(pc->curcmd, "bpf") && pc->curcmd_private &&
+	    (addr > (ulong)pc->curcmd_private))
+		readflags |= QUIET;
 
 	if (pc->curcmd_flags & MEMTYPE_UVADDR)
 		memtype = UVADDR;
@@ -842,44 +874,42 @@ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 
 	if (memtype == FILEADDR)
 		return(readmem(pc->curcmd_private, memtype, buf, len,
-                	"gdb_readmem_callback", RETURN_ON_ERROR));
+			"gdb_readmem_callback", readflags));
 	
 	switch (len)
 	{
 	case SIZEOF_8BIT:
+		if (STREQ(pc->curcmd, "bt")) {
+			if (readmem(addr, memtype, buf, SIZEOF_8BIT,
+		    	    "gdb_readmem_callback", readflags)) 
+				return TRUE;
+		}
+
 		p1 = (char *)buf;
-		if ((memtype == KVADDR) && 
-		    text_value_cache_byte(addr, (unsigned char *)p1)) 
-			return TRUE;
 
 		if (!readmem(addr, memtype, locbuf, SIZEOF_32BIT,
-		    "gdb_readmem_callback", RETURN_ON_ERROR)) 
+		    "gdb_readmem_callback", readflags)) 
 			return FALSE;
 
 		*p1 = locbuf[0];
-		if (memtype == KVADDR) {
-			p2 = (uint32_t *)locbuf;
-			text_value_cache(addr, *p2, 0);
-		}
 		return TRUE;
 
 	case SIZEOF_32BIT:
-		if ((memtype == KVADDR) && text_value_cache(addr, 0, buf)) 
-			return TRUE;
+		if (STREQ(pc->curcmd, "bt")) {
+			if (readmem(addr, memtype, buf, SIZEOF_32BIT,
+		    	    "gdb_readmem_callback", readflags)) 
+				return TRUE;
+		}
 
 		if (!readmem(addr, memtype, buf, SIZEOF_32BIT, 
-		    "gdb_readmem callback", RETURN_ON_ERROR))
+		    "gdb_readmem callback", readflags))
 			return FALSE;
 
-		if (memtype == KVADDR)
-			text_value_cache(addr, 
-				(uint32_t)*((uint32_t *)buf), NULL);
 		return TRUE;
 	}
 
-	return(readmem(addr, memtype, buf, len,
-                "gdb_readmem_callback", RETURN_ON_ERROR));
-
+	return(readmem(addr, memtype, buf, len, 
+		"gdb_readmem_callback", readflags));
 }
 
 /*
@@ -907,11 +937,29 @@ gdb_print_callback(ulong addr)
 		return IS_KVADDR(addr);
 }
 
+char *
+gdb_lookup_module_symbol(ulong addr, ulong *offset)
+{
+	struct syment *sp;
+
+	if ((sp = value_search_module(addr, offset))) {
+		return sp->name;
+	} else {
+		return NULL;
+	}
+}
+
+int
+is_kvaddr(ulong addr)
+{
+	return IS_KVADDR(addr);
+}
+
 /*
  *  Used by gdb_interface() to catch gdb-related errors, if desired.
  */
-void
-gdb_error_hook(void)
+static void
+gdb_error_debug(void)
 {
 	char buf1[BUFSIZE];
 	char buf2[BUFSIZE];
@@ -931,13 +979,6 @@ gdb_error_hook(void)
 			gdb_command_string(pc->cur_gdb_cmd, buf1, TRUE), buf2);
 	}
 
-#ifdef GDB_7_6
-	do_cleanups(all_cleanups()); 
-#else
-	do_cleanups(NULL); 
-#endif
-
-	longjmp(pc->gdb_interface_env, 1);
 }
 
 
@@ -974,19 +1015,21 @@ gdb_set_crash_scope(ulong vaddr, char *arg)
 	char name[BUFSIZE];
 	struct load_module *lm;
 
-	if (!is_kernel_text(vaddr)) {
-		error(INFO, "invalid text address: %s\n", arg);
-		return FALSE;
-	}
+	if (vaddr) {
+		if (!is_kernel_text(vaddr)) {
+			error(INFO, "invalid text address: %s\n", arg);
+			return FALSE;
+		}
 
-	if (module_symbol(vaddr, NULL, &lm, name, 0)) {
-		if (!(lm->mod_flags & MOD_LOAD_SYMS)) {
-			error(INFO, "attempting to find/load \"%s\" module debuginfo\n", 
-				lm->mod_name);
-			if (!load_module_symbols_helper(lm->mod_name)) {
-				error(INFO, "cannot find/load \"%s\" module debuginfo\n", 
+		if (module_symbol(vaddr, NULL, &lm, name, 0)) {
+			if (!(lm->mod_flags & MOD_LOAD_SYMS)) {
+				error(INFO, "attempting to find/load \"%s\" module debuginfo\n",
 					lm->mod_name);
-				return FALSE;
+				if (!load_module_symbols_helper(lm->mod_name)) {
+					error(INFO, "cannot find/load \"%s\" module debuginfo\n",
+						lm->mod_name);
+					return FALSE;
+				}
 			}
 		}
 	}
@@ -995,6 +1038,7 @@ gdb_set_crash_scope(ulong vaddr, char *arg)
 	req->addr = vaddr;
 	req->flags = 0;
 	req->addr2 = 0;
+	req->fp = pc->nullfp;
 	gdb_command_funnel(req);    
 
 	if (CRASHDEBUG(1))
@@ -1024,4 +1068,30 @@ get_frame_offset(ulong pc)
 }
 #endif /* !ALPHA */ 
 
+unsigned long crash_get_kaslr_offset(void);
+unsigned long crash_get_kaslr_offset(void)
+{
+        return kt->relocate * -1;
+}
 
+/* Callbacks for crash_target */
+int crash_get_current_task_reg (int regno, const char *regname,
+				int regsize, void *value);
+int crash_get_current_task_reg (int regno, const char *regname,
+				int regsize, void *value)
+{
+	if (!machdep->get_current_task_reg)
+		return FALSE;
+	return machdep->get_current_task_reg(regno, regname, regsize, value);
+}
+
+/* arm64 kernel lr maybe has patuh */
+#ifdef ARM64
+void crash_decode_ptrauth_pc(ulong *pc);
+void crash_decode_ptrauth_pc(ulong *pc)
+{
+	struct machine_specific *ms = machdep->machspec;
+	if (is_kernel_text(*pc | ms->CONFIG_ARM64_KERNELPACMASK))
+		*pc |= ms->CONFIG_ARM64_KERNELPACMASK;
+}
+#endif /* !ARM64 */

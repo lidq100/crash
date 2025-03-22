@@ -20,6 +20,7 @@
 #include "sadump.h"
 #include <arpa/inet.h> /* htonl, htons */
 #include <elf.h>
+#include <inttypes.h>
 
 enum {
 	failed = -1
@@ -50,6 +51,7 @@ static int cpu_to_apicid(int cpu, int *apicid);
 static int get_sadump_smram_cpu_state(int cpu, struct sadump_smram_cpu_state *smram);
 static int block_table_init(void);
 static uint64_t pfn_to_block(uint64_t pfn);
+static void mask_reserved_fields(struct sadump_smram_cpu_state *smram);
 
 struct sadump_data *
 sadump_get_sadump_data(void)
@@ -156,9 +158,6 @@ read_dump_header(char *file)
 	}
 
 restart:
-	if (block_size < 0)
-		return FALSE;
-
 	if (!read_device(sph, block_size, &offset)) {
 		error(INFO, "sadump: cannot read partition header\n");
 		goto err;
@@ -325,6 +324,20 @@ restart:
 
 	flags |= SADUMP_LOCAL;
 
+	switch (sh->header_version) {
+	case 0:
+		sd->max_mapnr = (uint64_t)sh->max_mapnr;
+		break;
+	default:
+		error(WARNING,
+		      "sadump: unsupported header version: %u\n"
+		      "sadump: assuming header version: 1\n",
+		      sh->header_version);
+	case 1:
+		sd->max_mapnr = sh->max_mapnr_64;
+		break;
+	}
+
 	if (sh->sub_hdr_size > 0) {
 		if (!read_device(&smram_cpu_state_size, sizeof(uint32_t),
 				 &offset)) {
@@ -379,7 +392,13 @@ restart:
 	}
 
 	sd->filename = file;
-	sd->flags = flags;
+
+	/*
+	 * Switch to zero excluded mode by default on sadump-related
+	 * formats because some Fujitsu troubleshooting software
+	 * assumes the behavior.
+	 */
+	sd->flags = flags | SADUMP_ZERO_EXCLUDED;
 
 	if (machine_type("X86"))
 		sd->machine_type = EM_386;
@@ -700,7 +719,7 @@ is_set_bit(char *bitmap, uint64_t pfn)
 	ulong index, bit;
 
 	index = pfn >> 3;
-	bit = pfn & 7;
+	bit = 7 - (pfn & 7);
 
 	return !!(bitmap[index] & (1UL << bit));
 }
@@ -772,10 +791,10 @@ int read_sadump(int fd, void *bufptr, int cnt, ulong addr, physaddr_t paddr)
 	curpaddr = paddr & ~((physaddr_t)(sd->block_size-1));
 	page_offset = paddr & ((physaddr_t)(sd->block_size-1));
 
-	if ((pfn >= sd->dump_header->max_mapnr) || !page_is_ram(pfn))
+	if ((pfn >= sd->max_mapnr) || !page_is_ram(pfn))
 		return SEEK_ERROR;
 	if (!page_is_dumpable(pfn)) {
-		if (sd->flags & SADUMP_ZERO_EXCLUDED)
+		if (!(sd->flags & SADUMP_ZERO_EXCLUDED))
 			return PAGE_EXCLUDED;
 		memset(bufptr, 0, cnt);
 		return cnt;
@@ -979,6 +998,17 @@ int sadump_memory_dump(FILE *fp)
 	fprintf(fp, "      written_blocks: %u\n", sh->written_blocks);
 	fprintf(fp, "         current_cpu: %u\n", sh->current_cpu);
 	fprintf(fp, "             nr_cpus: %u\n", sh->nr_cpus);
+	if (sh->header_version >= 1) {
+		fprintf(fp,
+			"        max_mapnr_64: %" PRIu64 "\n"
+			" total_ram_blocks_64: %" PRIu64 "\n"
+			"    device_blocks_64: %" PRIu64 "\n"
+			"   written_blocks_64: %" PRIu64 "\n",
+			sh->max_mapnr_64,
+			sh->total_ram_blocks_64,
+			sh->device_blocks_64,
+			sh->written_blocks_64);
+	}
 
 	fprintf(fp, "\n    dump sub heaer: ");
 	if (sh->sub_hdr_size > 0) {
@@ -1011,6 +1041,15 @@ int sadump_memory_dump(FILE *fp)
 				      "cpu_state\n");
 				return FALSE;
 			}
+			/*
+			 * Reserved fields in SMRAM CPU states could
+			 * be non-zero even if the corresponding APICs
+			 * are NOT used. This breaks the assumption
+			 * that SMRAM CPU state is zero cleared if and
+			 * only if the APIC corresponding to the entry
+			 * is NOT used.
+			 */
+			mask_reserved_fields(&scs);
 			if (memcmp(&scs, &zero, sizeof(scs)) != 0) {
 				fprintf(fp, "\n");
 				display_smram_cpu_state(aid, &scs);
@@ -1526,13 +1565,26 @@ sadump_display_regs(int cpu, FILE *ofp)
  */
 int sadump_phys_base(ulong *phys_base)
 {
-	if (SADUMP_VALID()) {
+	if (SADUMP_VALID() && !sd->phys_base) {
 		if (CRASHDEBUG(1))
 			error(NOTE, "sadump: does not save phys_base.\n");
 		return FALSE;
 	}
 
+	if (sd->phys_base) {
+		*phys_base = sd->phys_base;
+		return TRUE;
+	}
+
 	return FALSE;
+}
+
+int
+sadump_set_phys_base(ulong phys_base)
+{
+	sd->phys_base = phys_base;
+
+	return TRUE;
 }
 
 /*
@@ -1556,7 +1608,7 @@ static int block_table_init(void)
 {
 	uint64_t pfn, section, max_section, *block_table;
 
-	max_section = divideup(sd->dump_header->max_mapnr, SADUMP_PF_SECTION_NUM);
+	max_section = divideup(sd->max_mapnr, SADUMP_PF_SECTION_NUM);
 
 	block_table = calloc(sizeof(uint64_t), max_section);
 	if (!block_table) {
@@ -1616,4 +1668,41 @@ struct sadump_data *
 get_sadump_data(void)
 {
 	return sd;
+}
+
+int
+sadump_get_nr_cpus(void)
+{
+	/* apicids */
+	return sd->dump_header->nr_cpus;
+}
+
+#ifdef X86_64
+int
+sadump_get_cr3_cr4_idtr(int cpu, ulong *cr3, ulong *cr4, ulong *idtr)
+{
+	struct sadump_smram_cpu_state scs;
+
+	memset(&scs, 0, sizeof(scs));
+	if (!sadump_get_smram_cpu_state(cpu, &scs))
+		return FALSE;
+
+	*cr3 = scs.Cr3;
+	*cr4 = scs.Cr4;
+	*idtr = ((uint64_t)scs.IdtUpper)<<32 | (uint64_t)scs.IdtLower;
+
+	return TRUE;
+}
+#endif /* X86_64 */
+
+static void
+mask_reserved_fields(struct sadump_smram_cpu_state *smram)
+{
+	memset(smram->Reserved1, 0, sizeof(smram->Reserved1));
+	memset(smram->Reserved2, 0, sizeof(smram->Reserved2));
+	memset(smram->Reserved3, 0, sizeof(smram->Reserved3));
+	memset(smram->Reserved4, 0, sizeof(smram->Reserved4));
+	memset(smram->Reserved5, 0, sizeof(smram->Reserved5));
+	memset(smram->Reserved6, 0, sizeof(smram->Reserved6));
+	memset(smram->Reserved7, 0, sizeof(smram->Reserved7));
 }

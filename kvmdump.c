@@ -297,7 +297,7 @@ kvmdump_memory_dump(FILE *ofp)
 				(ulonglong)kvm->page_cache[i].paddr);
 	}
 
-	fprintf(ofp, "      cpu_devices: %d\n", kvm->cpu_devices);
+	fprintf(ofp, "      cpu_devices: %ld\n", kvm->cpu_devices);
 	fprintf(ofp, "           iohole: %llx (%llx - %llx)\n", 
 		(ulonglong)kvm->iohole, 0x100000000ULL - kvm->iohole,
 		0x100000000ULL);
@@ -846,8 +846,10 @@ kvmdump_mapfile_exists(void)
 
 	sprintf(filename, "%s.map", pc->dumpfile);
 
-	if (!file_exists(filename, &stat) || !S_ISREG(stat.st_mode))
+	if (!file_exists(filename, &stat) || !S_ISREG(stat.st_mode)) {
+		free(filename);
 		return FALSE;
+	}
 
 	if (is_kvmdump_mapfile(filename)) {
 		pc->kvmdump_mapfile = filename;

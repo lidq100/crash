@@ -18,9 +18,12 @@
  * Author: Ken'ichi Ohmichi <oomichi mxs nes nec co jp>
  */
 
+#define _LARGEFILE64_SOURCE 1  /* stat64() */
 #include "defs.h"
 #include "makedumpfile.h"
 #include <byteswap.h>
+
+static void flattened_format_get_osrelease(char *);
 
 int flattened_format = 0;
 
@@ -56,11 +59,17 @@ store_flat_data_array(char *file, struct flat_data **fda)
 {
 	int			result = FALSE, fd;
 	int64_t			offset_fdh;
+	int64_t			offset_report = 0;
 	unsigned long long	num_allocated = 0;
 	unsigned long long	num_stored    = 0;
+	unsigned long long	sort_idx;
 	unsigned long long	size_allocated;
 	struct flat_data	*ptr = NULL, *cur, *new;
 	struct makedumpfile_data_header	fdh;
+	struct stat64		stat;
+	ulonglong		pct, last_pct;
+	char			buf[BUFSIZE];
+	ssize_t			bytes_read;
 
 	fd = open(file, O_RDONLY);
 	if (fd < 0) {
@@ -72,6 +81,13 @@ store_flat_data_array(char *file, struct flat_data **fda)
 		close(fd);
 		return -1;
 	}
+	if (stat64(file, &stat) < 0) {
+		error(INFO, "cannot stat64 %s\n", file);
+                return -1;
+	}
+
+	please_wait("sorting flat format data");
+	pct = last_pct = 0;
 	while (1) {
 		if (num_allocated <= num_stored) {
 			num_allocated += 100;
@@ -87,8 +103,13 @@ store_flat_data_array(char *file, struct flat_data **fda)
 		}
 		offset_fdh = lseek(fd, 0x0, SEEK_CUR);
 
-		if (read(fd, &fdh, sizeof(fdh)) < 0) {
-			error(INFO, "read error: %s (flat format)\n", file);
+		if ((bytes_read = read(fd, &fdh, sizeof(fdh))) != sizeof(fdh)) {
+			if (bytes_read >= 0)
+				error(INFO, 
+				    "read error: %s (flat format): truncated/incomplete\n", 
+					file);
+			else
+				error(INFO, "read error: %s (flat format)\n", file);
 			break;
 		}
 		if (!is_bigendian()){
@@ -100,10 +121,42 @@ store_flat_data_array(char *file, struct flat_data **fda)
 			break;
 		}
 		cur = ptr + num_stored;
+		sort_idx = num_stored;
+		while (sort_idx) {
+			new = ptr + --sort_idx;
+			if (new->off_rearranged >= fdh.offset) {
+				cur->off_flattened = new->off_flattened;
+				cur->off_rearranged = new->off_rearranged;
+				cur->buf_size = new->buf_size;
+				cur = new;
+			} else {
+				if (CRASHDEBUG(1) && sort_idx + 1 != num_stored) {
+					fprintf(fp,
+						"makedumpfile: Moved from %lld to %lld\n",
+						num_stored, sort_idx + 1);
+				}
+				break;
+			}
+		}
 		cur->off_flattened  = offset_fdh + sizeof(fdh);
 		cur->off_rearranged = fdh.offset;
 		cur->buf_size       = fdh.buf_size;
 		num_stored++;
+
+		pct = (offset_fdh * 100ULL) / stat.st_size; 
+		if (pct > last_pct) {
+			sprintf(buf, "sorting flat format data: %lld%%", (ulonglong)pct);
+			please_wait(buf);
+			if (CRASHDEBUG(1))
+				fprintf(fp, "\n");
+			last_pct = pct;
+		}
+
+		if (CRASHDEBUG(1) && (fdh.offset >> 30) > (offset_report >> 30)) {
+			fprintf(fp, "makedumpfile: At %lld GiB\n",
+			      (ulonglong)(fdh.offset >> 30));
+			offset_report = fdh.offset;
+		}
 
 		/* seek for next makedumpfile_data_header. */
 		if (lseek(fd, fdh.buf_size, SEEK_CUR) < 0) {
@@ -111,6 +164,8 @@ store_flat_data_array(char *file, struct flat_data **fda)
 			break;
 		}
 	}
+	please_wait_done();
+
 	close(fd);
 	if (result == FALSE) {
 		free(ptr);
@@ -119,35 +174,6 @@ store_flat_data_array(char *file, struct flat_data **fda)
 	*fda = ptr;
 
 	return num_stored;
-}
-
-static void
-sort_flat_data_array(struct flat_data **fda, unsigned long long num_fda)
-{
-	unsigned long long	i, j;
-	struct flat_data	tmp, *cur_i, *cur_j;
-
-	for (i = 0; i < num_fda - 1; i++) {
-		for (j = i + 1; j < num_fda; j++) {
-			cur_i = *fda + i;
-			cur_j = *fda + j;
-
-			if (cur_i->off_rearranged < cur_j->off_rearranged)
-				continue;
-
-			tmp.off_flattened  = cur_i->off_flattened;
-			tmp.off_rearranged = cur_i->off_rearranged;
-			tmp.buf_size       = cur_i->buf_size;
-
-			cur_i->off_flattened  = cur_j->off_flattened;
-			cur_i->off_rearranged = cur_j->off_rearranged;
-			cur_i->buf_size       = cur_j->buf_size;
-
-			cur_j->off_flattened  = tmp.off_flattened;
-			cur_j->off_rearranged = tmp.off_rearranged;
-			cur_j->buf_size       = tmp.buf_size;
-		}
-	}
 }
 
 static int
@@ -161,8 +187,6 @@ read_all_makedumpfile_data_header(char *file)
 	if (retval < 0)
 		return FALSE;
 
-	sort_flat_data_array(&fda, num);
-
 	afd.num_array = num;
 	afd.array     = fda;
 
@@ -172,25 +196,31 @@ read_all_makedumpfile_data_header(char *file)
 void
 check_flattened_format(char *file)
 {
-	int fd;
+	int fd, get_osrelease;
 	struct stat stat;
 	struct makedumpfile_header fh;
 
+	if (pc->flags2 & GET_OSRELEASE) {
+		get_osrelease = TRUE;
+		pc->flags2 &= ~GET_OSRELEASE;
+	} else
+		get_osrelease = FALSE;
+
 	if (flattened_format)
-		return;
+		goto out;
 
 	if (file_exists(file, &stat) && S_ISCHR(stat.st_mode))
-		return;
+		goto out;
 
 	fd = open(file, O_RDONLY);
 	if (fd < 0) {
 		error(INFO, "unable to open dump file %s\n", file);
-		return;
+		goto out;
 	}
 	if (read(fd, &fh, sizeof(fh)) < 0) {
 		error(INFO, "unable to read dump file %s\n", file);
 		close(fd);
-		return;
+		goto out;
 	}
 	close(fd);
 
@@ -200,7 +230,12 @@ check_flattened_format(char *file)
 	}
 	if ((strncmp(fh.signature, MAKEDUMPFILE_SIGNATURE, sizeof(MAKEDUMPFILE_SIGNATURE)) != 0) || 
 	    (fh.type != TYPE_FLAT_HEADER))
+		goto out;
+
+	if (get_osrelease) {
+		flattened_format_get_osrelease(file);
 		return;
+	}
 
 	if (!read_all_makedumpfile_data_header(file))
 		return;
@@ -211,6 +246,11 @@ check_flattened_format(char *file)
 	fh_save = fh;
 
 	flattened_format = TRUE;
+	return;
+
+out:
+	if (get_osrelease)
+		pc->flags2 |= GET_OSRELEASE;
 }
 
 static int
@@ -325,4 +365,29 @@ dump_flat_header(FILE *ofp)
 	fprintf(ofp, "          num_array: %lld\n", (ulonglong)afd.num_array);
 	fprintf(ofp, "              array: %lx\n", (ulong)afd.array);
 	fprintf(ofp, "          file_size: %ld\n\n", (ulong)afd.file_size);
+}
+
+static void 
+flattened_format_get_osrelease(char *file)
+{
+	int c;
+	FILE *pipe;
+	char buf[BUFSIZE], *p1, *p2;
+
+	c = strlen("OSRELEASE=");
+	sprintf(buf, "/usr/bin/strings -n %d %s", c, file);
+			
+	if ((pipe = popen(buf, "r")) == NULL)
+		return;
+
+        for (c = 0; (c < 100) && fgets(buf, BUFSIZE-1, pipe); c++) {
+		if ((p1 = strstr(buf, "OSRELEASE="))) {
+			p2 = strstr(p1, "=");
+			fprintf(fp, "%s", p2+1);
+			flattened_format = TRUE;
+			pc->flags2 |= GET_OSRELEASE;
+		}
+	}
+
+	pclose(pipe);
 }

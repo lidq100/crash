@@ -207,6 +207,7 @@ xen_hyper_domain_init(void)
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_domain_flags, "domain", "domain_flags");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_evtchn, "domain", "evtchn");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_hvm, "domain", "is_hvm");
+	XEN_HYPER_MEMBER_OFFSET_INIT(domain_guest_type, "domain", "guest_type");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_privileged, "domain", "is_privileged");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_debugger_attached, "domain", "debugger_attached");
 
@@ -217,7 +218,12 @@ xen_hyper_domain_init(void)
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_polling, "domain", "is_polling");
 
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_dying, "domain", "is_dying");
+	/*
+	 * With Xen 4.2.5 is_paused_by_controller changed to
+	 * controller_pause_count.
+	 */
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_paused_by_controller, "domain", "is_paused_by_controller");
+	XEN_HYPER_MEMBER_OFFSET_INIT(domain_controller_pause_count, "domain", "controller_pause_count");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_shutting_down, "domain", "is_shutting_down");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_is_shut_down, "domain", "is_shut_down");
 	XEN_HYPER_MEMBER_OFFSET_INIT(domain_vcpu, "domain", "vcpu");
@@ -318,7 +324,7 @@ void
 xen_hyper_x86_pcpu_init(void)
 {
 	ulong cpu_info;
-	ulong init_tss_base, init_tss;
+	ulong init_tss_base, init_tss = 0, stack_base = 0;
 	ulong sp;
 	struct xen_hyper_pcpu_context *pcc;
 	char *buf, *bp;
@@ -332,34 +338,42 @@ xen_hyper_x86_pcpu_init(void)
 	if((xhpct->pcpu_struct = malloc(XEN_HYPER_SIZE(cpu_info))) == NULL) {
 		error(FATAL, "cannot malloc pcpu struct space.\n");
 	}
-
 	/* get physical cpu context */
 	xen_hyper_alloc_pcpu_context_space(XEN_HYPER_MAX_CPUS());
-	if (symbol_exists("per_cpu__init_tss")) {
+	if (symbol_exists("stack_base")) {
+		stack_base = symbol_value("stack_base");
+		flag = 0;
+	} else if (symbol_exists("per_cpu__init_tss")) {
 		init_tss_base = symbol_value("per_cpu__init_tss");
-		flag = TRUE;
+		flag = 1;
+	} else if (symbol_exists("per_cpu__tss_page")) {
+		init_tss_base = symbol_value("per_cpu__tss_page");
+		flag = 1;
 	} else {
 		init_tss_base = symbol_value("init_tss");
-		flag = FALSE;
+		flag = 2;
 	}
-	buf = GETBUF(XEN_HYPER_SIZE(tss_struct));	
+	if (flag)
+		buf = GETBUF(XEN_HYPER_SIZE(tss));
 	for_cpu_indexes(i, cpuid)
 	{
-		if (flag)
-			init_tss = xen_hyper_per_cpu(init_tss_base, cpuid);
-		else
-			init_tss = init_tss_base +
-				XEN_HYPER_SIZE(tss_struct) * cpuid;
-		if (!readmem(init_tss, KVADDR, buf,
-			XEN_HYPER_SIZE(tss_struct), "init_tss", RETURN_ON_ERROR)) {
-			error(FATAL, "cannot read init_tss.\n");
+		if (flag) {
+			if (flag == 1)
+				init_tss = xen_hyper_per_cpu(init_tss_base, cpuid);
+			else
+				init_tss = init_tss_base + XEN_HYPER_SIZE(tss) * cpuid;
+			readmem(init_tss, KVADDR, buf,
+				XEN_HYPER_SIZE(tss), "init_tss", FAULT_ON_ERROR);
+			if (machine_type("X86")) {
+				sp = ULONG(buf + XEN_HYPER_OFFSET(tss_esp0));
+			} else if (machine_type("X86_64")) {
+				sp = ULONG(buf + XEN_HYPER_OFFSET(tss_rsp0));
+			} else
+				sp = 0;
+		} else {
+			readmem(stack_base + sizeof(ulong) * cpuid, KVADDR, &sp,
+				sizeof(ulong), "stack_base", FAULT_ON_ERROR);
 		}
-		if (machine_type("X86")) {
-			sp = ULONG(buf + XEN_HYPER_OFFSET(tss_struct_esp0));
-		} else if (machine_type("X86_64")) {
-			sp = ULONG(buf + XEN_HYPER_OFFSET(tss_struct_rsp0));
-		} else 
-			sp = 0;
 		cpu_info = XEN_HYPER_GET_CPU_INFO(sp);
 		if (CRASHDEBUG(1)) {
 			fprintf(fp, "sp=%lx, cpu_info=%lx\n", sp, cpu_info);
@@ -369,9 +383,11 @@ xen_hyper_x86_pcpu_init(void)
 		}
 		pcc = &xhpct->context_array[cpuid];
 		xen_hyper_store_pcpu_context(pcc, cpu_info, bp);
-		xen_hyper_store_pcpu_context_tss(pcc, init_tss, buf);
+		if (flag)
+			xen_hyper_store_pcpu_context_tss(pcc, init_tss, buf);
 	}
-	FREEBUF(buf);
+	if (flag)
+		FREEBUF(buf);
 }
 
 #elif defined(IA64)
@@ -399,13 +415,21 @@ void
 xen_hyper_misc_init(void)
 {
 	XEN_HYPER_STRUCT_SIZE_INIT(schedule_data, "schedule_data");
-	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_schedule_lock, "schedule_data", "schedule_lock");
-	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_curr, "schedule_data", "curr");
-	if (MEMBER_EXISTS("schedule_data", "idle"))
-		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_idle, "schedule_data", "idle");
-	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_sched_priv, "schedule_data", "sched_priv");
-	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_s_timer, "schedule_data", "s_timer");
-	XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_tick, "schedule_data", "tick");
+	XEN_HYPER_STRUCT_SIZE_INIT(sched_resource, "sched_resource");
+	if (XEN_HYPER_VALID_SIZE(schedule_data)) {
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_schedule_lock, "schedule_data", "schedule_lock");
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_curr, "schedule_data", "curr");
+		if (MEMBER_EXISTS("schedule_data", "idle"))
+			XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_idle, "schedule_data", "idle");
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_sched_priv, "schedule_data", "sched_priv");
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_s_timer, "schedule_data", "s_timer");
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_tick, "schedule_data", "tick");
+	} else if (XEN_HYPER_VALID_SIZE(sched_resource)) {
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_schedule_lock, "sched_resource", "schedule_lock");
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_curr, "sched_resource", "curr");
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_sched_priv, "sched_resource", "sched_priv");
+		XEN_HYPER_MEMBER_OFFSET_INIT(schedule_data_s_timer, "sched_resource", "s_timer");
+	}
 
 	XEN_HYPER_STRUCT_SIZE_INIT(scheduler, "scheduler");
 	XEN_HYPER_MEMBER_OFFSET_INIT(scheduler_name, "scheduler", "name");
@@ -429,19 +453,31 @@ xen_hyper_misc_init(void)
 /*
  * Do initialization for scheduler of Xen Hyper system here.
  */
-#define XEN_HYPER_SCHEDULERS_ARRAY_CNT 10
 #define XEN_HYPER_SCHEDULER_NAME 1024
+
+static int section_size(char *start_section, char *end_section)
+{
+	ulong sp_start, sp_end;
+
+	sp_start = symbol_value(start_section);
+	sp_end = symbol_value(end_section);
+
+	return (sp_end - sp_start) / sizeof(long);
+}
 
 static void
 xen_hyper_schedule_init(void)
 {
 	ulong addr, opt_sched, schedulers, opt_name;
 	long scheduler_opt_name;
-	long schedulers_buf[XEN_HYPER_SCHEDULERS_ARRAY_CNT];
+	long *schedulers_buf;
+	int nr_schedulers;
 	struct xen_hyper_sched_context *schc;
+	long buf_size;
 	char *buf;
 	char opt_name_buf[XEN_HYPER_OPT_SCHED_SIZE];
 	int i, cpuid, flag;
+	char *sp_name;
 
 	/* get scheduler information */
 	if((xhscht->scheduler_struct =
@@ -463,15 +499,27 @@ xen_hyper_schedule_init(void)
 	XEN_HYPER_OPT_SCHED_SIZE, "opt_sched,", RETURN_ON_ERROR)) {
 		error(FATAL, "cannot read opt_sched,.\n");
 	}
-	schedulers = symbol_value("schedulers");
+
+	/* symbol exists since Xen 4.7 */
+	if (symbol_exists("__start_schedulers_array")) {
+		sp_name = "__start_schedulers_array";
+		nr_schedulers = section_size("__start_schedulers_array",
+					     "__end_schedulers_array");
+	} else {
+		sp_name = "schedulers";
+		nr_schedulers = get_array_length("schedulers", 0, 0);
+	}
+
+	schedulers_buf = (long *)GETBUF(nr_schedulers * sizeof(long));
+	schedulers = symbol_value(sp_name);
 	addr = schedulers;
 	while (xhscht->name == NULL) {
 		if (!readmem(addr, KVADDR, schedulers_buf,
-		sizeof(long) * XEN_HYPER_SCHEDULERS_ARRAY_CNT,
-		"schedulers", RETURN_ON_ERROR)) {
+			     sizeof(long) * nr_schedulers,
+			     "schedulers", RETURN_ON_ERROR)) {
 			error(FATAL, "cannot read schedulers.\n");
 		}
-		for (i = 0; i < XEN_HYPER_SCHEDULERS_ARRAY_CNT; i++) {
+		for (i = 0; i < nr_schedulers; i++) {
 			if (schedulers_buf[i] == 0) {
 				error(FATAL, "schedule data not found.\n");
 			}
@@ -505,12 +553,13 @@ xen_hyper_schedule_init(void)
 				error(FATAL, "cannot malloc scheduler_name space.\n");
 			}
 			BZERO(xhscht->name, strlen(buf) + 1);
-			strncpy(xhscht->name, buf, strlen(buf));
+			BCOPY(buf, xhscht->name, strlen(buf));
 			break;
 		}
-		addr += sizeof(long) * XEN_HYPER_SCHEDULERS_ARRAY_CNT;
+		addr += sizeof(long) * nr_schedulers;
 	}
 	FREEBUF(buf);
+	FREEBUF(schedulers_buf);
 
 	/* get schedule_data information */
 	if((xhscht->sched_context_array =
@@ -519,28 +568,39 @@ xen_hyper_schedule_init(void)
 	}
 	BZERO(xhscht->sched_context_array,
 		sizeof(struct xen_hyper_sched_context) * XEN_HYPER_MAX_CPUS());
-	buf = GETBUF(XEN_HYPER_SIZE(schedule_data));	
-	if (symbol_exists("per_cpu__schedule_data")) {
+	if (symbol_exists("per_cpu__sched_res")) {
+		addr = symbol_value("per_cpu__sched_res");
+		buf_size = XEN_HYPER_SIZE(sched_resource);
+		flag = 0;
+	} else if (symbol_exists("per_cpu__schedule_data")) {
 		addr = symbol_value("per_cpu__schedule_data");
-		flag = TRUE;
+		buf_size = XEN_HYPER_SIZE(schedule_data);
+		flag = 1;
 	} else {
 		addr = symbol_value("schedule_data");
-		flag = FALSE;
+		buf_size = XEN_HYPER_SIZE(schedule_data);
+		flag = 2;
 	}
+	buf = GETBUF(buf_size);
 	for_cpu_indexes(i, cpuid)
 	{
 		schc = &xhscht->sched_context_array[cpuid];
 		if (flag) {
-			schc->schedule_data =
-				xen_hyper_per_cpu(addr, i);
+			if (flag == 1) {
+				schc->schedule_data =
+					xen_hyper_per_cpu(addr, i);
+			} else {
+				schc->schedule_data = addr +
+					XEN_HYPER_SIZE(schedule_data) * i;
+			}
+			readmem(schc->schedule_data,
+				KVADDR, buf, XEN_HYPER_SIZE(schedule_data),
+				"schedule_data", FAULT_ON_ERROR);
 		} else {
-			schc->schedule_data = addr +
-				XEN_HYPER_SIZE(schedule_data) * i;
-		}
-		if (!readmem(schc->schedule_data,
-			KVADDR, buf, XEN_HYPER_SIZE(schedule_data),
-		"schedule_data", RETURN_ON_ERROR)) {
-			error(FATAL, "cannot read schedule_data.\n");
+			schc->sched_resource = xen_hyper_per_cpu(addr, i);
+			readmem(schc->sched_resource,
+				KVADDR, buf, XEN_HYPER_SIZE(sched_resource),
+				"sched_resource", FAULT_ON_ERROR);
 		}
 		schc->cpu_id = cpuid;
 		schc->curr = ULONG(buf + XEN_HYPER_OFFSET(schedule_data_curr));
@@ -1030,7 +1090,9 @@ xen_hyper_get_domains(void)
 	long domain_next_in_list;
 	int i, j;
 
-	get_symbol_data("dom0", sizeof(void *), &domain);
+	if (!try_get_symbol_data("hardware_domain", sizeof(void *), &domain))
+		get_symbol_data("dom0", sizeof(void *), &domain);
+
 	domain_next_in_list = MEMBER_OFFSET("domain", "next_in_list");
 	i = 0;
 	while (domain != 0) {
@@ -1071,7 +1133,8 @@ xen_hyper_get_domain_next(int mod, ulong *next)
 		if (xhdt->dom0) {
 			*next = xhdt->dom0->domain;
 		} else {
-			get_symbol_data("dom0", sizeof(void *), next);
+			if (!try_get_symbol_data("hardware_domain", sizeof(void *), next))
+				get_symbol_data("dom0", sizeof(void *), next);
 		}
 		return xhdt->domain_struct;
 		break;
@@ -1247,22 +1310,42 @@ xen_hyper_store_domain_context(struct xen_hyper_domain_context *dc,
 		dc->domain_flags = ULONG(dp + XEN_HYPER_OFFSET(domain_domain_flags));
 	else if (XEN_HYPER_VALID_MEMBER(domain_is_shut_down)) {
 		dc->domain_flags = 0;
-		if (*(dp + XEN_HYPER_OFFSET(domain_is_hvm))) {
+                if (XEN_HYPER_VALID_MEMBER(domain_is_hvm) &&
+                    *(dp + XEN_HYPER_OFFSET(domain_is_hvm))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_HVM;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_privileged))) {
+		}
+                if (XEN_HYPER_VALID_MEMBER(domain_guest_type) &&
+                    *(dp + XEN_HYPER_OFFSET(domain_guest_type))) {
+			/* For now PVH and HVM are the same for crash.
+			 * and 0 is PV.
+			 */
+			dc->domain_flags |= XEN_HYPER_DOMS_HVM;
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_privileged))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_privileged;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_debugger_attached))) {
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_debugger_attached))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_debugging;
-		} else if (XEN_HYPER_VALID_MEMBER(domain_is_polling) &&
+		}
+		if (XEN_HYPER_VALID_MEMBER(domain_is_polling) &&
 				*(dp + XEN_HYPER_OFFSET(domain_is_polling))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_polling;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_paused_by_controller))) {
+		}
+		if (XEN_HYPER_VALID_MEMBER(domain_is_paused_by_controller) &&
+			*(dp + XEN_HYPER_OFFSET(domain_is_paused_by_controller))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_ctrl_pause;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_dying))) {
+		}
+		if (XEN_HYPER_VALID_MEMBER(domain_controller_pause_count) &&
+			*(dp + XEN_HYPER_OFFSET(domain_controller_pause_count))) {
+			dc->domain_flags |= XEN_HYPER_DOMS_ctrl_pause;
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_dying))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_dying;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_shutting_down))) {
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_shutting_down))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_shuttingdown;
-		} else if (*(dp + XEN_HYPER_OFFSET(domain_is_shut_down))) {
+		}
+		if (*(dp + XEN_HYPER_OFFSET(domain_is_shut_down))) {
 			dc->domain_flags |= XEN_HYPER_DOMS_shutdown;
 		}
 	} else {
@@ -1534,7 +1617,8 @@ xen_hyper_store_vcpu_context(struct xen_hyper_vcpu_context *vcc,
 	vcc->next_in_list = ULONG(vcp + XEN_HYPER_OFFSET(vcpu_next_in_list));
 	if (XEN_HYPER_VALID_MEMBER(vcpu_sleep_tick))
 		vcc->sleep_tick = ULONG(vcp + XEN_HYPER_OFFSET(vcpu_sleep_tick));
-	vcc->sched_priv = ULONG(vcp + XEN_HYPER_OFFSET(vcpu_sched_priv));
+	if (XEN_HYPER_VALID_MEMBER(vcpu_sched_priv))
+		vcc->sched_priv = ULONG(vcp + XEN_HYPER_OFFSET(vcpu_sched_priv));
 	vcc->state = INT(vcp + XEN_HYPER_OFFSET(vcpu_runstate) +
 		XEN_HYPER_OFFSET(vcpu_runstate_info_state));
 	vcc->state_entry_time = ULONGLONG(vcp +
@@ -1724,10 +1808,10 @@ xen_hyper_store_pcpu_context_tss(struct xen_hyper_pcpu_context *pcc,
 
 	pcc->init_tss = init_tss;
 	if (machine_type("X86")) {
-		pcc->sp.esp0 = ULONG(tss + XEN_HYPER_OFFSET(tss_struct_esp0));
+		pcc->sp.esp0 = ULONG(tss + XEN_HYPER_OFFSET(tss_esp0));
 	} else if (machine_type("X86_64")) {
-		pcc->sp.rsp0 = ULONG(tss + XEN_HYPER_OFFSET(tss_struct_rsp0));
-		ist_p = (uint64_t *)(tss + XEN_HYPER_OFFSET(tss_struct_ist));
+		pcc->sp.rsp0 = ULONG(tss + XEN_HYPER_OFFSET(tss_rsp0));
+		ist_p = (uint64_t *)(tss + XEN_HYPER_OFFSET(tss_ist));
 		for (i = 0; i < XEN_HYPER_TSS_IST_MAX; i++, ist_p++) {
 			pcc->ist[i] = ULONG(ist_p);
 		}

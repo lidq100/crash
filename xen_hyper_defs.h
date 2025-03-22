@@ -63,7 +63,7 @@
 #define HYPERVISOR_VIRT_START (0xffff800000000000)
 #define HYPERVISOR_VIRT_END   (0xffff880000000000)
 #define DIRECTMAP_VIRT_START  (0xffff830000000000)
-#define DIRECTMAP_VIRT_END    (0xffff840000000000)
+#define DIRECTMAP_VIRT_END    (0xffff880000000000)
 #define PAGE_OFFSET_XEN_HYPER DIRECTMAP_VIRT_START
 #define XEN_VIRT_START        (xht->xen_virt_start)
 #define XEN_VIRT_ADDR(vaddr) \
@@ -551,6 +551,7 @@ struct xen_hyper_sched_context {
 	ulong idle;
 	ulong sched_priv;
 	ulong tick;
+	ulong sched_resource;
 };
 
 struct xen_hyper_sched_table {
@@ -598,10 +599,11 @@ struct xen_hyper_size_table {
 	long scheduler;
 	long shared_info;
 	long timer;
-	long tss_struct;
+	long tss;
 	long vcpu;
 	long vcpu_runstate_info;
 	long xen_crash_xen_regs_t;		/* elf note v2 */
+	long sched_resource;
 };
 
 struct xen_hyper_offset_table {
@@ -673,10 +675,15 @@ struct xen_hyper_offset_table {
 	long domain_domain_flags;
 	long domain_evtchn;
 	long domain_is_hvm;
+	long domain_guest_type;
 	long domain_is_privileged;
 	long domain_debugger_attached;
 	long domain_is_polling;
 	long domain_is_dying;
+	/*
+	 * This changed from xen-4.2.5 to domain_controller_pause_count.
+	 * See below!
+	 */
 	long domain_is_paused_by_controller;
 	long domain_is_shutting_down;
 	long domain_is_shut_down;
@@ -687,7 +694,7 @@ struct xen_hyper_offset_table {
 	/* mm_struct */
 	long mm_struct_pgd;
 #endif
-	/* schedule_data */
+	/* schedule_data or sched_resource */
 	long schedule_data_schedule_lock;
 	long schedule_data_curr;
 	long schedule_data_idle;
@@ -722,9 +729,9 @@ struct xen_hyper_offset_table {
 	long timer_heap_offset;
 	long timer_killed;
 	/* tss */
-	long tss_struct_rsp0;
-	long tss_struct_esp0;
-	long tss_struct_ist;
+	long tss_rsp0;
+	long tss_esp0;
+	long tss_ist;
 	/* vcpu */
 	long vcpu_vcpu_id;
 	long vcpu_processor;
@@ -751,6 +758,8 @@ struct xen_hyper_offset_table {
 	long vcpu_runstate_info_state;
 	long vcpu_runstate_info_state_entry_time;
 	long vcpu_runstate_info_time;
+	/* domain - changed item see domain_is_paused_by_controller */
+	long domain_controller_pause_count;
 };
 
 /*

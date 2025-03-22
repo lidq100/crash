@@ -1,8 +1,8 @@
 /* remote.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002, 2003, 2004, 2005, 2009, 2011 David Anderson
- * Copyright (C) 2002, 2003, 2004, 2005, 2009, 2011 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002, 2003, 2004, 2005, 2009, 2011, 2018 David Anderson
+ * Copyright (C) 2002, 2003, 2004, 2005, 2009, 2011, 2018 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -84,7 +84,7 @@ main(int argc, char **argv)
                 {
 		case 'v':
 			printf("%s %s\n", basename(argv[0]), 
-				BASELEVEL_REVISION);
+				/* BASELEVEL_REVISION */ "(deprecated)");
 			exit(0);
 
                 case 'd':
@@ -2537,7 +2537,7 @@ remote_fd_init(void)
                 	error(INFO, "too many dumpfile/memory arguments\n");
 			program_usage(SHORT_FORM);
 		}
-		pc->flags |= MEMSRC_LOCAL;
+		pc->flags2 |= MEMSRC_LOCAL;
 		if (pc->flags & (DEVMEM|MEMMOD)) {
 			if (!get_proc_version())
                         	error(INFO, "/proc/version: %s\n", 
@@ -2759,7 +2759,7 @@ identical_namelist(char *file, struct remote_file *rfp)
 	long csum;
 	char sendbuf[BUFSIZE];
 	char recvbuf[BUFSIZE];
-	char readbuf[BUFSIZE];
+	char readbuf[BUFSIZE*2];
 
 	if (stat(file, &sbuf) < 0)
 		return FALSE;
@@ -3025,7 +3025,7 @@ dumpfile_save:
 		return FALSE;
 	}
 
-        if (pc->flags & MEMSRC_LOCAL) {
+        if (pc->flags2 & MEMSRC_LOCAL) {
                 error(INFO, "%s is a local file\n", pc->dumpfile);
 		return FALSE;
 	}
@@ -3264,7 +3264,7 @@ static int
 copy_remote_file(struct remote_file *rfp, int fd, char *file, char *ttystr)
 {
 	char sendbuf[BUFSIZE];
-	char recvbuf[BUFSIZE];
+	char recvbuf[BUFSIZE*2];
 	char readbuf[READBUFSIZE];
 	char *bufptr;
 	long pct, last;
@@ -3399,7 +3399,7 @@ copy_remote_gzip_file(struct remote_file *rfp, char *file, char *ttystr)
 				}
 				if (STRNEQ(bufptr, DONEMSG) ||
 				    STRNEQ(bufptr, DATAMSG)) {
-					strncpy(gziphdr, bufptr, DATA_HDRSIZE);
+					BCOPY(bufptr, gziphdr, DATA_HDRSIZE);
 					if (CRASHDEBUG(1))
 						fprintf(fp, 
 				                "copy_remote_gzip_file: [%s]\n",
@@ -3647,7 +3647,7 @@ remote_memory_dump(int verbose)
 				}
 				if (STRNEQ(bufptr, DONEMSG) ||
 				    STRNEQ(bufptr, DATAMSG)) {
-					strncpy(datahdr, bufptr, DATA_HDRSIZE);
+					BCOPY(bufptr, datahdr, DATA_HDRSIZE);
 					if (CRASHDEBUG(1))
 						fprintf(fp, 
 					        "remote_memory_dump: [%s]\n",
@@ -3788,7 +3788,7 @@ int
 remote_execute(void)
 {
 	char command[BUFSIZE];
-        char sendbuf[BUFSIZE];
+        char sendbuf[BUFSIZE*2];
         char readbuf[READBUFSIZE];
 	char datahdr[DATA_HDRSIZE];
         char *bufptr, *p1;
@@ -3833,7 +3833,7 @@ remote_execute(void)
 				}
 				if (STRNEQ(bufptr, DONEMSG) ||
 				    STRNEQ(bufptr, DATAMSG)) {
-					strncpy(datahdr, bufptr, DATA_HDRSIZE);
+					BCOPY(bufptr, datahdr, DATA_HDRSIZE);
 					if (CRASHDEBUG(1))
 						fprintf(fp, 
 					        "remote_execute: [%s]\n",

@@ -184,6 +184,7 @@ lkcd_dump_init_v8_arch(dump_header_t *dh)
 
 	memcpy(&dump_header_asm_v8, &arch_hdr, sizeof(dump_header_asm_t));
 
+	free(hdr_buf);
 	return 0;
 
 err:
@@ -542,8 +543,7 @@ dump_header_only:
 	lkcd_print("    dh_num_pages: ");
 	lkcd_print(BITS32() ? "%ld\n" : "%d\n", dh->dh_num_pages);
         lkcd_print(" dh_panic_string: %s%s", dh->dh_panic_string,
-		dh && dh->dh_panic_string &&
-		strstr(dh->dh_panic_string, "\n") ? "" : "\n");
+		dh && strstr(dh->dh_panic_string, "\n") ? "" : "\n");
 	tv.tv_sec = dh->dh_time.tv_sec;
         lkcd_print("         dh_time: %s\n",
                         strip_linefeeds(ctime(&(tv.tv_sec))));

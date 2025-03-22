@@ -7,8 +7,8 @@
  * netdump dumpfiles, the facilities in netdump.c are used.  For
  * compressed dumpfiles, the facilities in this file are used.
  *
- * Copyright (C) 2004-2013 David Anderson
- * Copyright (C) 2004-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2015 David Anderson
+ * Copyright (C) 2004-2015 Red Hat, Inc. All rights reserved.
  * Copyright (C) 2005  FUJITSU LIMITED
  * Copyright (C) 2005  NEC Corporation
  *
@@ -25,6 +25,10 @@
 
 #include "defs.h"
 #include "diskdump.h"
+#include "xen_dom0.h"
+#include "vmcore.h"
+#include "maple_tree.h"
+#include "lzorle_decompress.h"
 
 #define BITMAP_SECT_LEN	4096
 
@@ -54,6 +58,11 @@ struct diskdump_data {
 	unsigned char *notes_buf;	/* copy of elf notes */
 	void	**nt_prstatus_percpu;
 	uint	num_prstatus_notes;
+	void	**nt_qemu_percpu;
+	void	**nt_qemucs_percpu;
+	uint	num_qemu_notes;
+	void	**nt_vmcoredd_array;
+	uint	num_vmcoredd_notes;
 
 	/* page cache */
 	struct page_cache_hdr {		/* header for each cached page */
@@ -67,20 +76,22 @@ struct diskdump_data {
 	ulong	evictions;		/* total evictions done */
 	ulong	cached_reads;
 	ulong  *valid_pages;
+	int     max_sect_len;           /* highest bucket of valid_pages */
 	ulong   accesses;
+	ulong	snapshot_task;
 };
 
 static struct diskdump_data diskdump_data = { 0 };
 static struct diskdump_data *dd = &diskdump_data;
-static int get_dump_level(void);
 
 ulong *diskdump_flags = &diskdump_data.flags;
 
 static int __diskdump_memory_dump(FILE *);
 static void dump_vmcoreinfo(FILE *);
-static void dump_nt_prstatus_offset(FILE *);
+static void dump_note_offsets(FILE *);
 static char *vmcoreinfo_read_string(const char *);
 static void diskdump_get_osrelease(void);
+static int valid_note_address(unsigned char *);
 
 /* For split dumpfile */
 static struct diskdump_data **dd_list = NULL;
@@ -92,6 +103,58 @@ int dumpfile_is_split(void)
 	return KDUMP_SPLIT();
 }
 
+int have_crash_notes(int cpu)
+{
+	ulong crash_notes, notes_ptr;
+	char *buf, *p;
+	Elf64_Nhdr *note = NULL;
+
+	if (!readmem(symbol_value("crash_notes"), KVADDR, &crash_notes,
+		     sizeof(crash_notes), "crash_notes", RETURN_ON_ERROR)) {
+		error(WARNING, "cannot read \"crash_notes\"\n");
+		return FALSE;
+	}
+
+	if ((kt->flags & SMP) && (kt->flags & PER_CPU_OFF))
+		notes_ptr = crash_notes + kt->__per_cpu_offset[cpu];
+	else
+		notes_ptr = crash_notes;
+
+	buf = GETBUF(SIZE(note_buf));
+
+	if (!readmem(notes_ptr, KVADDR, buf,
+		     SIZE(note_buf), "note_buf_t", RETURN_ON_ERROR)) {
+		error(WARNING, "cpu %d: cannot read NT_PRSTATUS note\n", cpu);
+		return FALSE;
+	}
+
+	note = (Elf64_Nhdr *)buf;
+	p = buf + sizeof(Elf64_Nhdr);
+
+	if (note->n_type != NT_PRSTATUS) {
+		error(WARNING, "cpu %d: invalid NT_PRSTATUS note (n_type != NT_PRSTATUS)\n", cpu);
+		return FALSE;
+	}
+
+	if (!STRNEQ(p, "CORE")) {
+		error(WARNING, "cpu %d: invalid NT_PRSTATUS note (name != \"CORE\")\n", cpu);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+int
+diskdump_is_cpu_prstatus_valid(int cpu)
+{
+	static int crash_notes_exists = -1;
+
+	if (crash_notes_exists == -1)
+		crash_notes_exists = kernel_symbol_exists("crash_notes");
+
+	return (!crash_notes_exists || have_crash_notes(cpu));
+}
+
 void
 map_cpus_to_prstatus_kdump_cmprs(void)
 {
@@ -99,8 +162,11 @@ map_cpus_to_prstatus_kdump_cmprs(void)
 	int online, i, j, nrcpus;
 	size_t size;
 
+	if (pc->flags2 & QEMU_MEM_DUMP_COMPRESSED)  /* notes exist for all cpus */
+		goto resize_note_pointers;
+
 	if (!(online = get_cpus_online()) || (online == kt->cpus))
-		return;
+		goto resize_note_pointers;
 
 	if (CRASHDEBUG(1))
 		error(INFO,
@@ -119,7 +185,7 @@ map_cpus_to_prstatus_kdump_cmprs(void)
 	nrcpus = (kt->kernel_NR_CPUS ? kt->kernel_NR_CPUS : NR_CPUS);
 
 	for (i = 0, j = 0; i < nrcpus; i++) {
-		if (in_cpu_map(ONLINE, i)) {
+		if (in_cpu_map(ONLINE_MAP, i) && machdep->is_cpu_prstatus_valid(i)) {
 			dd->nt_prstatus_percpu[i] = nt_ptr[j++];
 			dd->num_prstatus_notes = 
 				MAX(dd->num_prstatus_notes, i+1);
@@ -127,6 +193,32 @@ map_cpus_to_prstatus_kdump_cmprs(void)
 	}
 
 	FREEBUF(nt_ptr);
+
+resize_note_pointers:
+	/*
+	 *  For architectures that only utilize the note pointers
+	 *  within this file, resize the arrays accordingly.
+	 */
+	if (machine_type("X86_64") || machine_type("X86") || 
+	    machine_type("ARM64")) {
+		if ((dd->nt_prstatus_percpu = realloc(dd->nt_prstatus_percpu, 
+		    dd->num_prstatus_notes * sizeof(void *))) == NULL)
+			error(FATAL, 
+			    "compressed kdump: cannot realloc NT_PRSTATUS note pointers\n");
+		if (dd->num_qemu_notes) {
+			if  ((dd->nt_qemu_percpu = realloc(dd->nt_qemu_percpu, 
+		    	    dd->num_qemu_notes * sizeof(void *))) == NULL)
+				error(FATAL, 
+				    "compressed kdump: cannot realloc QEMU note pointers\n");
+			if  ((dd->nt_qemucs_percpu = realloc(dd->nt_qemucs_percpu,
+			    dd->num_qemu_notes * sizeof(void *))) == NULL)
+				error(FATAL,
+				    "compressed kdump: cannot realloc QEMU note pointers\n");
+		} else {
+			free(dd->nt_qemu_percpu);
+			free(dd->nt_qemucs_percpu);
+		}
+	}
 }
 
 static void 
@@ -134,7 +226,7 @@ add_diskdump_data(char* name)
 {
 #define DDL_SIZE 16
 	int i;
-	int sz = sizeof(void*);
+	int sz = sizeof(void *);
 	struct diskdump_data *ddp;
 
 	if (dd_list == NULL) {
@@ -195,7 +287,7 @@ clean_diskdump_data(void)
 }
 
 static inline int 
-get_bit(char *map, int byte, int bit)
+get_bit(char *map, unsigned long byte, int bit)
 {
 	return map[byte] & (1<<bit);
 }
@@ -243,16 +335,38 @@ process_elf32_notes(void *note_buf, unsigned long size_note)
 	Elf32_Nhdr *nt;
 	size_t index, len = 0;
 	int num = 0;
-
+	int vmcoredd_num = 0;
+	int qemu_num = 0;
 
 	for (index = 0; index < size_note; index += len) {
 		nt = note_buf + index;
 
-		if(nt->n_type == NT_PRSTATUS) {
+		if (nt->n_type == NT_PRSTATUS) {
 			dd->nt_prstatus_percpu[num] = nt;
 			num++;
 		}
 		len = sizeof(Elf32_Nhdr);
+		if (STRNEQ((char *)nt + len, "QEMU")) {
+			ulong *ptr =
+			    (ulong *)((char *)nt + sizeof(Elf32_Nhdr) + nt->n_namesz);
+			dd->nt_qemucs_percpu[qemu_num] =
+			    (ulong *)roundup((ulong) ptr, 4);
+			dd->nt_qemu_percpu[qemu_num] = nt;
+			qemu_num++;
+		}
+		if (nt->n_type == NT_XEN_KDUMP_CR3 ||
+		    nt->n_type == XEN_ELFNOTE_CRASH_INFO) {
+			void *data = (char*)(nt + 1) +
+				roundup(nt->n_namesz, 4);
+			process_xen_note(nt->n_type, data, nt->n_descsz);
+		}
+
+		if (nt->n_type == NT_VMCOREDD &&
+		    vmcoredd_num < NR_DEVICE_DUMPS) {
+			dd->nt_vmcoredd_array[vmcoredd_num] = nt;
+			vmcoredd_num++;
+		}
+
 		len = roundup(len + nt->n_namesz, 4);
 		len = roundup(len + nt->n_descsz, 4);
 	}
@@ -261,6 +375,14 @@ process_elf32_notes(void *note_buf, unsigned long size_note)
 		pc->flags2 |= ELF_NOTES;
 		dd->num_prstatus_notes = num;
 	}
+
+	if (qemu_num > 0) {
+		pc->flags2 |= QEMU_MEM_DUMP_COMPRESSED;
+		dd->num_qemu_notes = qemu_num;
+	}
+	if (vmcoredd_num > 0)
+		dd->num_vmcoredd_notes = vmcoredd_num;
+
 	return;
 }
 
@@ -270,15 +392,44 @@ process_elf64_notes(void *note_buf, unsigned long size_note)
 	Elf64_Nhdr *nt;
 	size_t index, len = 0;
 	int num = 0;
+	int vmcoredd_num = 0;
+	int qemu_num = 0;
 
 	for (index = 0; index < size_note; index += len) {
 		nt = note_buf + index;
 
-		if(nt->n_type == NT_PRSTATUS) {
+		if (nt->n_type == NT_PRSTATUS) {
 			dd->nt_prstatus_percpu[num] = nt;
 			num++;
 		}
+		if ((nt->n_type == NT_TASKSTRUCT) && 
+		    (STRNEQ((char *)nt + sizeof(Elf64_Nhdr), "SNAP"))) {
+			pc->flags2 |= (LIVE_DUMP|SNAP);
+			dd->snapshot_task = 
+			    *((ulong *)((char *)nt + sizeof(Elf64_Nhdr) + nt->n_namesz));
+		}
 		len = sizeof(Elf64_Nhdr);
+		if (STRNEQ((char *)nt + len, "QEMU")) {
+			ulong *ptr =
+			    (ulong *)((char *)nt + sizeof(Elf64_Nhdr) + nt->n_namesz);
+			dd->nt_qemucs_percpu[qemu_num] =
+			    (ulong *)roundup((ulong) ptr, 4);
+			dd->nt_qemu_percpu[qemu_num] = nt;
+			qemu_num++;
+		}
+		if (nt->n_type == NT_XEN_KDUMP_CR3 ||
+		    nt->n_type == XEN_ELFNOTE_CRASH_INFO) {
+			void *data = (char*)(nt + 1) +
+				roundup(nt->n_namesz, 4);
+			process_xen_note(nt->n_type, data, nt->n_descsz);
+		}
+
+		if (nt->n_type == NT_VMCOREDD &&
+		    vmcoredd_num < NR_DEVICE_DUMPS) {
+			dd->nt_vmcoredd_array[vmcoredd_num] = nt;
+			vmcoredd_num++;
+		}
+
 		len = roundup(len + nt->n_namesz, 4);
 		len = roundup(len + nt->n_descsz, 4);
 	}
@@ -287,6 +438,14 @@ process_elf64_notes(void *note_buf, unsigned long size_note)
 		pc->flags2 |= ELF_NOTES;
 		dd->num_prstatus_notes = num;
 	}
+
+	if (qemu_num > 0) {
+		pc->flags2 |= QEMU_MEM_DUMP_COMPRESSED;
+		dd->num_qemu_notes = qemu_num;
+	}
+	if (vmcoredd_num > 0)
+		dd->num_vmcoredd_notes = vmcoredd_num;
+
 	return;
 }
 
@@ -299,7 +458,7 @@ x86_process_elf_notes(void *note_ptr, unsigned long size_note)
 		process_elf32_notes(note_ptr, size_note);
 }
 
-#if defined(__i386__) && defined(ARM)
+#if defined(__i386__) && (defined(ARM) || defined(MIPS))
 /*
  * The kdump_sub_header member offsets are different when the crash 
  * binary is built natively on an ARM host vs. when built with  
@@ -402,7 +561,34 @@ arm_kdump_header_adjust(int header_version)
 		kdsh->max_mapnr_64 = dd->max_mapnr;
 	}
 }
-#endif  /* __i386__ && ARM */
+#endif  /* __i386__ && (ARM || MIPS) */
+
+/*
+ * Read page descriptor.
+ */
+static int
+read_pd(int fd, off_t offset, page_desc_t *pd)
+{
+	int ret;
+
+	if (FLAT_FORMAT()) {
+		if (!read_flattened_format(fd, offset, pd, sizeof(*pd)))
+			return READ_ERROR;
+	} else {
+		if (offset < 0) {
+			if (CRASHDEBUG(8))
+				fprintf(fp, "read_pd: invalid offset: %lx\n", offset);
+			return SEEK_ERROR;
+		}
+		if ((ret = pread(fd, pd, sizeof(*pd), offset)) != sizeof(*pd)) {
+			if (ret == -1 && CRASHDEBUG(8))
+				fprintf(fp, "read_pd: pread error: %s\n", strerror(errno));
+			return READ_ERROR;
+		}
+	}
+
+	return 0;
+}
 
 static int 
 read_dump_header(char *file)
@@ -412,15 +598,13 @@ read_dump_header(char *file)
 	struct kdump_sub_header *sub_header_kdump = NULL;
 	size_t size;
 	off_t bitmap_len;
-	char *bufptr;
-	size_t len;
-	ssize_t bytes_read;
 	int block_size = (int)sysconf(_SC_PAGESIZE);
 	off_t offset;
 	const off_t failed = (off_t)-1;
 	ulong pfn;
 	int i, j, max_sect_len;
 	int is_split = 0;
+	ulonglong tmp, *bitmap;
 
 	if (block_size < 0)
 		return FALSE;
@@ -480,17 +664,29 @@ restart:
 	else if (STREQ(header->utsname.machine, "ppc") &&
 	    machine_type_mismatch(file, "PPC", NULL, 0))
 		goto err;
-	else if (STREQ(header->utsname.machine, "ppc64") &&
+	else if (STRNEQ(header->utsname.machine, "ppc64") &&
 	    machine_type_mismatch(file, "PPC64", NULL, 0))
 		goto err;
 	else if (STRNEQ(header->utsname.machine, "arm") &&
 	    machine_type_mismatch(file, "ARM", NULL, 0))
+		goto err;
+	else if (STREQ(header->utsname.machine, "mips") &&
+	    machine_type_mismatch(file, "MIPS", NULL, 0))
+		goto err;
+	else if (STRNEQ(header->utsname.machine, "mips64") &&
+	    machine_type_mismatch(file, "MIPS64", NULL, 0))
 		goto err;
 	else if (STRNEQ(header->utsname.machine, "s390x") &&
 	    machine_type_mismatch(file, "S390X", NULL, 0))
 		goto err;
 	else if (STRNEQ(header->utsname.machine, "aarch64") &&
 	    machine_type_mismatch(file, "ARM64", NULL, 0))
+		goto err;
+	else if (STRNEQ(header->utsname.machine, "riscv64") &&
+	    machine_type_mismatch(file, "RISCV64", NULL, 0))
+		goto err;
+	else if (STRNEQ(header->utsname.machine, "loongarch64") &&
+		machine_type_mismatch(file, "LOONGARCH64", NULL, 0))
 		goto err;
 
 	if (header->block_size != block_size) {
@@ -568,7 +764,7 @@ restart:
 		}
 		dd->sub_header_kdump = sub_header_kdump;
 
-#if defined(__i386__) && defined(ARM)
+#if defined(__i386__) && (defined(ARM) || defined(MIPS))
 		arm_kdump_header_adjust(header->header_version);
 #endif
 		/* use 64bit max_mapnr in compressed kdump file sub-header */
@@ -586,14 +782,10 @@ restart:
 		dd->max_mapnr = header->max_mapnr;
 
 	/* read memory bitmap */
-	bitmap_len = block_size * header->bitmap_blocks;
+	bitmap_len = (off_t)block_size * header->bitmap_blocks;
 	dd->bitmap_len = bitmap_len;
 
 	offset = (off_t)block_size * (1 + header->sub_hdr_size);
-
-	if ((dd->bitmap = malloc(bitmap_len)) == NULL)
-		error(FATAL, "%s: cannot malloc bitmap buffer\n",
-			DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
 
 	dd->dumpable_bitmap = calloc(bitmap_len, 1);
 
@@ -603,30 +795,39 @@ restart:
 			(ulonglong)offset);
 
 	if (FLAT_FORMAT()) {
+		if ((dd->bitmap = malloc(bitmap_len)) == NULL)
+			error(FATAL, "%s: cannot malloc bitmap buffer\n",
+				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
+
 		if (!read_flattened_format(dd->dfd, offset, dd->bitmap, bitmap_len)) {
 			error(INFO, "%s: cannot read memory bitmap\n",
 				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
 			goto err;
 		}
 	} else {
-		if (lseek(dd->dfd, offset, SEEK_SET) == failed) {
-			error(INFO, "%s: cannot lseek memory bitmap\n",
-				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
+		struct stat sbuf;
+		if (fstat(dd->dfd, &sbuf) != 0) {
+			error(INFO, "Cannot fstat the dump file\n");
 			goto err;
 		}
-		bufptr = dd->bitmap;
-		len = bitmap_len;
-		while (len) {
-			bytes_read = read(dd->dfd, bufptr, len);
-			if (bytes_read  < 0) {
-				error(INFO, "%s: cannot read memory bitmap\n",
-					DISKDUMP_VALID() ? "diskdump"
-					: "compressed kdump");
-				goto err;
-			}
-			len -= bytes_read;
-			bufptr += bytes_read;
+
+		/*
+		 * For memory regions mapped with the mmap(), attempts access to
+		 * a page of the buffer that lies beyond the end of the mapped file,
+		 * which may cause SIGBUS(see the mmap() man page).
+		 */
+		if (bitmap_len + offset > sbuf.st_size) {
+			error(INFO, "Mmap: Beyond the end of mapped file, corrupted?\n");
+			goto err;
 		}
+
+		dd->bitmap = mmap(NULL, bitmap_len, PROT_READ,
+					MAP_SHARED, dd->dfd, offset);
+		if (dd->bitmap == MAP_FAILED)
+			error(FATAL, "%s: cannot mmap bitmap buffer\n",
+				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
+
+		madvise(dd->bitmap, bitmap_len, MADV_WILLNEED);
 	}
 
 	if (dump_is_partial(header))
@@ -636,13 +837,15 @@ restart:
 		memcpy(dd->dumpable_bitmap, dd->bitmap, bitmap_len);
 
 	dd->data_offset
-		= (1 + header->sub_hdr_size + header->bitmap_blocks)
+		= (1UL + header->sub_hdr_size + header->bitmap_blocks)
 		* header->block_size;
 
 	dd->header = header;
 
 	if (machine_type("ARM"))
 		dd->machine_type = EM_ARM;
+	else if (machine_type("MIPS") || machine_type("MIPS64"))
+		dd->machine_type = EM_MIPS;
 	else if (machine_type("X86"))
 		dd->machine_type = EM_386;
 	else if (machine_type("X86_64"))
@@ -657,6 +860,12 @@ restart:
 		dd->machine_type = EM_S390;
 	else if (machine_type("ARM64"))
 		dd->machine_type = EM_AARCH64;
+	else if (machine_type("SPARC64"))
+		dd->machine_type = EM_SPARCV9;
+	else if (machine_type("RISCV64"))
+		dd->machine_type = EM_RISCV;
+	else if (machine_type("LOONGARCH64"))
+		dd->machine_type = EM_LOONGARCH;
 	else {
 		error(INFO, "%s: unsupported machine type: %s\n", 
 			DISKDUMP_VALID() ? "diskdump" : "compressed kdump",
@@ -676,9 +885,21 @@ restart:
 			error(FATAL, "compressed kdump: cannot malloc notes"
 				" buffer\n");
 
-		if ((dd->nt_prstatus_percpu = malloc(NR_CPUS * sizeof(void*))) == NULL)
+		if ((dd->nt_prstatus_percpu = malloc(NR_CPUS * sizeof(void *))) == NULL)
 			error(FATAL, "compressed kdump: cannot malloc pointer"
 				" to NT_PRSTATUS notes\n");
+
+		if ((dd->nt_qemu_percpu = malloc(NR_CPUS * sizeof(void *))) == NULL)
+			error(FATAL, "qemu mem dump compressed: cannot malloc pointer"
+				" to QEMU notes\n");
+
+		if ((dd->nt_qemucs_percpu = malloc(NR_CPUS * sizeof(void *))) == NULL)
+			error(FATAL, "qemu mem dump compressed: cannot malloc pointer"
+				" to QEMUCS notes\n");
+
+		if ((dd->nt_vmcoredd_array = malloc(NR_DEVICE_DUMPS * sizeof(void *))) == NULL)
+			error(FATAL, "compressed kdump: cannot malloc array for "
+				     "vmcore device dump notes\n");
 
 		if (FLAT_FORMAT()) {
 			if (!read_flattened_format(dd->dfd, offset, dd->notes_buf, size)) {
@@ -712,6 +933,14 @@ restart:
 		dd->sub_header_kdump->size_vmcoreinfo)
 		pc->flags2 |= VMCOREINFO;
 
+	if (KDUMP_CMPRS_VALID() && 
+	    (dd->header->status & DUMP_DH_COMPRESSED_INCOMPLETE))
+		pc->flags2 |= INCOMPLETE_DUMP;
+
+	if (KDUMP_CMPRS_VALID() && 
+	    (dd->header->status & DUMP_DH_EXCLUDED_VMEMMAP))
+		pc->flags2 |= EXCLUDED_VMEMMAP;
+
 	/* For split dumpfile */
 	if (KDUMP_CMPRS_VALID()) {
 		is_split = ((dd->header->header_version >= 2) &&
@@ -742,11 +971,17 @@ restart:
 	}
 
 	dd->valid_pages = calloc(sizeof(ulong), max_sect_len + 1);
+	dd->max_sect_len = max_sect_len;
+
+	/* It is safe to convert it to (ulonglong *). */
+	bitmap = (ulonglong *)dd->dumpable_bitmap;
 	for (i = 1; i < max_sect_len + 1; i++) {
 		dd->valid_pages[i] = dd->valid_pages[i - 1];
-		for (j = 0; j < BITMAP_SECT_LEN; j++, pfn++)
-			if (page_is_dumpable(pfn))
-				dd->valid_pages[i]++;
+		for (j = 0; j < BITMAP_SECT_LEN; j += 64, pfn += 64) {
+			tmp = bitmap[pfn >> 6];
+			if (tmp)
+				dd->valid_pages[i] += hweight64(tmp);
+		}
 	}
 
         return TRUE;
@@ -757,14 +992,24 @@ err:
 		free(sub_header);
 	if (sub_header_kdump)
 		free(sub_header_kdump);
-	if (dd->bitmap)
-		free(dd->bitmap);
+	if (dd->bitmap) {
+		if (FLAT_FORMAT())
+			free(dd->bitmap);
+		else
+			munmap(dd->bitmap, dd->bitmap_len);
+	}
 	if (dd->dumpable_bitmap)
 		free(dd->dumpable_bitmap);
 	if (dd->notes_buf)
 		free(dd->notes_buf);
 	if (dd->nt_prstatus_percpu)
 		free(dd->nt_prstatus_percpu);
+	if (dd->nt_qemu_percpu)
+		free(dd->nt_qemu_percpu);
+	if (dd->nt_qemucs_percpu)
+		free(dd->nt_qemucs_percpu);
+	if (dd->nt_vmcoredd_array)
+		free(dd->nt_vmcoredd_array);
 
 	dd->flags &= ~(DISKDUMP_LOCAL|KDUMP_CMPRS_LOCAL);
 	pc->flags2 &= ~ELF_NOTES;
@@ -837,12 +1082,17 @@ is_diskdump(char *file)
 #ifdef SNAPPY
 	dd->flags |= SNAPPY_SUPPORTED;
 #endif
+#ifdef ZSTD
+	dd->flags |= ZSTD_SUPPORTED;
+#endif
+
+	pc->read_vmcoreinfo = vmcoreinfo_read_string;
 
 	if ((pc->flags2 & GET_LOG) && KDUMP_CMPRS_VALID()) {
 		pc->dfd = dd->dfd;
 		pc->readmem = read_diskdump;
 		pc->flags |= DISKDUMP;
-		get_log_from_vmcoreinfo(file, vmcoreinfo_read_string);
+		get_log_from_vmcoreinfo(file);
 	}
 
 	return TRUE;
@@ -858,6 +1108,7 @@ diskdump_init(char *unused, FILE *fptr)
 	if (!DISKDUMP_VALID() && !KDUMP_CMPRS_VALID())
 		return FALSE;
 
+	machdep->is_cpu_prstatus_valid = diskdump_is_cpu_prstatus_valid;
 	dd->ofp = fptr;
 	return TRUE;
 }
@@ -870,6 +1121,17 @@ diskdump_phys_base(unsigned long *phys_base)
 {
 	if (KDUMP_CMPRS_VALID()) {
 		*phys_base = dd->sub_header_kdump->phys_base;
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+int
+diskdump_set_phys_base(unsigned long phys_base)
+{
+	if (diskdump_kaslr_check()) {
+		dd->sub_header_kdump->phys_base = phys_base;
 		return TRUE;
 	}
 
@@ -945,8 +1207,10 @@ cache_page(physaddr_t paddr)
 	off_t seek_offset;
 	page_desc_t pd;
 	const int block_size = dd->block_size;
-	const off_t failed = (off_t)-1;
 	ulong retlen;
+#ifdef ZSTD
+	static ZSTD_DCtx *dctx = NULL;
+#endif
 
 	for (i = found = 0; i < DISKDUMP_CACHED_PAGES; i++) {
 		if (DISKDUMP_VALID_PAGE(dd->page_cache_hdr[i].pg_flags))
@@ -974,15 +1238,9 @@ cache_page(physaddr_t paddr)
 			+ (off_t)(desc_pos - 1)*sizeof(page_desc_t);
 
 	/* read page descriptor */
-	if (FLAT_FORMAT()) {
-		if (!read_flattened_format(dd->dfd, seek_offset, &pd, sizeof(pd)))
-			return READ_ERROR;
-	} else {
-		if (lseek(dd->dfd, seek_offset, SEEK_SET) == failed)
-			return SEEK_ERROR;
-		if (read(dd->dfd, &pd, sizeof(pd)) != sizeof(pd))
-			return READ_ERROR;
-	}
+	ret = read_pd(dd->dfd, seek_offset, &pd);
+	if (ret)
+		return ret;
 
 	/* sanity check */
 	if (pd.size > block_size)
@@ -992,11 +1250,39 @@ cache_page(physaddr_t paddr)
 	if (FLAT_FORMAT()) {
 		if (!read_flattened_format(dd->dfd, pd.offset, dd->compressed_page, pd.size))
 			return READ_ERROR;
+	} else if (0 == pd.offset) {
+		/*
+		 *  First check whether zero_excluded has been set.
+		 */
+		if (*diskdump_flags & ZERO_EXCLUDED) {
+			if (CRASHDEBUG(8))
+				fprintf(fp, 
+			    	    "read_diskdump/cache_page: zero-fill: "
+				    "paddr/pfn: %llx/%lx\n", 
+					(ulonglong)paddr, pfn);
+			memset(dd->compressed_page, 0, dd->block_size);
+		} else {
+			if (CRASHDEBUG(8))
+				fprintf(fp,
+					"read_diskdump/cache_page: "
+					"descriptor with zero offset found at "
+					"paddr/pfn/pos: %llx/%lx/%lx\n",
+					(ulonglong)paddr, pfn, desc_pos);
+			return PAGE_INCOMPLETE;
+		}
 	} else {
-		if (lseek(dd->dfd, pd.offset, SEEK_SET) == failed)
+		if (pd.offset < 0) {
+			if (CRASHDEBUG(8))
+				fprintf(fp, "read_diskdump/cache_page: invalid offset: %lx\n",
+					pd.offset);
 			return SEEK_ERROR;
-		if (read(dd->dfd, dd->compressed_page, pd.size) != pd.size)
+		}
+		if ((ret = pread(dd->dfd, dd->compressed_page, pd.size, pd.offset)) != pd.size) {
+			if (ret == -1 && CRASHDEBUG(8))
+				fprintf(fp, "read_diskdump/cache_page: pread error: %s\n",
+					strerror(errno));
 			return READ_ERROR;
+		}
 	}
 
 	if (pd.flags & DUMP_DH_COMPRESSED_ZLIB) {
@@ -1061,6 +1347,33 @@ cache_page(physaddr_t paddr)
 			return READ_ERROR;
 		}
 #endif
+	} else if (pd.flags & DUMP_DH_COMPRESSED_ZSTD) {
+
+		if (!(dd->flags & ZSTD_SUPPORTED)) {
+			error(INFO, "%s: uncompess failed: no zstd compression support\n",
+				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
+			return READ_ERROR;
+		}
+#ifdef ZSTD
+		if (!dctx) {
+			dctx = ZSTD_createDCtx();
+			if (!dctx) {
+				error(INFO, "%s: uncompess failed: cannot create ZSTD_DCtx\n",
+					DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
+				return READ_ERROR;
+			}
+		}
+
+		retlen = ZSTD_decompressDCtx(dctx,
+				dd->page_cache_hdr[i].pg_bufptr, block_size,
+				dd->compressed_page, pd.size);
+		if (ZSTD_isError(retlen) || (retlen != block_size)) {
+			error(INFO, "%s: uncompress failed: %d (%s)\n",
+				DISKDUMP_VALID() ? "diskdump" : "compressed kdump",
+				retlen, ZSTD_getErrorName(retlen));
+			return READ_ERROR;
+		}
+#endif
 	} else
 		memcpy(dd->page_cache_hdr[i].pg_bufptr,
 		       dd->compressed_page, block_size);
@@ -1080,6 +1393,19 @@ read_diskdump(int fd, void *bufptr, int cnt, ulong addr, physaddr_t paddr)
 	int ret;
 	physaddr_t curpaddr;
 	ulong pfn, page_offset;
+	physaddr_t paddr_in = paddr;
+
+	if (XEN_CORE_DUMPFILE() && !XEN_HYPER_MODE()) {
+		if ((paddr = xen_kdump_p2m(paddr)) == P2M_FAILURE) {
+			if (CRASHDEBUG(8))
+				fprintf(fp, "read_diskdump: xen_kdump_p2m(%llx): "
+					"P2M_FAILURE\n", (ulonglong)paddr_in);
+			return READ_ERROR;
+		}
+		if (CRASHDEBUG(8))
+			fprintf(fp, "read_diskdump: xen_kdump_p2m(%llx): %llx\n",
+				(ulonglong)paddr_in, (ulonglong)paddr);
+	}
 
 	pfn = paddr_to_pfn(paddr);
 
@@ -1092,7 +1418,7 @@ read_diskdump(int fd, void *bufptr, int cnt, ulong addr, physaddr_t paddr)
 		for (i=0; i<num_dumpfiles; i++) {
 			start_pfn = dd_list[i]->sub_header_kdump->start_pfn_64;
 			end_pfn = dd_list[i]->sub_header_kdump->end_pfn_64;
-			if ((pfn >= start_pfn) && (pfn <= end_pfn))	{
+			if ((pfn >= start_pfn) && (pfn < end_pfn))	{
 				dd = dd_list[i];
 				break;
 			}
@@ -1184,6 +1510,9 @@ get_diskdump_panic_task(void)
 	    || !get_active_set())
 		return NO_TASK;
 
+	if (pc->flags2 & SNAP)
+		return (task_exists(dd->snapshot_task) ? dd->snapshot_task : NO_TASK);
+
 	if (DISKDUMP_VALID())
 		return (ulong)dd->header->tasks[dd->header->current_cpu];
 
@@ -1191,7 +1520,7 @@ get_diskdump_panic_task(void)
 		if (kernel_symbol_exists("crashing_cpu") &&
 		    cpu_map_addr("online")) {
 			get_symbol_data("crashing_cpu", sizeof(int), &i);
-			if ((i >= 0) && in_cpu_map(ONLINE, i)) {
+			if ((i >= 0) && in_cpu_map(ONLINE_MAP, i)) {
 				if (CRASHDEBUG(1))
 					error(INFO, "get_diskdump_panic_task: "
 					    "active_set[%d]: %lx\n", 
@@ -1208,14 +1537,11 @@ extern void get_netdump_regs_x86(struct bt_info *, ulong *, ulong *);
 extern void get_netdump_regs_x86_64(struct bt_info *, ulong *, ulong *);
 
 static void
-get_diskdump_regs_ppc(struct bt_info *bt, ulong *eip, ulong *esp)
+get_diskdump_regs_32(struct bt_info *bt, ulong *eip, ulong *esp)
 {
 	Elf32_Nhdr *note;
 	int len;
 
-	if (KDUMP_CMPRS_VALID())
-		ppc_relocate_nt_prstatus_percpu(dd->nt_prstatus_percpu,
-						&dd->num_prstatus_notes);
 	if (KDUMP_CMPRS_VALID() &&
 		(bt->task == tt->panic_task || 
 		(is_task_active(bt->task) && dd->num_prstatus_notes > 1))) {
@@ -1236,10 +1562,42 @@ get_diskdump_regs_ppc(struct bt_info *bt, ulong *eip, ulong *esp)
 }
 
 static void
+get_diskdump_regs_ppc(struct bt_info *bt, ulong *eip, ulong *esp)
+{
+	if (KDUMP_CMPRS_VALID())
+		ppc_relocate_nt_prstatus_percpu(dd->nt_prstatus_percpu,
+						&dd->num_prstatus_notes);
+
+	get_diskdump_regs_32(bt, eip, esp);
+}
+
+static void
 get_diskdump_regs_ppc64(struct bt_info *bt, ulong *eip, ulong *esp)
 {
+	int cpu;
+	Elf64_Nhdr *note;
+	size_t len;
+
 	if ((bt->task == tt->panic_task) && DISKDUMP_VALID())
 		bt->machdep = &dd->sub_header->elf_regs;
+	else if (KDUMP_CMPRS_VALID() &&
+		(bt->task == tt->panic_task ||
+		(is_task_active(bt->task) && dd->num_prstatus_notes > 1))) {
+		cpu = bt->tc->processor;
+		if (dd->nt_prstatus_percpu[cpu] == NULL) {
+			if(CRASHDEBUG(1))
+				error(INFO,
+				      "registers not collected for cpu %d\n",
+				      cpu);
+		} else {
+			note = (Elf64_Nhdr *)
+				dd->nt_prstatus_percpu[cpu];
+			len = sizeof(Elf64_Nhdr);
+			len = roundup(len + note->n_namesz, 4);
+			bt->machdep = (void *)((char *)note + len +
+				MEMBER_OFFSET("elf_prstatus", "pr_reg"));
+		}
+	}
 
 	machdep->get_stack_frame(bt, eip, esp);
 }
@@ -1256,6 +1614,49 @@ get_diskdump_regs_arm64(struct bt_info *bt, ulong *eip, ulong *esp)
 	machdep->get_stack_frame(bt, eip, esp);
 }
 
+static void
+get_diskdump_regs_mips(struct bt_info *bt, ulong *eip, ulong *esp)
+{
+	machdep->get_stack_frame(bt, eip, esp);
+}
+
+static void
+get_diskdump_regs_riscv64(struct bt_info *bt, ulong *eip, ulong *esp)
+{
+	machdep->get_stack_frame(bt, eip, esp);
+}
+
+static void
+get_diskdump_regs_loongarch64(struct bt_info *bt, ulong *eip, ulong *esp)
+{
+	machdep->get_stack_frame(bt, eip, esp);
+}
+
+static void
+get_diskdump_regs_sparc64(struct bt_info *bt, ulong *eip, ulong *esp)
+{
+	Elf64_Nhdr *note;
+	int len;
+
+	if (KDUMP_CMPRS_VALID() &&
+		(bt->task == tt->panic_task ||
+		(is_task_active(bt->task) && dd->num_prstatus_notes > 1))) {
+		note  = (Elf64_Nhdr *)dd->nt_prstatus_percpu[bt->tc->processor];
+		if (!note)
+			error(FATAL,
+				    "cannot determine NT_PRSTATUS ELF note "
+				    "for %s task: %lx\n",
+					(bt->task == tt->panic_task) ?
+					"panic" : "active", bt->task);
+		len = sizeof(Elf64_Nhdr);
+		len = roundup(len + note->n_namesz, 4);
+		bt->machdep = (void *)((char *)note + len +
+			MEMBER_OFFSET("elf_prstatus", "pr_reg"));
+	}
+
+	machdep->get_stack_frame(bt, eip, esp);
+}
+
 /*
  *  Send the request to the proper architecture hander.
  */
@@ -1267,6 +1668,10 @@ get_diskdump_regs(struct bt_info *bt, ulong *eip, ulong *esp)
 	{
 	case EM_ARM:
 		get_diskdump_regs_arm(bt, eip, esp);
+		break;
+
+	case EM_MIPS:
+		return get_diskdump_regs_mips(bt, eip, esp);
 		break;
 
 	case EM_386:
@@ -1300,6 +1705,18 @@ get_diskdump_regs(struct bt_info *bt, ulong *eip, ulong *esp)
 
 	case EM_AARCH64:
 		get_diskdump_regs_arm64(bt, eip, esp);
+		break;
+
+	case EM_SPARCV9:
+		get_diskdump_regs_sparc64(bt, eip, esp);
+		break;
+
+	case EM_RISCV:
+		get_diskdump_regs_riscv64(bt, eip, esp);
+		break;
+
+	case EM_LOONGARCH:
+		get_diskdump_regs_loongarch64(bt, eip, esp);
 		break;
 
 	default:
@@ -1370,10 +1787,10 @@ dump_vmcoreinfo(FILE *fp)
 	fprintf(fp, "                      ");
 	for (i = 0; i < size_vmcoreinfo; i++) {
 		fprintf(fp, "%c", buf[i]);
-		if (buf[i] == '\n')
+		if ((buf[i] == '\n') && ((i+1) != size_vmcoreinfo))
 			fprintf(fp, "                      ");
 	}
-	if (buf[i - 1] != '\n')
+	if (buf[i-1] != '\n')
 		fprintf(fp, "\n");
 err:
 	if (buf)
@@ -1426,7 +1843,7 @@ err:
 }
 
 static void
-dump_nt_prstatus_offset(FILE *fp)
+dump_note_offsets(FILE *fp)
 {
 	struct kdump_sub_header *sub_header_kdump = dd->sub_header_kdump;
 	size_t size;
@@ -1434,7 +1851,7 @@ dump_nt_prstatus_offset(FILE *fp)
 	Elf32_Nhdr *note32 = NULL;
 	Elf64_Nhdr *note64 = NULL;
 	size_t tot, len = 0;
-	int cnt;
+	int qemu, cnt;
 
 	if (KDUMP_CMPRS_VALID() && !(dd->flags & NO_ELF_NOTES) &&
 	    (dd->header->header_version >= 4) &&
@@ -1443,18 +1860,29 @@ dump_nt_prstatus_offset(FILE *fp)
 		size = sub_header_kdump->size_note;
 		offset = sub_header_kdump->offset_note;
 
-		fprintf(fp, "  NT_PRSTATUS_offset: ");
+		fprintf(fp, "        NOTE offsets: ");
 		for (tot = cnt = 0; tot < size; tot += len) {
+			qemu = FALSE;
 			if (machine_type("X86_64") || machine_type("S390X") ||
-			    machine_type("ARM64")) {
+			    machine_type("ARM64") || machine_type("PPC64") ||
+			    machine_type("SPARC64") || machine_type("MIPS64") ||
+			    machine_type("RISCV64") || machine_type("LOONGARCH64")) {
 				note64 = (void *)dd->notes_buf + tot;
 				len = sizeof(Elf64_Nhdr);
+				if (STRNEQ((char *)note64 + len, "QEMU"))
+					qemu = TRUE;
 				len = roundup(len + note64->n_namesz, 4);
 				len = roundup(len + note64->n_descsz, 4);
 
 				if (note64->n_type == NT_PRSTATUS) {
-					fprintf(fp, "%s%lx\n",
-						(tot == 0) ? "" : "                      ",
+					fprintf(fp, "%s%lx (NT_PRSTATUS)\n",
+						tot ? space(22) : "",
+						(ulong)(offset + tot));
+					cnt++;
+				} 
+				if (qemu) {
+					fprintf(fp, "%s%lx (QEMU)\n",
+						tot ? space(22) : "",
 						(ulong)(offset + tot));
 					cnt++;
 				}
@@ -1462,12 +1890,20 @@ dump_nt_prstatus_offset(FILE *fp)
 			} else if (machine_type("X86") || machine_type("PPC")) {
 				note32 = (void *)dd->notes_buf + tot;
 				len = sizeof(Elf32_Nhdr);
+				if (STRNEQ((char *)note32 + len, "QEMU"))
+					qemu = TRUE;
 				len = roundup(len + note32->n_namesz, 4);
 				len = roundup(len + note32->n_descsz, 4);
 
 				if (note32->n_type == NT_PRSTATUS) {
-					fprintf(fp, "%s%lx\n",
-						(tot == 0) ? "" : "                      ",
+					fprintf(fp, "%s%lx (NT_PRSTATUS)\n",
+						tot ? space(22) : "",
+						(ulong)(offset + tot));
+					cnt++;
+				}
+				if (qemu) {
+					fprintf(fp, "%s%lx (QEMU)\n",
+						tot ? space(22) : "",
 						(ulong)(offset + tot));
 					cnt++;
 				}
@@ -1513,6 +1949,8 @@ __diskdump_memory_dump(FILE *fp)
 		fprintf(fp, "%sLZO_SUPPORTED", others++ ? "|" : "");
 	if (dd->flags & SNAPPY_SUPPORTED)
 		fprintf(fp, "%sSNAPPY_SUPPORTED", others++ ? "|" : "");
+	if (dd->flags & ZSTD_SUPPORTED)
+		fprintf(fp, "%sZSTD_SUPPORTED", others++ ? "|" : "");
         fprintf(fp, ") %s\n", FLAT_FORMAT() ? "[FLAT]" : "");
         fprintf(fp, "               dfd: %d\n", dd->dfd);
         fprintf(fp, "               ofp: %lx\n", (ulong)dd->ofp);
@@ -1521,6 +1959,8 @@ __diskdump_memory_dump(FILE *fp)
 	{
 	case EM_ARM:
 		fprintf(fp, "(EM_ARM)\n"); break;
+	case EM_MIPS:
+		fprintf(fp, "(EM_MIPS)\n"); break;
 	case EM_386:
 		fprintf(fp, "(EM_386)\n"); break;
 	case EM_X86_64:
@@ -1535,6 +1975,10 @@ __diskdump_memory_dump(FILE *fp)
 		fprintf(fp, "(EM_S390)\n"); break;
 	case EM_AARCH64:
 		fprintf(fp, "(EM_AARCH64)\n"); break;
+	case EM_SPARCV9:
+		fprintf(fp, "(EM_SPARCV9)\n"); break;
+	case EM_LOONGARCH:
+		fprintf(fp, "(EM_LOONGARCH)\n"); break;
 	default:
 		fprintf(fp, "(unknown)\n"); break;
 	}
@@ -1575,6 +2019,12 @@ __diskdump_memory_dump(FILE *fp)
 			fprintf(fp, "DUMP_DH_COMPRESSED_LZO");
 		if (dh->status & DUMP_DH_COMPRESSED_SNAPPY)
 			fprintf(fp, "DUMP_DH_COMPRESSED_SNAPPY");
+		if (dh->status & DUMP_DH_COMPRESSED_ZSTD)
+			fprintf(fp, "DUMP_DH_COMPRESSED_ZSTD");
+		if (dh->status & DUMP_DH_COMPRESSED_INCOMPLETE)
+			fprintf(fp, "DUMP_DH_COMPRESSED_INCOMPLETE");
+		if (dh->status & DUMP_DH_EXCLUDED_VMEMMAP)
+			fprintf(fp, "DUMP_DH_EXCLUDED_VMEMMAP");
 		break;
 	}
 	fprintf(fp, ")\n");
@@ -1649,6 +2099,7 @@ __diskdump_memory_dump(FILE *fp)
 #define DL_EXCLUDE_USER_DATA    (0x008) /* Exclude UserProcessData Pages */
 #define DL_EXCLUDE_FREE         (0x010) /* Exclude Free Pages */
 
+			others = 0;
         		if (dump_level & DL_EXCLUDE_ZERO)
                 		fprintf(fp, "%sDUMP_EXCLUDE_ZERO", 
 					others++ ? "|" : "");
@@ -1704,15 +2155,37 @@ __diskdump_memory_dump(FILE *fp)
 			fprintf(fp, "           size_note: %lu (0x%lx)\n",
 				dd->sub_header_kdump->size_note,
 				dd->sub_header_kdump->size_note);
-			fprintf(fp, "  num_prstatus_notes: %d\n",
-				dd->num_prstatus_notes);
 			fprintf(fp, "           notes_buf: %lx\n",
 				(ulong)dd->notes_buf);
-			for (i = 0; i < dd->num_prstatus_notes; i++) {
-				fprintf(fp, "            notes[%d]: %lx\n",
-					i, (ulong)dd->nt_prstatus_percpu[i]);
+			fprintf(fp, "  num_vmcoredd_notes: %d\n",
+				dd->num_vmcoredd_notes);
+			for (i = 0; i < dd->num_vmcoredd_notes; i++) {
+				fprintf(fp, "            notes[%d]: %lx %s\n",
+					i, (ulong)dd->nt_vmcoredd_array[i],
+					dd->nt_vmcoredd_array[i] ? "(NT_VMCOREDD)" : "");
+				display_vmcoredd_note(dd->nt_vmcoredd_array[i], fp);
 			}
-			dump_nt_prstatus_offset(fp);
+
+			fprintf(fp, "  num_prstatus_notes: %d\n",
+				dd->num_prstatus_notes);
+			for (i = 0; i < dd->num_prstatus_notes; i++) {
+				fprintf(fp, "            notes[%d]: %lx %s\n",
+					i, (ulong)dd->nt_prstatus_percpu[i],
+					dd->nt_prstatus_percpu[i] ? "(NT_PRSTATUS)" : ""); 
+				display_ELF_note(dd->machine_type, PRSTATUS_NOTE,
+					 dd->nt_prstatus_percpu[i], fp);
+			}
+			fprintf(fp, "       snapshot_task: %lx %s\n", dd->snapshot_task, 
+				dd->snapshot_task ? "(NT_TASKSTRUCT)" : "");
+			fprintf(fp, "      num_qemu_notes: %d\n",
+				dd->num_qemu_notes);
+			for (i = 0; i < dd->num_qemu_notes; i++) {
+				fprintf(fp, "            notes[%d]: %lx (QEMUCPUState)\n",
+					i, (ulong)dd->nt_qemu_percpu[i]);
+				display_ELF_note(dd->machine_type, QEMU_NOTE,
+					dd->nt_qemu_percpu[i], fp);
+			}
+			dump_note_offsets(fp);
 		}
 		if (dh->header_version >= 5) {
 			fprintf(fp, "    offset_eraseinfo: %llu (0x%llx)\n",
@@ -1782,6 +2255,7 @@ __diskdump_memory_dump(FILE *fp)
 	else
 		fprintf(fp, "\n");
 	fprintf(fp, "       valid_pages: %lx\n", (ulong)dd->valid_pages);
+	fprintf(fp, " total_valid_pages: %ld\n", dd->valid_pages[dd->max_sect_len]);
 
 	return 0;
 }
@@ -1821,7 +2295,7 @@ get_diskdump_switch_stack(ulong task)
  *  Version 1 and later compressed kdump dumpfiles contain the dump level
  *  in an additional field of the sub_header_kdump structure.
  */
-static int 
+int
 get_dump_level(void)
 {
 	int dump_level;
@@ -1857,13 +2331,19 @@ show_split_dumpfiles(void)
 {
 	int i;
 	struct diskdump_data *ddp;
+	struct disk_dump_header *dh;
 
         for (i = 0; i < num_dumpfiles; i++) {
         	ddp = dd_list[i];
-		fprintf(fp, "%s%s %s", 
+		dh = ddp->header;
+		fprintf(fp, "%s%s%s%s%s", 
 			i ? "              " : "", 
 			ddp->filename, 
-			is_partial_diskdump() ? "[PARTIAL DUMP]" : "");
+			is_partial_diskdump() ? " [PARTIAL DUMP]" : "",
+			dh->status & DUMP_DH_COMPRESSED_INCOMPLETE ? 
+			" [INCOMPLETE]" : "",
+			dh->status & DUMP_DH_EXCLUDED_VMEMMAP ? 
+			" [EXCLUDED VMEMMAP]" : "");
 		if ((i+1) < num_dumpfiles)
 			fprintf(fp, "\n");
 	}
@@ -1872,8 +2352,20 @@ show_split_dumpfiles(void)
 void *
 diskdump_get_prstatus_percpu(int cpu)
 {
+	int online;
+
 	if ((cpu < 0) || (cpu >= dd->num_prstatus_notes))
 		return NULL;
+
+	/*
+	 * If no cpu mapping was done, then there must be
+	 * a one-to-one relationship between the number
+	 * of online cpus and the number of notes.
+	 */
+        if ((online = get_cpus_online()) && 
+	    (online == kt->cpus) &&
+	    (online != dd->num_prstatus_notes))
+                return NULL;
 
 	return dd->nt_prstatus_percpu[cpu];
 }
@@ -1893,6 +2385,9 @@ vmcoreinfo_read_string(const char *key)
 	off_t offset;
 	char keybuf[BUFSIZE];
 	const off_t failed = (off_t)-1;
+
+	if (dd->header->header_version < 3)
+		return NULL;
 
 	buf = value_string = NULL;
 	size_vmcoreinfo = dd->sub_header_kdump->size_vmcoreinfo;
@@ -1951,6 +2446,15 @@ diskdump_get_osrelease(void)
 		pc->flags2 &= ~GET_OSRELEASE;
 }
 
+static int
+valid_note_address(unsigned char *offset)
+{
+	if (offset > (dd->notes_buf + dd->sub_header_kdump->size_note))
+		return FALSE;
+	
+	return TRUE;
+}
+
 void
 diskdump_display_regs(int cpu, FILE *ofp)
 {
@@ -1959,9 +2463,10 @@ diskdump_display_regs(int cpu, FILE *ofp)
 	char *user_regs;
 	size_t len;
 
-	if (!diskdump_get_prstatus_percpu(cpu)) {
+	if ((cpu < 0) || (cpu >= dd->num_prstatus_notes) ||
+	    (dd->nt_prstatus_percpu[cpu] == NULL)) {
 		error(INFO, "registers not collected for cpu %d\n", cpu);
-		return;
+                return;
 	}
 
 	if (machine_type("X86_64")) {
@@ -1969,6 +2474,10 @@ diskdump_display_regs(int cpu, FILE *ofp)
 		len = sizeof(Elf64_Nhdr);
 		len = roundup(len + note64->n_namesz, 4);
 		len = roundup(len + note64->n_descsz, 4);
+		if (!valid_note_address((unsigned char *)note64 + len)) {
+			error(INFO, "invalid NT_PRSTATUS note for cpu %d\n", cpu);
+			return;
+		}
 		user_regs = (char *)note64 + len - SIZE(user_regs_struct) - sizeof(long);
 		fprintf(ofp,
 		    "    RIP: %016llx  RSP: %016llx  RFLAGS: %08llx\n"
@@ -2001,13 +2510,119 @@ diskdump_display_regs(int cpu, FILE *ofp)
 		);
 	}
 
+	if (machine_type("PPC64")) {
+		struct ppc64_elf_prstatus *prs;
+		struct ppc64_pt_regs *pr;
+
+		note64 = dd->nt_prstatus_percpu[cpu];
+		len = sizeof(Elf64_Nhdr);
+		len = roundup(len + note64->n_namesz, 4);
+		len = roundup(len + note64->n_descsz, 4);
+		if (!valid_note_address((unsigned char *)note64 + len)) {
+			error(INFO, "invalid NT_PRSTATUS note for cpu %d\n", cpu);
+			return;
+		}
+
+		prs = (struct ppc64_elf_prstatus *)
+			((char *)note64 + sizeof(Elf64_Nhdr) + note64->n_namesz);
+		prs = (struct ppc64_elf_prstatus *)roundup((ulong)prs, 4);
+		pr = &prs->pr_reg;
+
+		fprintf(ofp, 
+			"     R0: %016lx   R1: %016lx   R2: %016lx\n"
+			"     R3: %016lx   R4: %016lx   R5: %016lx\n"
+			"     R6: %016lx   R7: %016lx   R8: %016lx\n"
+			"     R9: %016lx  R10: %016lx  R11: %016lx\n"
+			"    R12: %016lx  R13: %016lx  R14: %016lx\n"
+			"    R15: %016lx  R16: %016lx  R16: %016lx\n"
+			"    R18: %016lx  R19: %016lx  R20: %016lx\n"
+			"    R21: %016lx  R22: %016lx  R23: %016lx\n"
+			"    R24: %016lx  R25: %016lx  R26: %016lx\n"
+			"    R27: %016lx  R28: %016lx  R29: %016lx\n"
+			"    R30: %016lx  R31: %016lx\n"
+			"      NIP: %016lx     MSR: %016lx\n"
+			"    OGPR3: %016lx     CTR: %016lx\n"  
+			"     LINK: %016lx     XER: %016lx\n"
+			"      CCR: %016lx      MQ: %016lx\n"
+			"     TRAP: %016lx     DAR: %016lx\n"
+			"    DSISR: %016lx  RESULT: %016lx\n",
+			pr->gpr[0], pr->gpr[1], pr->gpr[2],
+			pr->gpr[3], pr->gpr[4], pr->gpr[5],
+			pr->gpr[6], pr->gpr[7], pr->gpr[8],
+			pr->gpr[9], pr->gpr[10], pr->gpr[11],
+			pr->gpr[12], pr->gpr[13], pr->gpr[14],
+			pr->gpr[15], pr->gpr[16], pr->gpr[17],
+			pr->gpr[18], pr->gpr[19], pr->gpr[20],
+			pr->gpr[21], pr->gpr[22], pr->gpr[23],
+			pr->gpr[24], pr->gpr[25], pr->gpr[26],
+			pr->gpr[27], pr->gpr[28], pr->gpr[29],
+			pr->gpr[30], pr->gpr[31],
+			pr->nip, pr->msr, 
+			pr->orig_gpr3, pr->ctr,
+			pr->link, pr->xer,
+			pr->ccr, pr->mq,
+			pr->trap,  pr->dar, 
+			pr->dsisr, pr->result);
+	}
+
 	if (machine_type("ARM64")) {
 		note64 = dd->nt_prstatus_percpu[cpu];
 		len = sizeof(Elf64_Nhdr);
 		len = roundup(len + note64->n_namesz, 4);
 		len = roundup(len + note64->n_descsz, 4);
-//		user_regs = (char *)note64 + len - SIZE(user_regs_struct) - sizeof(long);
-		fprintf(ofp, "diskdump_display_regs: ARM64 register dump TBD\n");
+		if (!valid_note_address((unsigned char *)note64 + len)) {
+			error(INFO, "invalid NT_PRSTATUS note for cpu %d\n", cpu);
+			return;
+		}
+		user_regs = (char *)note64 + len - SIZE(elf_prstatus) + OFFSET(elf_prstatus_pr_reg);
+		fprintf(ofp,
+			"    X0: %016lx   X1: %016lx   X2: %016lx\n"
+			"    X3: %016lx   X4: %016lx   X5: %016lx\n"
+			"    X6: %016lx   X7: %016lx   X8: %016lx\n"
+			"    X9: %016lx  X10: %016lx  X11: %016lx\n"
+			"   X12: %016lx  X13: %016lx  X14: %016lx\n"
+			"   X15: %016lx  X16: %016lx  X17: %016lx\n"
+			"   X18: %016lx  X19: %016lx  X20: %016lx\n"
+			"   X21: %016lx  X22: %016lx  X23: %016lx\n"
+			"   X24: %016lx  X25: %016lx  X26: %016lx\n"
+			"   X27: %016lx  X28: %016lx  X29: %016lx\n"
+			"    LR: %016lx   SP: %016lx   PC: %016lx\n"
+			"   PSTATE: %08lx   FPVALID: %08x\n", 
+			ULONG(user_regs + sizeof(ulong) * 0),
+			ULONG(user_regs + sizeof(ulong) * 1),
+			ULONG(user_regs + sizeof(ulong) * 2),
+			ULONG(user_regs + sizeof(ulong) * 3),
+			ULONG(user_regs + sizeof(ulong) * 4),
+			ULONG(user_regs + sizeof(ulong) * 5),
+			ULONG(user_regs + sizeof(ulong) * 6),
+			ULONG(user_regs + sizeof(ulong) * 7),
+			ULONG(user_regs + sizeof(ulong) * 8),
+			ULONG(user_regs + sizeof(ulong) * 9),
+			ULONG(user_regs + sizeof(ulong) * 10),
+			ULONG(user_regs + sizeof(ulong) * 11),
+			ULONG(user_regs + sizeof(ulong) * 12),
+			ULONG(user_regs + sizeof(ulong) * 13),
+			ULONG(user_regs + sizeof(ulong) * 14),
+			ULONG(user_regs + sizeof(ulong) * 15),
+			ULONG(user_regs + sizeof(ulong) * 16),
+			ULONG(user_regs + sizeof(ulong) * 17),
+			ULONG(user_regs + sizeof(ulong) * 18),
+			ULONG(user_regs + sizeof(ulong) * 19),
+			ULONG(user_regs + sizeof(ulong) * 20),
+			ULONG(user_regs + sizeof(ulong) * 21),
+			ULONG(user_regs + sizeof(ulong) * 22),
+			ULONG(user_regs + sizeof(ulong) * 23),
+			ULONG(user_regs + sizeof(ulong) * 24),
+			ULONG(user_regs + sizeof(ulong) * 25),
+			ULONG(user_regs + sizeof(ulong) * 26),
+			ULONG(user_regs + sizeof(ulong) * 27),
+			ULONG(user_regs + sizeof(ulong) * 28),
+			ULONG(user_regs + sizeof(ulong) * 29),
+			ULONG(user_regs + sizeof(ulong) * 30),
+			ULONG(user_regs + sizeof(ulong) * 31),
+			ULONG(user_regs + sizeof(ulong) * 32),
+			ULONG(user_regs + sizeof(ulong) * 33),
+			UINT(user_regs + sizeof(ulong) * 34));
 	}
 
 	if (machine_type("X86")) {
@@ -2016,6 +2631,10 @@ diskdump_display_regs(int cpu, FILE *ofp)
 		len = roundup(len + note32->n_namesz, 4);
 		len = roundup(len + note32->n_descsz, 4);
 		user_regs = (char *)note32 + len - SIZE(user_regs_struct) - sizeof(int);
+		if (!valid_note_address((unsigned char *)note32 + len)) {
+			error(INFO, "invalid NT_PRSTATUS note for cpu %d\n", cpu);
+			return;
+		}
 		fprintf(ofp,
 		    "    EAX: %08x  EBX: %08x  ECX: %08x  EDX: %08x\n"
 		    "    ESP: %08x  EIP: %08x  ESI: %08x  EDI: %08x\n"
@@ -2040,6 +2659,15 @@ diskdump_display_regs(int cpu, FILE *ofp)
 		    UINT(user_regs + OFFSET(user_regs_struct_eflags))
 		);
 	}
+
+	if (machine_type("MIPS"))
+		mips_display_regs_from_elf_notes(cpu, ofp);
+
+	if (machine_type("MIPS64"))
+		mips64_display_regs_from_elf_notes(cpu, ofp);
+
+	if (machine_type("LOONGARCH64"))
+		loongarch64_display_regs_from_elf_notes(cpu, ofp);
 }
 
 void
@@ -2048,13 +2676,473 @@ dump_registers_for_compressed_kdump(void)
 	int c;
 
 	if (!KDUMP_CMPRS_VALID() || (dd->header->header_version < 4) ||
-	    !(machine_type("X86") || machine_type("X86_64") || machine_type("ARM64")))
+	    !(machine_type("X86") || machine_type("X86_64") ||
+	      machine_type("ARM64") || machine_type("PPC64") ||
+	      machine_type("MIPS") || machine_type("MIPS64") ||
+	      machine_type("RISCV64") || machine_type("LOONGARCH64")))
 		error(FATAL, "-r option not supported for this dumpfile\n");
 
+	if (machine_type("ARM64") && (kt->cpus != dd->num_prstatus_notes))
+		fprintf(fp, "NOTE: cpus: %d  NT_PRSTATUS notes: %d  "
+			"(note-to-cpu mapping is questionable)\n\n", 
+			kt->cpus, dd->num_prstatus_notes);
+
 	for (c = 0; c < kt->cpus; c++) {
-		fprintf(fp, "%sCPU %d:\n", c ? "\n" : "", c);
+		if (hide_offline_cpu(c)) {
+			fprintf(fp, "%sCPU %d: [OFFLINE]\n", c ? "\n" : "", c);
+			continue;
+		} else
+			fprintf(fp, "%sCPU %d:\n", c ? "\n" : "", c);
 		diskdump_display_regs(c, fp);
 	}
 }
 
+int
+diskdump_kaslr_check()
+{
+	if (!QEMU_MEM_DUMP_NO_VMCOREINFO())
+		return FALSE;
 
+	if (dd->num_qemu_notes)
+		return TRUE;
+
+	return FALSE;
+}
+
+int
+diskdump_get_nr_cpus(void)
+{
+        if (dd->num_prstatus_notes)
+                return dd->num_prstatus_notes;
+        else if (dd->num_qemu_notes)
+                return dd->num_qemu_notes;
+        else if (dd->num_vmcoredd_notes)
+                return dd->num_vmcoredd_notes;
+        else if (dd->header->nr_cpus)
+                return dd->header->nr_cpus;
+
+        return 1;
+}
+
+#ifdef X86_64
+QEMUCPUState *
+diskdump_get_qemucpustate(int cpu)
+{
+        if (cpu >= dd->num_qemu_notes) {
+                if (CRASHDEBUG(1))
+                        error(INFO,
+                            "Invalid index for QEMU Note: %d (>= %d)\n",
+                            cpu, dd->num_qemu_notes);
+                return NULL;
+        }
+
+        if (dd->machine_type != EM_X86_64) {
+                if (CRASHDEBUG(1))
+                        error(INFO, "Only x86_64 64bit is supported.\n");
+                return NULL;
+        }
+
+        return (QEMUCPUState *)dd->nt_qemucs_percpu[cpu];
+}
+#endif
+
+/*
+ * extract hardware specific device dumps from coredump.
+ */
+void
+diskdump_device_dump_extract(int index, char *outfile, FILE *ofp)
+{
+	ulonglong offset;
+
+	if (!dd->num_vmcoredd_notes)
+		error(FATAL, "no device dumps found in this dumpfile\n");
+	else if (index >= dd->num_vmcoredd_notes)
+		error(FATAL, "no device dump found at index: %d", index);
+
+	offset = dd->sub_header_kdump->offset_note +
+		 ((unsigned char *)dd->nt_vmcoredd_array[index] -
+		  dd->notes_buf);
+
+	devdump_extract(dd->nt_vmcoredd_array[index], offset, outfile, ofp);
+}
+
+/*
+ * list all hardware specific device dumps present in coredump.
+ */
+void
+diskdump_device_dump_info(FILE *ofp)
+{
+	ulonglong offset;
+	char buf[BUFSIZE];
+	ulong i;
+
+	if (!dd->num_vmcoredd_notes)
+		error(FATAL, "no device dumps found in this dumpfile\n");
+
+	fprintf(fp, "%s ", mkstring(buf, strlen("INDEX"), LJUST, "INDEX"));
+	fprintf(fp, " %s ", mkstring(buf, LONG_LONG_PRLEN, LJUST, "OFFSET"));
+	fprintf(fp, "  %s ", mkstring(buf, LONG_PRLEN, LJUST, "SIZE"));
+	fprintf(fp, "NAME\n");
+
+	for (i = 0; i < dd->num_vmcoredd_notes; i++) {
+		fprintf(fp, "%s  ", mkstring(buf, strlen("INDEX"), CENTER | INT_DEC, MKSTR(i)));
+		offset = dd->sub_header_kdump->offset_note +
+			 ((unsigned char *)dd->nt_vmcoredd_array[i] -
+			  dd->notes_buf);
+		devdump_info(dd->nt_vmcoredd_array[i], offset, ofp);
+	}
+}
+
+static ulong ZRAM_FLAG_SHIFT;
+static ulong ZRAM_FLAG_SAME_BIT;
+static ulong ZRAM_COMP_PRIORITY_BIT1;
+static ulong ZRAM_COMP_PRIORITY_MASK;
+
+static void
+zram_init(void)
+{
+	long zram_flag_shift;
+
+	MEMBER_OFFSET_INIT(zram_mem_pool, "zram", "mem_pool");
+	MEMBER_OFFSET_INIT(zram_compressor, "zram", "compressor");
+	if (INVALID_MEMBER(zram_compressor))
+		MEMBER_OFFSET_INIT(zram_comp_algs, "zram", "comp_algs");
+	MEMBER_OFFSET_INIT(zram_table_entry_flags, "zram_table_entry", "flags");
+	if (INVALID_MEMBER(zram_table_entry_flags))
+		MEMBER_OFFSET_INIT(zram_table_entry_flags, "zram_table_entry", "value");
+	STRUCT_SIZE_INIT(zram_table_entry, "zram_table_entry");
+	MEMBER_OFFSET_INIT(zs_pool_size_class, "zs_pool", "size_class");
+	MEMBER_OFFSET_INIT(size_class_size, "size_class", "size");
+	MEMBER_OFFSET_INIT(zspage_huge, "zspage", "huge");
+
+	if (enumerator_value("ZRAM_LOCK", &zram_flag_shift))
+		;
+	else if (THIS_KERNEL_VERSION >= LINUX(6,1,0))
+		zram_flag_shift = PAGESHIFT() + 1;
+	else
+		zram_flag_shift = 24;
+
+	ZRAM_FLAG_SHIFT = 1 << zram_flag_shift;
+	ZRAM_FLAG_SAME_BIT = 1 << (zram_flag_shift+1);
+	ZRAM_COMP_PRIORITY_BIT1 = ZRAM_FLAG_SHIFT + 7;
+	ZRAM_COMP_PRIORITY_MASK = 0x3;
+
+	if (CRASHDEBUG(1))
+		fprintf(fp, "zram_flag_shift: %ld\n", zram_flag_shift);
+}
+
+static unsigned char *
+zram_object_addr(ulong pool, ulong handle, unsigned char *zram_buf)
+{
+	ulong obj, off, class, page, zspage;
+	struct zspage zspage_s;
+	physaddr_t paddr;
+	unsigned int obj_idx, class_idx, size;
+	ulong pages[2], sizes[2];
+	ulong zs_magic;
+
+	readmem(handle, KVADDR, &obj, sizeof(void *), "zram entry", FAULT_ON_ERROR);
+	obj >>= OBJ_TAG_BITS;
+	phys_to_page(PTOB(obj >> OBJ_INDEX_BITS), &page);
+	obj_idx = (obj & OBJ_INDEX_MASK);
+
+	readmem(page + OFFSET(page_private), KVADDR, &zspage,
+			sizeof(void *), "page_private", FAULT_ON_ERROR);
+
+	readmem(zspage, KVADDR, &zspage_s, sizeof(struct zspage), "zspage", FAULT_ON_ERROR);
+	if (VALID_MEMBER(zspage_huge)) {
+		class_idx = zspage_s.v5_17.class;
+		zs_magic = zspage_s.v5_17.magic;
+	} else {
+		class_idx = zspage_s.v0.class;
+		zs_magic = zspage_s.v0.magic;
+	}
+
+	if (zs_magic != ZSPAGE_MAGIC)
+		error(FATAL, "zspage magic incorrect: %x\n", zs_magic);
+
+	class = pool + OFFSET(zs_pool_size_class);
+	class += (class_idx * sizeof(void *));
+	readmem(class, KVADDR, &class, sizeof(void *), "size_class", FAULT_ON_ERROR);
+	readmem(class + OFFSET(size_class_size), KVADDR,
+			&size, sizeof(unsigned int), "size of class_size", FAULT_ON_ERROR);
+	off = (size * obj_idx) & (~machdep->pagemask);
+	if (off + size <= PAGESIZE()) {
+		if (!is_page_ptr(page, &paddr)) {
+			error(WARNING, "zspage: %lx: not a page pointer\n", page);
+			return NULL;
+		}
+		readmem(paddr + off, PHYSADDR, zram_buf, size, "zram buffer", FAULT_ON_ERROR);
+		goto out;
+	}
+
+	pages[0] = page;
+	if (VALID_MEMBER(page_freelist))
+		readmem(page + OFFSET(page_freelist), KVADDR, &pages[1],
+			sizeof(void *), "page_freelist", FAULT_ON_ERROR);
+	else
+		readmem(page + OFFSET(page_index), KVADDR, &pages[1],
+			sizeof(void *), "page_index", FAULT_ON_ERROR);
+
+	sizes[0] = PAGESIZE() - off;
+	sizes[1] = size - sizes[0];
+	if (!is_page_ptr(pages[0], &paddr)) {
+		error(WARNING, "pages[0]: %lx: not a page pointer\n", pages[0]);
+		return NULL;
+	}
+
+	readmem(paddr + off, PHYSADDR, zram_buf, sizes[0], "zram buffer[0]", FAULT_ON_ERROR);
+	if (!is_page_ptr(pages[1], &paddr)) {
+		error(WARNING, "pages[1]: %lx: not a page pointer\n", pages[1]);
+		return NULL;
+	}
+
+	readmem(paddr, PHYSADDR, zram_buf + sizes[0], sizes[1], "zram buffer[1]", FAULT_ON_ERROR);
+
+out:
+	if (VALID_MEMBER(zspage_huge)) {
+		if (!zspage_s.v5_17.huge)
+			return (zram_buf + ZS_HANDLE_SIZE);
+	} else {
+		readmem(page, KVADDR, &obj, sizeof(void *), "page flags", FAULT_ON_ERROR);
+		if (!(obj & (1<<10))) // PG_OwnerPriv1 flag
+			return (zram_buf + ZS_HANDLE_SIZE);
+	}
+
+	return zram_buf;
+}
+
+static inline bool radix_tree_exceptional_entry(ulong entry)
+{
+	return entry & RADIX_TREE_EXCEPTIONAL_ENTRY;
+}
+
+static unsigned char *
+lookup_swap_cache(ulonglong pte_val, unsigned char *zram_buf)
+{
+	ulonglong swp_offset;
+	ulong swp_type, swp_space;
+	struct list_pair lp;
+	physaddr_t paddr;
+	static int is_xarray = -1;
+
+	if (is_xarray < 0) {
+		is_xarray = STREQ(MEMBER_TYPE_NAME("address_space", "i_pages"), "xarray");
+	}
+
+	swp_type = __swp_type(pte_val);
+	if (THIS_KERNEL_VERSION >= LINUX(2,6,0)) {
+		swp_offset = (ulonglong)__swp_offset(pte_val);
+	} else {
+		swp_offset = (ulonglong)SWP_OFFSET(pte_val);
+	}
+
+	if (!symbol_exists("swapper_spaces"))
+		return NULL;
+	swp_space = symbol_value("swapper_spaces");
+	swp_space += swp_type * sizeof(void *);
+
+	readmem(swp_space, KVADDR, &swp_space, sizeof(void *),
+			"swp_spaces", FAULT_ON_ERROR);
+	swp_space += (swp_offset >> SWAP_ADDRESS_SPACE_SHIFT) * SIZE(address_space);
+
+	lp.index = swp_offset;
+	if ((is_xarray ? do_xarray : do_radix_tree)
+		(swp_space+OFFSET(address_space_page_tree), RADIX_TREE_SEARCH, &lp)) {
+		if ((is_xarray ? xa_is_value : radix_tree_exceptional_entry)((ulong)lp.value)) {
+			/* ignore shadow values */
+			return NULL;
+		}
+		if (!is_page_ptr((ulong)lp.value, &paddr)) {
+			error(WARNING, "radix page: %lx: not a page pointer\n", lp.value);
+			return NULL;
+		}
+		readmem(paddr, PHYSADDR, zram_buf, PAGESIZE(), "zram buffer", FAULT_ON_ERROR);
+		return zram_buf;
+	}
+	return NULL;
+}
+
+static int get_disk_name_private_data(ulonglong pte_val, ulonglong vaddr,
+				       char *name, ulong *private_data)
+{
+	ulong swap_info, bdev, bd_disk;
+
+	if (!symbol_exists("swap_info"))
+		return FALSE;
+
+	swap_info = symbol_value("swap_info");
+
+	swap_info_init();
+	if (vt->flags & SWAPINFO_V2) {
+		swap_info += (__swp_type(pte_val) * sizeof(void *));
+		readmem(swap_info, KVADDR, &swap_info,
+				sizeof(void *), "swap_info", FAULT_ON_ERROR);
+	} else {
+		swap_info += (SIZE(swap_info_struct) * __swp_type(pte_val));
+	}
+
+	readmem(swap_info + OFFSET(swap_info_struct_bdev), KVADDR, &bdev,
+			sizeof(void *), "swap_info_struct_bdev", FAULT_ON_ERROR);
+	readmem(bdev + OFFSET(block_device_bd_disk), KVADDR, &bd_disk,
+			sizeof(void *), "block_device_bd_disk", FAULT_ON_ERROR);
+	if (name)
+		readmem(bd_disk + OFFSET(gendisk_disk_name), KVADDR, name,
+			strlen("zram"), "gendisk_disk_name", FAULT_ON_ERROR);
+	if (private_data)
+		readmem(bd_disk + OFFSET(gendisk_private_data), KVADDR,
+			private_data, sizeof(void *), "gendisk_private_data",
+			FAULT_ON_ERROR);
+
+	return TRUE;
+}
+
+ulong readswap(ulonglong pte_val, char *buf, ulong len, ulonglong vaddr)
+{
+	char name[32] = {0};
+
+	if (!get_disk_name_private_data(pte_val, vaddr, name, NULL))
+		return 0;
+
+	if (!strncmp(name, "zram", 4)) {
+		return try_zram_decompress(pte_val, (unsigned char *)buf, len, vaddr);
+	} else {
+		if (CRASHDEBUG(2))
+			error(WARNING, "this page has been swapped to %s\n", name);
+		return 0;
+	}
+}
+
+ulong (*decompressor)(unsigned char *in_addr, ulong in_size, unsigned char *out_addr,
+			ulong *out_size, void *other/* NOT USED */);
+/*
+ * If userspace address was swapped out to zram, this function is called to decompress the object.
+ * try_zram_decompress returns decompressed page data and data length
+ */
+ulong
+try_zram_decompress(ulonglong pte_val, unsigned char *buf, ulong len, ulonglong vaddr)
+{
+	char name[32] = {0};
+	ulonglong swp_offset;
+	unsigned char *obj_addr = NULL;
+	unsigned char *zram_buf = NULL;
+	unsigned char *outbuf = NULL;
+	ulong zram, zram_table_entry, sector, index, entry, flags, size,
+		outsize, off;
+
+	if (INVALID_MEMBER(zram_mem_pool)) {
+		zram_init();
+		if (INVALID_MEMBER(zram_mem_pool)) {
+			error(WARNING,
+			      "Some pages are swapped out to zram. "
+			      "Please run mod -s zram.\n");
+			return 0;
+		}
+	}
+
+	if (CRASHDEBUG(2))
+		error(WARNING, "this page has swapped to zram\n");
+
+	if (!get_disk_name_private_data(pte_val, vaddr, NULL, &zram))
+		return 0;
+
+	if (THIS_KERNEL_VERSION >= LINUX(2, 6, 0))
+		swp_offset = (ulonglong)__swp_offset(pte_val);
+	else
+		swp_offset = (ulonglong)SWP_OFFSET(pte_val);
+
+	sector = swp_offset << (PAGESHIFT() - 9);
+	index = sector >> SECTORS_PER_PAGE_SHIFT;
+	readmem(zram, KVADDR, &zram_table_entry,
+		sizeof(void *), "zram_table_entry", FAULT_ON_ERROR);
+	zram_table_entry += (index * SIZE(zram_table_entry));
+	readmem(zram_table_entry + OFFSET(zram_table_entry_flags), KVADDR, &flags,
+		sizeof(void *), "zram_table_entry.flags", FAULT_ON_ERROR);
+	if (VALID_MEMBER(zram_compressor))
+		readmem(zram + OFFSET(zram_compressor), KVADDR, name, sizeof(name),
+			"zram compressor", FAULT_ON_ERROR);
+	else {
+		ulong comp_alg_addr;
+		uint32_t prio = (flags >> ZRAM_COMP_PRIORITY_BIT1) & ZRAM_COMP_PRIORITY_MASK;
+		readmem(zram + OFFSET(zram_comp_algs) + sizeof(const char *) * prio, KVADDR,
+			&comp_alg_addr, sizeof(comp_alg_addr), "zram comp_algs", FAULT_ON_ERROR);
+		read_string(comp_alg_addr, name, sizeof(name));
+	}
+	if (STREQ(name, "lzo")) {
+#ifdef LZO
+		if (!(dd->flags & LZO_SUPPORTED)) {
+			if (lzo_init() == LZO_E_OK)
+				dd->flags |= LZO_SUPPORTED;
+			else
+				return 0;
+		}
+		decompressor = (void *)lzo1x_decompress_safe;
+#else
+		error(WARNING,
+		      "zram decompress error: this executable needs to be built"
+		      " with lzo library\n");
+		return 0;
+#endif
+	} else if (STREQ(name, "lzo-rle")) {
+		decompressor = (void *)&lzorle_decompress_safe;
+	} else { /* todo: support more compressor */
+		error(WARNING, "only the lzo compressor is supported\n");
+		return 0;
+	}
+
+	zram_buf = (unsigned char *)GETBUF(PAGESIZE());
+	/* lookup page from swap cache */
+	off = PAGEOFFSET(vaddr);
+	obj_addr = lookup_swap_cache(pte_val, zram_buf);
+	if (obj_addr != NULL) {
+		memcpy(buf, obj_addr + off, len);
+		goto out;
+	}
+
+	readmem(zram_table_entry, KVADDR, &entry,
+		sizeof(void *), "entry of table", FAULT_ON_ERROR);
+	if (!entry || (flags & ZRAM_FLAG_SAME_BIT)) {
+		int count;
+		ulong *same_buf = (ulong *)GETBUF(PAGESIZE());
+		for (count = 0; count < PAGESIZE() / sizeof(ulong); count++) {
+			same_buf[count] = entry;
+		}
+		memcpy(buf, same_buf + off, len);
+		FREEBUF(same_buf);
+		goto out;
+	}
+	size = flags & (ZRAM_FLAG_SHIFT -1);
+	if (size == 0) {
+		len = 0;
+		goto out;
+	}
+
+	readmem(zram + OFFSET(zram_mem_pool), KVADDR, &zram,
+		sizeof(void *), "zram.mem_pool", FAULT_ON_ERROR);
+
+	obj_addr = zram_object_addr(zram, entry, zram_buf);
+	if (obj_addr == NULL) {
+		len = 0;
+		goto out;
+	}
+
+	if (size == PAGESIZE()) {
+		memcpy(buf, obj_addr + off, len);
+	} else {
+		outbuf = (unsigned char *)GETBUF(PAGESIZE());
+		outsize = PAGESIZE();
+		if (!decompressor(obj_addr, size, outbuf, &outsize, NULL))
+			memcpy(buf, outbuf + off, len);
+		else {
+			error(WARNING, "zram decompress error\n");
+			len = 0;
+		}
+		FREEBUF(outbuf);
+	}
+
+out:
+	if (len && CRASHDEBUG(2))
+		error(INFO, "%lx: zram decompress success\n", vaddr);
+	FREEBUF(zram_buf);
+	return len;
+}

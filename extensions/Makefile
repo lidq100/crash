@@ -34,21 +34,22 @@ link_defs:
 
 $(CONTRIB_SO): %.so: %.c defs.h
 	@if [ -f $*.mk ]; then \
-		make -f $*.mk; \
+		$(MAKE) -f $*.mk; \
 	else \
 		grep '((constructor))' $*.c > .constructor; \
 		if [ -s .constructor ]; then \
-			echo "gcc -Wall -shared -rdynamic -o $@ $*.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS)"; \
-			gcc -Wall -shared -rdynamic -o $@ $*.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS); \
+			echo "gcc -Wall -g -shared -rdynamic -o $@ $*.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS)"; \
+			gcc -Wall -g -shared -rdynamic -o $@ $*.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS); \
 		fi; \
 		if [ ! -s .constructor ]; then \
-			echo "gcc -Wall -nostartfiles -shared -rdynamic -o $@ $*.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS)"; \
-			gcc -Wall -nostartfiles -shared -rdynamic -o $@ $*.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS); \
+			echo "gcc -Wall -g -nostartfiles -shared -rdynamic -o $@ $*.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS)"; \
+			gcc -Wall -g -nostartfiles -shared -rdynamic -o $@ $*.c -fPIC -D$(TARGET) $(TARGET_CFLAGS) $(GDB_FLAGS); \
 		fi; \
+		rm -f .constructor; \
 	fi
 
 clean:
 	rm -f $(CONTRIB_SO)
 	@for MAKEFILE in `grep -sl "^clean:" *.mk`; \
-	  do make --no-print-directory -f $$MAKEFILE clean; \
+	  do $(MAKE) -f $$MAKEFILE clean; \
 	done

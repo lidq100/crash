@@ -16,6 +16,7 @@
  */
 
 #include "defs.h"
+#include "vmcore.h"
 
 static void dump_blkdevs(ulong);
 static void dump_chrdevs(ulong);
@@ -23,7 +24,9 @@ static void dump_blkdevs_v2(ulong);
 static void dump_blkdevs_v3(ulong);
 static ulong search_cdev_map_probes(char *, int, int, ulong *);
 static ulong search_bdev_map_probes(char *, int, int, ulong *);
+static ulong search_blockdev_inodes(int, ulong *);
 static void do_pci(void); 
+static void do_pci2(void);
 static void do_io(void);
 static void do_resource_list(ulong, char *, int);
 
@@ -31,7 +34,7 @@ static const char *pci_strclass (uint, char *);
 static const char *pci_strvendor(uint, char *); 
 static const char *pci_strdev(uint, uint, char *); 
 
-static void diskio_option(void);
+static void diskio_option(ulong flags);
  
 static struct dev_table {
         ulong flags;
@@ -42,17 +45,32 @@ struct dev_table *dt = &dev_table;
 #define DEV_INIT    0x1
 #define DISKIO_INIT 0x2
 
+#define DIOF_ALL	1 << 0
+#define DIOF_NONZERO	1 << 1
+
 void
 dev_init(void)
 {
         MEMBER_OFFSET_INIT(pci_dev_global_list, "pci_dev", "global_list");
         MEMBER_OFFSET_INIT(pci_dev_next, "pci_dev", "next");
         MEMBER_OFFSET_INIT(pci_dev_bus, "pci_dev", "bus");
+	MEMBER_OFFSET_INIT(pci_dev_dev, "pci_dev", "dev");
         MEMBER_OFFSET_INIT(pci_dev_devfn, "pci_dev", "devfn");
         MEMBER_OFFSET_INIT(pci_dev_class, "pci_dev", "class");
         MEMBER_OFFSET_INIT(pci_dev_device, "pci_dev", "device");
+	MEMBER_OFFSET_INIT(pci_dev_hdr_type, "pci_dev", "hdr_type");
+	MEMBER_OFFSET_INIT(pci_dev_pcie_flags_reg, "pci_dev", "pcie_flags_reg");
         MEMBER_OFFSET_INIT(pci_dev_vendor, "pci_dev", "vendor");
 	MEMBER_OFFSET_INIT(pci_bus_number, "pci_bus", "number");
+	MEMBER_OFFSET_INIT(pci_bus_node, "pci_bus", "node");
+	MEMBER_OFFSET_INIT(pci_bus_devices, "pci_bus", "devices");
+	MEMBER_OFFSET_INIT(pci_bus_dev, "pci_bus", "dev");
+	MEMBER_OFFSET_INIT(pci_bus_children, "pci_bus", "children");
+	MEMBER_OFFSET_INIT(pci_bus_parent, "pci_bus", "parent");
+	MEMBER_OFFSET_INIT(pci_bus_self, "pci_bus", "self");
+
+	MEMBER_OFFSET_INIT(device_kobj, "device", "kobj");
+	MEMBER_OFFSET_INIT(kobject_name, "kobject", "name");
 
         STRUCT_SIZE_INIT(resource, "resource");
 	if ((VALID_STRUCT(resource) && symbol_exists("do_resource_list")) ||
@@ -88,16 +106,22 @@ dev_init(void)
 void
 cmd_dev(void)
 {
-        int c;
+	int c;
+	int dd_index = -1;
+	char *outputfile = NULL;
 	ulong flags;
 
 	flags = 0;
 
-        while ((c = getopt(argcnt, args, "dpi")) != EOF) {
+	while ((c = getopt(argcnt, args, "dDpiVv:")) != EOF) {
                 switch(c)
                 {
 		case 'd':
-			diskio_option();
+			diskio_option(DIOF_ALL);
+			return;
+
+		case 'D':
+			diskio_option(DIOF_NONZERO);
 			return;
 
 		case 'i':
@@ -107,11 +131,30 @@ cmd_dev(void)
 			return;
 
 		case 'p':
-			if (machine_type("S390X") ||
-			    (THIS_KERNEL_VERSION >= LINUX(2,6,26)))
+			if (machine_type("S390X"))
 				option_not_supported(c);
-			do_pci();
+			if (symbol_exists("pci_devices"))
+				do_pci();
+			else if (symbol_exists("pci_root_buses"))
+				do_pci2();
+			else
+				option_not_supported(c);
 			return;
+
+		case 'V':
+			if (KDUMP_DUMPFILE())
+				kdump_device_dump_info(fp);
+			else if (DISKDUMP_DUMPFILE())
+				diskdump_device_dump_info(fp);
+			else if (ACTIVE())
+				error(INFO, "-V option not supported on a live system\n");
+			else
+				error(INFO, "-V option not supported on this dumpfile type\n");
+			return;
+
+		case 'v':
+			dd_index = atoi(optarg);
+			break;
 
                 default:
                         argerrs++;
@@ -121,6 +164,29 @@ cmd_dev(void)
 
         if (argerrs)
                 cmd_usage(pc->curcmd, SYNOPSIS);
+
+        while (args[optind]) {
+		if (dd_index >= 0) {
+			if (!outputfile) 
+				outputfile = args[optind];
+			else
+				cmd_usage(pc->curcmd, SYNOPSIS);
+		} else
+			cmd_usage(pc->curcmd, SYNOPSIS);
+		optind++;
+	}
+
+	if (dd_index >= 0) {
+		if (KDUMP_DUMPFILE())
+			kdump_device_dump_extract(dd_index, outputfile, fp);
+		else if (DISKDUMP_DUMPFILE())
+			diskdump_device_dump_extract(dd_index, outputfile, fp);
+		else if (ACTIVE())
+			error(INFO, "-v option not supported on a live system\n");
+		else
+			error(INFO, "-v option not supported on this dumpfile type\n");
+		return;
+	}
 
 	dump_chrdevs(flags);
 	fprintf(fp, "\n");
@@ -428,9 +494,10 @@ dump_blkdevs(ulong flags)
                 ulong ops;
         } blkdevs[MAX_DEV], *bp;
 
-	if (kernel_symbol_exists("major_names") && 
-	    kernel_symbol_exists("bdev_map")) {
-                dump_blkdevs_v3(flags);
+	if (kernel_symbol_exists("major_names") &&
+	    (kernel_symbol_exists("bdev_map") ||
+	     kernel_symbol_exists("blockdev_superblock"))) {
+		dump_blkdevs_v3(flags);
 		return;
 	}
 
@@ -652,6 +719,7 @@ dump_blkdevs_v3(ulong flags)
 	char buf[BUFSIZE];
 	uint major;
 	ulong gendisk, addr, fops;
+	int use_bdev_map = kernel_symbol_exists("bdev_map");
 	
 	if (!(len = get_array_length("major_names", NULL, 0)))
 		len = MAX_DEV;
@@ -680,8 +748,11 @@ dump_blkdevs_v3(ulong flags)
 		strncpy(buf, blk_major_name_buf +  
 			OFFSET(blk_major_name_name), 16);
 
-		fops = search_bdev_map_probes(buf, major == i ? major : i, 
-			UNUSED, &gendisk);
+		if (use_bdev_map)
+			fops = search_bdev_map_probes(buf, major == i ? major : i,
+				UNUSED, &gendisk);
+		else /* v5.11 and later */
+			fops = search_blockdev_inodes(major, &gendisk);
 
 		if (CRASHDEBUG(1))
 			fprintf(fp, "blk_major_name: %lx block major: %d name: %s gendisk: %lx fops: %lx\n", 
@@ -760,6 +831,67 @@ search_bdev_map_probes(char *name, int major, int minor, ulong *gendisk)
 	}
 
 	FREEBUF(probe_buf);
+	FREEBUF(gendisk_buf);
+	return fops;
+}
+
+/* For bdev_inode.  See block/bdev.c */
+#define I_BDEV(inode) (inode - SIZE(block_device))
+
+static ulong
+search_blockdev_inodes(int major, ulong *gendisk)
+{
+	struct list_data list_data, *ld;
+	ulong addr, bd_sb, disk, fops = 0;
+	int i, inode_count, gendisk_major;
+	char *gendisk_buf;
+
+	ld = &list_data;
+	BZERO(ld, sizeof(struct list_data));
+
+	get_symbol_data("blockdev_superblock", sizeof(void *), &bd_sb);
+
+	addr = bd_sb + OFFSET(super_block_s_inodes);
+	if (!readmem(addr, KVADDR, &ld->start, sizeof(ulong),
+	    "blockdev_superblock.s_inodes", QUIET|RETURN_ON_ERROR))
+		return 0;
+
+	if (empty_list(ld->start))
+		return 0;
+
+	ld->flags |= LIST_ALLOCATE;
+	ld->end = bd_sb + OFFSET(super_block_s_inodes);
+	ld->list_head_offset = OFFSET(inode_i_sb_list);
+
+	inode_count = do_list(ld);
+
+	gendisk_buf = GETBUF(SIZE(gendisk));
+
+	for (i = 0; i < inode_count; i++) {
+		addr = I_BDEV(ld->list_ptr[i]) + OFFSET(block_device_bd_disk);
+		if (!readmem(addr, KVADDR, &disk, sizeof(ulong),
+		    "block_device.bd_disk", QUIET|RETURN_ON_ERROR))
+			continue;
+
+		if (!disk)
+			continue;
+
+		if (!readmem(disk, KVADDR, gendisk_buf, SIZE(gendisk),
+		    "gendisk buffer", QUIET|RETURN_ON_ERROR))
+			continue;
+
+		gendisk_major = INT(gendisk_buf + OFFSET(gendisk_major));
+		if (gendisk_major != major)
+			continue;
+
+		fops = ULONG(gendisk_buf + OFFSET(gendisk_fops));
+		if (fops) {
+			*gendisk = disk;
+			break;
+		}
+	}
+
+	FREEBUF(ld->list_ptr);
 	FREEBUF(gendisk_buf);
 	return fops;
 }
@@ -2210,6 +2342,313 @@ do_resource_list(ulong first_entry, char *resource_buf, int size)
 
 #endif /* USE_2_2_17_PCI_H */
 
+#define PCI_EXP_FLAGS_TYPE      0x00f0  /* Device/Port type */
+#define  PCI_EXP_TYPE_ENDPOINT  0x0     /* Express Endpoint */
+#define  PCI_EXP_TYPE_LEG_END   0x1     /* Legacy Endpoint */
+#define  PCI_EXP_TYPE_ROOT_PORT 0x4     /* Root Port */
+#define  PCI_EXP_TYPE_UPSTREAM  0x5     /* Upstream Port */
+#define  PCI_EXP_TYPE_DOWNSTREAM 0x6    /* Downstream Port */
+#define  PCI_EXP_TYPE_PCI_BRIDGE 0x7    /* PCIe to PCI/PCI-X Bridge */
+#define  PCI_EXP_TYPE_PCIE_BRIDGE 0x8   /* PCI/PCI-X to PCIe Bridge */
+#define  PCI_EXP_TYPE_RC_END    0x9     /* Root Complex Integrated Endpoint */
+#define  PCI_EXP_TYPE_RC_EC     0xa     /* Root Complex Event Collector */
+
+static void
+fill_dev_name(ulong pci_dev, char *name)
+{
+	ulong kobj, value;
+
+	memset(name, 0, sizeof(*name) * BUFSIZE);
+
+	kobj = pci_dev + OFFSET(pci_dev_dev) + OFFSET(device_kobj);
+
+	readmem(kobj + OFFSET(kobject_name),
+		KVADDR, &value, sizeof(void *), "kobject name",
+		FAULT_ON_ERROR);
+
+	read_string(value, name, BUFSIZE-1);
+}
+
+static void
+fill_bus_name(ulong pci_bus, char *name)
+{
+	ulong kobj, value;
+
+	memset(name, 0, sizeof(*name) * BUFSIZE);
+
+	kobj = pci_bus + OFFSET(pci_bus_dev) + OFFSET(device_kobj);
+
+	readmem(kobj + OFFSET(kobject_name),
+		KVADDR, &value, sizeof(void *), "kobject name",
+		FAULT_ON_ERROR);
+
+	read_string(value, name, BUFSIZE-1);
+}
+
+static void
+fill_dev_id(ulong pci_dev, char *id)
+{
+	unsigned short device, vendor;
+
+	memset(id, 0, sizeof(*id) * BUFSIZE);
+
+	readmem(pci_dev + OFFSET(pci_dev_device),
+		KVADDR, &device, sizeof(short), "pci dev device",
+		FAULT_ON_ERROR);
+	readmem(pci_dev + OFFSET(pci_dev_vendor), KVADDR,
+		&vendor, sizeof(short), "pci dev vendor", FAULT_ON_ERROR);
+
+	sprintf(id, "%x:%x", vendor, device);
+}
+
+static void
+fill_dev_class(ulong pci_dev, char *c)
+{
+	unsigned int class;
+
+	memset(c, 0, sizeof(*c) * BUFSIZE);
+	readmem(pci_dev + OFFSET(pci_dev_class), KVADDR,
+		&class, sizeof(int), "pci class", FAULT_ON_ERROR);
+
+	class >>= 8;
+
+	sprintf(c, "%04x", class);
+}
+
+static int
+pci_pcie_type(ulong cap)
+{
+	return (cap & PCI_EXP_FLAGS_TYPE) >> 4;
+}
+
+static int
+pci_is_bridge(unsigned char hdr_type)
+{
+	return hdr_type == PCI_HEADER_TYPE_BRIDGE ||
+		hdr_type == PCI_HEADER_TYPE_CARDBUS;
+}
+
+static void
+fill_pcie_type(ulong pcidev, char *t)
+{
+	int type, bufidx = 0;
+	unsigned short pciecap;
+	unsigned char hdr_type;
+
+	memset(t, 0, sizeof(*t) * BUFSIZE);
+
+	readmem(pcidev + OFFSET(pci_dev_hdr_type), KVADDR, &hdr_type,
+		sizeof(char), "pci dev hdr_type", FAULT_ON_ERROR);
+
+	if (!VALID_MEMBER(pci_dev_pcie_flags_reg))
+		goto bridge_chk;
+
+	readmem(pcidev + OFFSET(pci_dev_pcie_flags_reg), KVADDR, &pciecap,
+		sizeof(unsigned short), "pci dev pcie_flags_reg", FAULT_ON_ERROR);
+
+	type = pci_pcie_type(pciecap);
+
+	if (type == PCI_EXP_TYPE_ENDPOINT)
+		bufidx = sprintf(t, "ENDPOINT");
+	else if (type == PCI_EXP_TYPE_LEG_END)
+		bufidx = sprintf(t, "LEG_END");
+	else if (type == PCI_EXP_TYPE_ROOT_PORT)
+		bufidx = sprintf(t, "ROOT_PORT");
+	else if (type == PCI_EXP_TYPE_UPSTREAM)
+		bufidx = sprintf(t, "UPSTREAM");
+	else if (type == PCI_EXP_TYPE_DOWNSTREAM)
+		bufidx = sprintf(t, "DOWNSTREAM");
+	else if (type == PCI_EXP_TYPE_PCI_BRIDGE)
+		bufidx = sprintf(t, "PCI_BRIDGE");
+	else if (type == PCI_EXP_TYPE_PCIE_BRIDGE)
+		bufidx = sprintf(t, "PCIE_BRIDGE");
+	else if (type == PCI_EXP_TYPE_RC_END)
+		bufidx = sprintf(t, "RC_END");
+	else if (type == PCI_EXP_TYPE_RC_EC)
+		bufidx = sprintf(t, "RC_EC");
+
+bridge_chk:
+	if (pci_is_bridge(hdr_type))
+		sprintf(t + bufidx, " [BRIDGE]");
+}
+
+static void
+walk_devices(ulong pci_bus)
+{
+	struct list_data list_data, *ld;
+	int devcnt, i;
+	ulong *devlist, self;
+	char name[BUFSIZE], class[BUFSIZE], id[BUFSIZE], type[BUFSIZE];
+	char pcidev_hdr[BUFSIZE];
+	char buf1[BUFSIZE];
+	char buf2[BUFSIZE];
+	char buf3[BUFSIZE];
+	char buf4[BUFSIZE];
+	char buf5[BUFSIZE];
+
+	ld = &list_data;
+
+	BZERO(ld, sizeof(struct list_data));
+
+	readmem(pci_bus + OFFSET(pci_bus_devices), KVADDR,
+		&ld->start, sizeof(void *), "pci bus devices",
+		FAULT_ON_ERROR);
+
+	if (VALID_MEMBER(pci_dev_pcie_flags_reg))
+		snprintf(pcidev_hdr, sizeof(pcidev_hdr), "%s %s %s %s %s\n",
+			mkstring(buf1, VADDR_PRLEN, CENTER, "PCI DEV"),
+			mkstring(buf2, strlen("0000:00:00.0"), CENTER, "DO:BU:SL.FN"),
+			mkstring(buf3, strlen("0000") + 2, CENTER, "CLASS"),
+			mkstring(buf4, strlen("0000:0000"), CENTER, "PCI_ID"),
+			mkstring(buf5, 10, CENTER, "TYPE"));
+	else
+		snprintf(pcidev_hdr, sizeof(pcidev_hdr), "%s %s %s %s\n",
+			mkstring(buf1, VADDR_PRLEN, CENTER, "PCI DEV"),
+			mkstring(buf2, strlen("0000:00:00.0"), CENTER, "DO:BU:SL.FN"),
+			mkstring(buf3, strlen("0000") + 2, CENTER, "CLASS"),
+			mkstring(buf4, strlen("0000:0000"), CENTER, "PCI_ID"));
+
+	fprintf(fp, "  %s", pcidev_hdr);
+
+	readmem(pci_bus + OFFSET(pci_bus_self), KVADDR, &self,
+		sizeof(void *), "pci bus self", FAULT_ON_ERROR);
+	if (self) {
+		fill_dev_name(self, name);
+		fill_dev_class(self, class);
+		fill_dev_id(self, id);
+		fill_pcie_type(self, type);
+		fprintf(fp, "  %s %s %s %s %s\n",
+			mkstring(buf1, VADDR_PRLEN, LJUST|LONG_HEX,
+			MKSTR(self)),
+			mkstring(buf2, strlen("0000:00:00.0"), CENTER, name),
+			mkstring(buf3, strlen("0000") + 2, CENTER, class),
+			mkstring(buf4, strlen("0000:0000"), CENTER, id),
+			mkstring(buf5, 10, CENTER, type));
+	}
+
+	if (ld->start == (pci_bus + OFFSET(pci_bus_devices)))
+		return;
+
+	ld->end = pci_bus + OFFSET(pci_bus_devices);
+	hq_open();
+	devcnt = do_list(ld);
+	devlist = (ulong *)GETBUF(devcnt * sizeof(ulong));
+	devcnt = retrieve_list(devlist, devcnt);
+	hq_close();
+
+	for (i = 0; i < devcnt; i++) {
+		fill_dev_name(devlist[i], name);
+		fill_dev_class(devlist[i], class);
+		fill_dev_id(devlist[i], id);
+		fill_pcie_type(devlist[i], type);
+		fprintf(fp, "  %s %s %s %s %s\n",
+			mkstring(buf1, VADDR_PRLEN, LJUST|LONG_HEX,
+			MKSTR(devlist[i])),
+			mkstring(buf2, strlen("0000:00:00.0"), CENTER, name),
+			mkstring(buf3, strlen("0000") + 2, CENTER, class),
+			mkstring(buf4, strlen("0000:0000"), CENTER, id),
+			mkstring(buf5, 10, CENTER, type));
+	}
+	FREEBUF(devlist);
+}
+
+static void
+walk_buses(ulong pci_bus)
+{
+	struct list_data list_data, *ld;
+	int buscnt, i;
+	ulong *buslist, parent;
+	char pcibus_hdr[BUFSIZE];
+	char buf1[BUFSIZE];
+	char buf2[BUFSIZE];
+
+	ld = &list_data;
+
+	BZERO(ld, sizeof(struct list_data));
+
+	readmem(pci_bus + OFFSET(pci_bus_children), KVADDR,
+		&ld->start, sizeof(void *), "pci bus children",
+		FAULT_ON_ERROR);
+
+	if (ld->start == (pci_bus + OFFSET(pci_bus_children)))
+		return;
+
+	ld->end = pci_bus + OFFSET(pci_bus_children);
+	hq_open();
+	buscnt = do_list(ld);
+	buslist = (ulong *)GETBUF(buscnt * sizeof(ulong));
+	buscnt = retrieve_list(buslist, buscnt);
+	hq_close();
+
+	snprintf(pcibus_hdr, sizeof(pcibus_hdr), "%s %s\n",
+		mkstring(buf1, VADDR_PRLEN, CENTER, "PCI BUS"),
+		mkstring(buf2, VADDR_PRLEN, CENTER, "PARENT BUS"));
+
+	for (i = 0; i < buscnt; i++) {
+		readmem(buslist[i] + OFFSET(pci_bus_parent), KVADDR, &parent,
+			sizeof(void *), "pci bus parent", FAULT_ON_ERROR);
+
+		fprintf(fp, "  %s", pcibus_hdr);
+
+		fprintf(fp, "  %s %s\n",
+			mkstring(buf1, VADDR_PRLEN, LJUST|LONG_HEX,
+			MKSTR(buslist[i])),
+			mkstring(buf2, VADDR_PRLEN, LJUST|LONG_HEX,
+			MKSTR(parent)));
+		walk_devices(buslist[i]);
+		fprintf(fp, "\n");
+		walk_buses(buslist[i]);
+	}
+	FREEBUF(buslist);
+}
+
+static void
+do_pci2(void)
+{
+	struct list_data list_data, *ld;
+	int rootbuscnt, i;
+	ulong *rootbuslist;
+	unsigned long pci_root_bus_addr = symbol_value("pci_root_buses");
+	char name[BUFSIZE];
+	char pcirootbus_hdr[BUFSIZE];
+	char buf1[BUFSIZE];
+	char buf2[BUFSIZE];
+
+	ld = &list_data;
+	BZERO(ld, sizeof(struct list_data));
+
+	get_symbol_data("pci_root_buses", sizeof(void *), &ld->start);
+
+	if (ld->start == pci_root_bus_addr)
+		error(FATAL, "no PCI devices found on this system.\n");
+
+	ld->end = pci_root_bus_addr;
+
+	hq_open();
+	rootbuscnt = do_list(ld);
+	rootbuslist = (ulong *)GETBUF(rootbuscnt * sizeof(ulong));
+	rootbuscnt = retrieve_list(rootbuslist, rootbuscnt);
+	hq_close();
+
+	snprintf(pcirootbus_hdr, sizeof(pcirootbus_hdr), "%s %s\n",
+			mkstring(buf1, VADDR_PRLEN, CENTER, "ROOT BUS"),
+			mkstring(buf2, strlen("0000:00"), CENTER, "BUSNAME"));
+
+	for (i = 0; i < rootbuscnt; i++) {
+		fprintf(fp, "%s", pcirootbus_hdr);
+		fill_bus_name(rootbuslist[i], name);
+		fprintf(fp, "%s %s\n",
+			mkstring(buf1, VADDR_PRLEN, LJUST|LONG_HEX,
+			MKSTR(rootbuslist[i])),
+			mkstring(buf2, strlen("0000:00"), CENTER, name));
+		 walk_devices(rootbuslist[i]);
+		 walk_buses(rootbuslist[i]);
+
+		fprintf(fp, "\n");
+	}
+	FREEBUF(rootbuslist);
+}
+
 static void
 do_pci(void)
 {
@@ -2222,9 +2661,6 @@ do_pci(void)
 	char 		  buf1[BUFSIZE];
 	char 		  buf2[BUFSIZE];
 	char 		  buf3[BUFSIZE];
-
-	if (!symbol_exists("pci_devices"))
-		error(FATAL, "no PCI devices found on this system.\n");
 
 	BZERO(&pcilist_data, sizeof(struct list_data));
 
@@ -3646,7 +4082,7 @@ struct iter {
 	 * this function reads request_list.count[2], and the first argument
 	 * is the address of request_queue.
 	 */
-	void (*get_diskio)(unsigned long , struct diskio *);
+	void (*get_diskio)(unsigned long , unsigned long, struct diskio *);
 
 	/*
 	 * check if device.type == &disk_type
@@ -3692,6 +4128,30 @@ get_gendisk_4(unsigned long entry)
 		OFFSET(gendisk_part0);
 }
 
+/* kernel version >= 5.1 */
+static unsigned long
+get_gendisk_5(unsigned long entry)
+{
+	unsigned long device_address;
+	unsigned long device_private_address;
+	unsigned long gendisk;
+
+	device_private_address = entry - OFFSET(device_private_knode_class);
+	readmem(device_private_address + OFFSET(device_private_device),
+		KVADDR, &device_address, sizeof(device_address),
+		"device_private.device", FAULT_ON_ERROR);
+
+	if (VALID_MEMBER(hd_struct_dev))
+		return device_address - OFFSET(hd_struct_dev) - OFFSET(gendisk_part0);
+
+	/* kernel version >= 5.11 */
+	readmem(device_address - OFFSET(block_device_bd_device) +
+		OFFSET(block_device_bd_disk), KVADDR, &gendisk,
+		sizeof(ulong), "block_device.bd_disk", FAULT_ON_ERROR);
+
+	return gendisk;
+}
+
 /* 2.6.24 < kernel version <= 2.6.27 */
 static int 
 match_list(struct iter *i, unsigned long entry)
@@ -3714,8 +4174,18 @@ match_klist(struct iter *i, unsigned long entry)
 {
 	unsigned long device_address;
 	unsigned long device_type;
+	unsigned long device_private_address;
 
-	device_address = entry - OFFSET(device_knode_class);
+	if (VALID_MEMBER(device_knode_class))
+		device_address = entry - OFFSET(device_knode_class);
+	else {
+		/* kernel version >= 5.1 */
+		device_private_address = entry -
+			OFFSET(device_private_knode_class);
+		readmem(device_private_address + OFFSET(device_private_device),
+			KVADDR, &device_address, sizeof(device_address),
+			"device_private.device", FAULT_ON_ERROR);
+	}
 	readmem(device_address + OFFSET(device_type), KVADDR, &device_type,
 		sizeof(device_type), "device.type", FAULT_ON_ERROR);
 	if (device_type != i->type_address)
@@ -3800,18 +4270,329 @@ again:
 	return i->get_gendisk(klist_node_address);
 }
 
-/* read request_queue.rq.count[2] */
-static void 
-get_diskio_1(unsigned long rq, struct diskio *io)
+static int
+use_mq_interface(unsigned long q)
 {
-	int count[2];
+	unsigned long mq_ops;
 
-	readmem(rq + OFFSET(request_queue_rq) + OFFSET(request_list_count),
-		KVADDR, count, sizeof(int) * 2, "request_list.count",
+	if (!VALID_MEMBER(request_queue_mq_ops))
+		return 0;
+
+	readmem(q + OFFSET(request_queue_mq_ops), KVADDR, &mq_ops,
+		sizeof(ulong), "request_queue.mq_ops", FAULT_ON_ERROR);
+
+	if (mq_ops == 0)
+		return 0;
+	else
+		return 1;
+}
+
+static void
+get_one_mctx_diskio(unsigned long mctx, struct diskio *io)
+{
+	unsigned long dispatch[2];
+	unsigned long comp[2];
+
+	readmem(mctx + OFFSET(blk_mq_ctx_rq_dispatched),
+		KVADDR, dispatch, sizeof(ulong) * 2, "blk_mq_ctx.rq_dispatched",
 		FAULT_ON_ERROR);
 
-	io->read = count[0];
-	io->write = count[1];
+	readmem(mctx + OFFSET(blk_mq_ctx_rq_completed),
+		KVADDR, comp, sizeof(ulong) * 2, "blk_mq_ctx.rq_completed",
+		FAULT_ON_ERROR);
+
+	io->read = (dispatch[0] - comp[0]);
+	io->write = (dispatch[1] - comp[1]);
+}
+
+typedef bool (busy_tag_iter_fn)(ulong rq, void *data);
+
+struct mq_inflight {
+	ulong q;
+	struct diskio *dio;
+};
+
+struct bt_iter_data {
+	ulong tags;
+	uint reserved;
+	uint nr_reserved_tags;
+	busy_tag_iter_fn *fn;
+	void *data;
+};
+
+/*
+ * See the include/linux/blk_types.h and include/linux/blk-mq.h
+ */
+#define MQ_RQ_IN_FLIGHT 1
+#define REQ_OP_BITS     8
+#define REQ_OP_MASK     ((1 << REQ_OP_BITS) - 1)
+
+static uint op_is_write(uint op)
+{
+	return (op & REQ_OP_MASK) & 1;
+}
+
+static bool mq_check_inflight(ulong rq, void *data)
+{
+	uint cmd_flags = 0, state = 0;
+	ulong addr = 0, queue = 0;
+	struct mq_inflight *mi = data;
+
+	if (!IS_KVADDR(rq))
+		return TRUE;
+
+	addr = rq + OFFSET(request_q);
+	if (!readmem(addr, KVADDR, &queue, sizeof(ulong), "request.q", RETURN_ON_ERROR))
+		return FALSE;
+
+	addr = rq + OFFSET(request_cmd_flags);
+	if (!readmem(addr, KVADDR, &cmd_flags, sizeof(uint), "request.cmd_flags", RETURN_ON_ERROR))
+		return FALSE;
+
+	addr = rq + OFFSET(request_state);
+	if (!readmem(addr, KVADDR, &state, sizeof(uint), "request.state", RETURN_ON_ERROR))
+		return FALSE;
+
+	if (queue == mi->q && state == MQ_RQ_IN_FLIGHT) {
+		if (op_is_write(cmd_flags))
+			mi->dio->write++;
+		else
+			mi->dio->read++;
+	}
+
+	return TRUE;
+}
+
+static bool bt_iter(uint bitnr, void *data)
+{
+	ulong addr = 0, rqs_addr = 0, rq = 0;
+	struct bt_iter_data *iter_data = data;
+	ulong tag = iter_data->tags;
+
+	if (!iter_data->reserved)
+		bitnr += iter_data->nr_reserved_tags;
+
+	/* rqs */
+	addr = tag + OFFSET(blk_mq_tags_rqs);
+	if (!readmem(addr, KVADDR, &rqs_addr, sizeof(void *), "blk_mq_tags.rqs", RETURN_ON_ERROR))
+		return FALSE;
+
+	addr = rqs_addr + bitnr * sizeof(ulong); /* rqs[bitnr] */
+	if (!readmem(addr, KVADDR, &rq, sizeof(ulong), "blk_mq_tags.rqs[]", RETURN_ON_ERROR))
+		return FALSE;
+
+	return iter_data->fn(rq, iter_data->data);
+}
+
+static void bt_for_each(ulong q, ulong tags, ulong sbq, uint reserved, uint nr_resvd_tags, struct diskio *dio)
+{
+	struct sbitmap_context sc = {0};
+	struct mq_inflight mi = {
+		.q = q,
+		.dio = dio,
+	};
+	struct bt_iter_data iter_data = {
+		.tags = tags,
+		.reserved = reserved,
+		.nr_reserved_tags = nr_resvd_tags,
+		.fn = mq_check_inflight,
+		.data = &mi,
+	};
+
+	sbitmap_context_load(sbq + OFFSET(sbitmap_queue_sb), &sc);
+	sbitmap_for_each_set(&sc, bt_iter, &iter_data);
+}
+
+static void queue_for_each_hw_ctx(ulong q, ulong *hctx, uint cnt, struct diskio *dio)
+{
+	uint i;
+	int bitmap_tags_is_ptr = 0;
+
+	if (MEMBER_TYPE("blk_mq_tags", "bitmap_tags") == TYPE_CODE_PTR)
+		bitmap_tags_is_ptr = 1;
+
+	for (i = 0; i < cnt; i++) {
+		ulong addr = 0, tags = 0;
+		uint nr_reserved_tags = 0;
+
+		/* Tags owned by the block driver */
+		addr = hctx[i] + OFFSET(blk_mq_hw_ctx_tags);
+		if (!readmem(addr, KVADDR, &tags, sizeof(ulong),
+				"blk_mq_hw_ctx.tags", RETURN_ON_ERROR))
+			break;
+
+		addr = tags + OFFSET(blk_mq_tags_nr_reserved_tags);
+		if (!readmem(addr, KVADDR, &nr_reserved_tags, sizeof(uint),
+				"blk_mq_tags_nr_reserved_tags", RETURN_ON_ERROR))
+			break;
+
+		if (nr_reserved_tags) {
+			addr = tags + OFFSET(blk_mq_tags_breserved_tags);
+			if (bitmap_tags_is_ptr &&
+			    !readmem(addr, KVADDR, &addr, sizeof(ulong),
+					"blk_mq_tags.bitmap_tags", RETURN_ON_ERROR))
+				break;
+			bt_for_each(q, tags, addr, 1, nr_reserved_tags, dio);
+		}
+		addr = tags + OFFSET(blk_mq_tags_bitmap_tags);
+		if (bitmap_tags_is_ptr &&
+		    !readmem(addr, KVADDR, &addr, sizeof(ulong),
+				"blk_mq_tags.bitmap_tags", RETURN_ON_ERROR))
+			break;
+		bt_for_each(q, tags, addr, 0, nr_reserved_tags, dio);
+	}
+}
+
+static void get_mq_diskio_from_hw_queues(ulong q, struct diskio *dio)
+{
+	uint cnt = 0;
+	ulong addr = 0, hctx_addr = 0;
+	ulong *hctx_array = NULL;
+	struct list_pair *lp = NULL;
+
+	if (VALID_MEMBER(request_queue_hctx_table)) {
+		addr = q + OFFSET(request_queue_hctx_table);
+		cnt = do_xarray(addr, XARRAY_COUNT, NULL);
+		lp = (struct list_pair *)GETBUF(sizeof(struct list_pair) * (cnt + 1));
+		if (!lp)
+			error(FATAL, "fail to get memory for list_pair.\n");
+		lp[0].index = cnt;
+		cnt = do_xarray(addr, XARRAY_GATHER, lp);
+	} else {
+		addr = q + OFFSET(request_queue_nr_hw_queues);
+		readmem(addr, KVADDR, &cnt, sizeof(uint),
+			"request_queue.nr_hw_queues", FAULT_ON_ERROR);
+
+		addr = q + OFFSET(request_queue_queue_hw_ctx);
+		readmem(addr, KVADDR, &hctx_addr, sizeof(void *),
+			"request_queue.queue_hw_ctx", FAULT_ON_ERROR);
+	}
+
+	hctx_array = (ulong *)GETBUF(sizeof(void *) * cnt);
+	if (!hctx_array) {
+		if (lp)
+			FREEBUF(lp);
+		error(FATAL, "fail to get memory for the hctx_array\n");
+	}
+
+	if (lp && hctx_array) {
+		uint i;
+
+		/* copy it from list_pair to hctx_array */
+		for (i = 0; i < cnt; i++)
+			hctx_array[i] = (ulong)lp[i].value;
+
+		FREEBUF(lp);
+	} else if (!readmem(hctx_addr, KVADDR, hctx_array, sizeof(void *) * cnt,
+			"request_queue.queue_hw_ctx[]", RETURN_ON_ERROR)) {
+		FREEBUF(hctx_array);
+		return;
+	}
+
+	queue_for_each_hw_ctx(q, hctx_array, cnt, dio);
+
+	FREEBUF(hctx_array);
+}
+
+static void
+get_mq_diskio(unsigned long q, unsigned long *mq_count)
+{
+	int cpu;
+	unsigned long queue_ctx;
+	unsigned long mctx_addr;
+	struct diskio tmp = {0};
+
+	/*
+	 * Currently this function does not support old blk-mq implementation
+	 * before 12f5b9314545 ("blk-mq: Remove generation seqeunce"), so
+	 * filter them out.
+	 */
+	if (VALID_MEMBER(request_state)) {
+		if (CRASHDEBUG(1))
+			fprintf(fp, "mq: using sbitmap\n");
+		get_mq_diskio_from_hw_queues(q, &tmp);
+		mq_count[0] = tmp.read;
+		mq_count[1] = tmp.write;
+		return;
+	}
+
+	if (CRASHDEBUG(1))
+		fprintf(fp, "mq: using blk_mq_ctx.rq_{completed,dispatched} counters\n");
+
+	readmem(q + OFFSET(request_queue_queue_ctx), KVADDR, &queue_ctx,
+		sizeof(ulong), "request_queue.queue_ctx",
+		FAULT_ON_ERROR);
+
+	for (cpu = 0; cpu < kt->cpus; cpu++) {
+		if ((kt->flags & SMP) && (kt->flags & PER_CPU_OFF)) {
+			mctx_addr = queue_ctx + kt->__per_cpu_offset[cpu];
+			get_one_mctx_diskio(mctx_addr, &tmp);
+			mq_count[0] += tmp.read;
+			mq_count[1] += tmp.write;
+		}
+	}
+}
+
+static void
+get_one_diskio_from_dkstats(unsigned long dkstats, unsigned long *count)
+{
+	int cpu;
+	unsigned long dkstats_addr;
+	unsigned long in_flight[2];
+
+	for (cpu = 0; cpu < kt->cpus; cpu++) {
+		if ((kt->flags & SMP) && (kt->flags & PER_CPU_OFF)) {
+			dkstats_addr = dkstats + kt->__per_cpu_offset[cpu];
+			readmem(dkstats_addr + OFFSET(disk_stats_in_flight),
+				KVADDR, in_flight, sizeof(long) * 2,
+				"disk_stats.in_flight", FAULT_ON_ERROR);
+			count[0] += in_flight[0];
+			count[1] += in_flight[1];
+		}
+	}
+}
+
+
+/* read request_queue.rq.count[2] */
+static void 
+get_diskio_1(unsigned long rq, unsigned long gendisk, struct diskio *io)
+{
+	int count[2];
+	unsigned long io_counts[2] = { 0 };
+	unsigned long dkstats;
+
+	if (!use_mq_interface(rq)) {
+		if (VALID_MEMBER(request_queue_rq)) {
+			readmem(rq + OFFSET(request_queue_rq) +
+				OFFSET(request_list_count), KVADDR, count,
+				sizeof(int) * 2, "request_list.count", FAULT_ON_ERROR);
+
+			io->read = count[0];
+			io->write = count[1];
+		} else {
+			if (VALID_MEMBER(hd_struct_dkstats))
+				readmem(gendisk + OFFSET(gendisk_part0) +
+					OFFSET(hd_struct_dkstats), KVADDR, &dkstats,
+					sizeof(ulong), "gendisk.part0.dkstats", FAULT_ON_ERROR);
+			else { /* kernel version >= 5.11 */
+				ulong block_device;
+				readmem(gendisk + OFFSET(gendisk_part0), KVADDR, &block_device,
+					sizeof(ulong), "gendisk.part0", FAULT_ON_ERROR);
+				readmem(block_device + OFFSET(block_device_bd_stats), KVADDR,
+					&dkstats, sizeof(ulong), "block_device.bd_stats",
+					FAULT_ON_ERROR);
+			}
+
+			get_one_diskio_from_dkstats(dkstats, io_counts);
+
+			io->read = io_counts[0];
+			io->write = io_counts[1];
+		}
+	} else {
+		get_mq_diskio(rq, io_counts);
+		io->read = io_counts[0];
+		io->write = io_counts[1];
+	}
 }
 
 /* request_queue.in_flight contains total requests */
@@ -3856,9 +4637,6 @@ init_iter(struct iter *i)
 		i->get_in_flight = get_in_flight_1;
 	} else if (SIZE(rq_in_flight) == sizeof(int) * 2) {
 		i->get_in_flight = get_in_flight_2;
-	} else {
-		option_not_supported('d');
-		return;
 	}
 	i->get_diskio = get_diskio_1;
 
@@ -3908,9 +4686,16 @@ init_iter(struct iter *i)
 		} else {
 			/* kernel version > 2.6.27, klist */
 			unsigned long class_private_addr;
-			readmem(block_class_addr + OFFSET(class_p), KVADDR,
-				&class_private_addr, sizeof(class_private_addr),
-				"class.p", FAULT_ON_ERROR);
+
+			if (INVALID_MEMBER(class_p)) /* kernel version >= 6.4 */
+				class_private_addr = get_subsys_private("class_kset", "block");
+			else
+				readmem(block_class_addr + OFFSET(class_p), KVADDR,
+					&class_private_addr, sizeof(class_private_addr),
+					"class.p", FAULT_ON_ERROR);
+
+			if (!class_private_addr)
+				error(FATAL, "cannot determine subsys_private for block.\n");
 
 			if (VALID_STRUCT(class_private)) {
 				/* 2.6.27 < kernel version <= 2.6.37-rc2 */
@@ -3926,8 +4711,10 @@ init_iter(struct iter *i)
 			i->match = match_klist;
 			if (VALID_MEMBER(gendisk_dev))
 				i->get_gendisk = get_gendisk_3;
-			else
+			else if (VALID_MEMBER(device_knode_class))
 				i->get_gendisk = get_gendisk_4;
+			else
+				i->get_gendisk = get_gendisk_5;
 		}
 	} else {
 		option_not_supported('d');
@@ -3936,7 +4723,7 @@ init_iter(struct iter *i)
 }
 
 static void 
-display_one_diskio(struct iter *i, unsigned long gendisk)
+display_one_diskio(struct iter *i, unsigned long gendisk, ulong flags)
 {
 	char disk_name[BUFSIZE + 1];
 	char buf0[BUFSIZE];
@@ -3960,10 +4747,13 @@ display_one_diskio(struct iter *i, unsigned long gendisk)
 		sizeof(ulong), "gen_disk.queue", FAULT_ON_ERROR);
 	readmem(gendisk + OFFSET(gendisk_major), KVADDR, &major, sizeof(int),
 		"gen_disk.major", FAULT_ON_ERROR);
-	i->get_diskio(queue_addr, &io);
-	in_flight = i->get_in_flight(queue_addr);
+	i->get_diskio(queue_addr, gendisk, &io);
 
-	fprintf(fp, "%s%s%s  %s%s%s%s  %s%5d%s%s%s%s%s%5u\n",
+	if ((flags & DIOF_NONZERO)
+		&& (io.read + io.write == 0))
+		return;
+
+	fprintf(fp, "%s%s%s  %s%s%s%s  %s%5d%s%s%s%s%s",
 		mkstring(buf0, 5, RJUST|INT_DEC, (char *)(unsigned long)major),
 		space(MINSPACE),
 		mkstring(buf1, VADDR_PRLEN, LJUST|LONG_HEX, (char *)gendisk),
@@ -3980,12 +4770,20 @@ display_one_diskio(struct iter *i, unsigned long gendisk)
 		space(MINSPACE),
 		mkstring(buf5, 5, RJUST|INT_DEC,
 			(char *)(unsigned long)io.write),
-		space(MINSPACE),
-		in_flight);
+		space(MINSPACE));
+
+	if (VALID_MEMBER(request_queue_in_flight)) {
+		if (!use_mq_interface(queue_addr)) {
+			in_flight = i->get_in_flight(queue_addr);
+			fprintf(fp, "%5u\n", in_flight);
+		} else
+			fprintf(fp, "%s\n", "N/A(MQ)");
+	} else
+		fprintf(fp, "\n");
 }
 
 static void 
-display_all_diskio(void)
+display_all_diskio(ulong flags)
 {
 	struct iter i;
 	unsigned long gendisk;
@@ -4016,10 +4814,10 @@ display_all_diskio(void)
 		i.sync_count ? mkstring(buf4, 5, RJUST, "SYNC") :
 			mkstring(buf4, 5, RJUST, "WRITE"),
 		space(MINSPACE),
-		mkstring(buf5, 5, RJUST, "DRV"));
+		VALID_MEMBER(request_queue_in_flight) ? mkstring(buf5, 5, RJUST, "DRV") : "");
 
 	while ((gendisk = i.next_disk(&i)) != 0)
-		display_one_diskio(&i, gendisk);
+		display_one_diskio(&i, gendisk, flags);
 }
 
 static 
@@ -4032,11 +4830,21 @@ void diskio_init(void)
 	if (INVALID_MEMBER(class_devices))
 		MEMBER_OFFSET_INIT(class_devices, "class", "devices");
 	MEMBER_OFFSET_INIT(class_p, "class", "p");
+	if (INVALID_MEMBER(class_p)) {
+		MEMBER_OFFSET_INIT(kset_list, "kset", "list");
+		MEMBER_OFFSET_INIT(kset_kobj, "kset", "kobj");
+		MEMBER_OFFSET_INIT(kobject_name, "kobject", "name");
+		MEMBER_OFFSET_INIT(kobject_entry, "kobject", "entry");
+		MEMBER_OFFSET_INIT(subsys_private_subsys, "subsys_private", "subsys");
+	}
 	MEMBER_OFFSET_INIT(class_private_devices, "class_private",
 		"class_devices");
 	MEMBER_OFFSET_INIT(device_knode_class, "device", "knode_class");
 	MEMBER_OFFSET_INIT(device_node, "device", "node");
 	MEMBER_OFFSET_INIT(device_type, "device", "type");
+	MEMBER_OFFSET_INIT(device_private_device, "device_private", "device");
+	MEMBER_OFFSET_INIT(device_private_knode_class, "device_private",
+		"knode_class");
 	MEMBER_OFFSET_INIT(gendisk_dev, "gendisk", "dev");
 	if (INVALID_MEMBER(gendisk_dev))
 		MEMBER_OFFSET_INIT(gendisk_dev, "gendisk", "__dev");
@@ -4044,18 +4852,59 @@ void diskio_init(void)
 	MEMBER_OFFSET_INIT(gendisk_part0, "gendisk", "part0");
 	MEMBER_OFFSET_INIT(gendisk_queue, "gendisk", "queue");
 	MEMBER_OFFSET_INIT(hd_struct_dev, "hd_struct", "__dev");
+	MEMBER_OFFSET_INIT(hd_struct_dkstats, "hd_struct", "dkstats");
+	MEMBER_OFFSET_INIT(block_device_bd_device, "block_device", "bd_device");
+	MEMBER_OFFSET_INIT(block_device_bd_stats, "block_device", "bd_stats");
 	MEMBER_OFFSET_INIT(klist_k_list, "klist", "k_list");
 	MEMBER_OFFSET_INIT(klist_node_n_klist, "klist_node", "n_klist");
 	MEMBER_OFFSET_INIT(klist_node_n_node, "klist_node", "n_node");
 	MEMBER_OFFSET_INIT(kobject_entry, "kobject", "entry");
 	MEMBER_OFFSET_INIT(kset_list, "kset", "list");
 	MEMBER_OFFSET_INIT(request_list_count, "request_list", "count");
+	MEMBER_OFFSET_INIT(request_cmd_flags, "request", "cmd_flags");
+	MEMBER_OFFSET_INIT(request_q, "request", "q");
+	MEMBER_OFFSET_INIT(request_state, "request", "state");
 	MEMBER_OFFSET_INIT(request_queue_in_flight, "request_queue",
 		"in_flight");
 	if (MEMBER_EXISTS("request_queue", "rq"))
 		MEMBER_OFFSET_INIT(request_queue_rq, "request_queue", "rq");
 	else
 		MEMBER_OFFSET_INIT(request_queue_rq, "request_queue", "root_rl");
+	if (MEMBER_EXISTS("request_queue", "mq_ops")) {
+		MEMBER_OFFSET_INIT(request_queue_mq_ops, "request_queue",
+			"mq_ops");
+		ANON_MEMBER_OFFSET_INIT(request_queue_queue_ctx,
+			"request_queue", "queue_ctx");
+		MEMBER_OFFSET_INIT(request_queue_queue_hw_ctx,
+			"request_queue", "queue_hw_ctx");
+		MEMBER_OFFSET_INIT(request_queue_nr_hw_queues,
+			"request_queue", "nr_hw_queues");
+		MEMBER_OFFSET_INIT(request_queue_hctx_table,
+			"request_queue", "hctx_table");
+		MEMBER_OFFSET_INIT(blk_mq_ctx_rq_dispatched, "blk_mq_ctx",
+			"rq_dispatched");
+		MEMBER_OFFSET_INIT(blk_mq_ctx_rq_completed, "blk_mq_ctx",
+			"rq_completed");
+		MEMBER_OFFSET_INIT(blk_mq_hw_ctx_tags, "blk_mq_hw_ctx", "tags");
+		MEMBER_OFFSET_INIT(blk_mq_tags_bitmap_tags, "blk_mq_tags",
+			"bitmap_tags");
+		MEMBER_OFFSET_INIT(blk_mq_tags_breserved_tags, "blk_mq_tags",
+			"breserved_tags");
+		MEMBER_OFFSET_INIT(blk_mq_tags_nr_reserved_tags, "blk_mq_tags",
+			"nr_reserved_tags");
+		MEMBER_OFFSET_INIT(blk_mq_tags_rqs, "blk_mq_tags", "rqs");
+		STRUCT_SIZE_INIT(blk_mq_tags, "blk_mq_tags");
+		STRUCT_SIZE_INIT(sbitmap, "sbitmap");
+		STRUCT_SIZE_INIT(sbitmap_word, "sbitmap_word");
+		MEMBER_OFFSET_INIT(sbitmap_word_word, "sbitmap_word", "word");
+		MEMBER_OFFSET_INIT(sbitmap_word_cleared, "sbitmap_word", "cleared");
+		MEMBER_OFFSET_INIT(sbitmap_depth, "sbitmap", "depth");
+		MEMBER_OFFSET_INIT(sbitmap_shift, "sbitmap", "shift");
+		MEMBER_OFFSET_INIT(sbitmap_map_nr, "sbitmap", "map_nr");
+		MEMBER_OFFSET_INIT(sbitmap_map, "sbitmap", "map");
+		MEMBER_OFFSET_INIT(sbitmap_queue_sb, "sbitmap_queue", "sb");
+
+	}
 	MEMBER_OFFSET_INIT(subsys_private_klist_devices, "subsys_private",
 		"klist_devices");
 	MEMBER_OFFSET_INIT(subsystem_kset, "subsystem", "kset");
@@ -4064,13 +4913,67 @@ void diskio_init(void)
 	MEMBER_SIZE_INIT(rq_in_flight, "request_queue", "in_flight");
 	MEMBER_SIZE_INIT(class_private_devices, "class_private",
 		"class_devices");
+	MEMBER_OFFSET_INIT(disk_stats_in_flight, "disk_stats", "in_flight");
 
 	dt->flags |= DISKIO_INIT;
 }
 
 static void 
-diskio_option(void)
+diskio_option(ulong flags)
 {
 	diskio_init();
-	display_all_diskio();
+	display_all_diskio(flags);
+}
+
+void
+devdump_extract(void *_note, ulonglong offset, char *dump_file, FILE *ofp)
+{
+	struct vmcoredd_header *vh = (struct vmcoredd_header *)_note;
+	ulong dump_size, count;
+	FILE *tmpfp;
+
+	if (vh->n_type != NT_VMCOREDD)
+		error(FATAL, "unsupported note type: 0x%x", vh->n_type);
+
+	dump_size = vh->n_descsz - VMCOREDD_MAX_NAME_BYTES;
+
+	if (dump_file) {
+		tmpfp = fopen(dump_file, "w");
+		if (!tmpfp) {
+			error(FATAL, "cannot open output file: %s\n",
+			      dump_file);
+			return;
+		}
+		set_tmpfile2(tmpfp);
+	}
+	fprintf(ofp, "DEVICE: %s\n", vh->dump_name);
+	
+	if (dump_file)
+		count = dump_size;
+	else 
+		count = dump_size/sizeof(uint64_t) +
+			(dump_size % sizeof(uint64_t) ? 1 : 0);
+	
+	display_memory_from_file_offset(offset + sizeof(struct vmcoredd_header),
+		count, dump_file);
+}
+
+void 
+devdump_info(void *_note, ulonglong offset, FILE *ofp)
+{
+	struct vmcoredd_header *vh = (struct vmcoredd_header *)_note;
+	char buf[BUFSIZE];
+	ulong dump_size;
+
+	if (vh->n_type != NT_VMCOREDD)
+		return;
+
+	dump_size = vh->n_descsz - VMCOREDD_MAX_NAME_BYTES;
+	offset += sizeof(struct vmcoredd_header);
+
+	fprintf(ofp, "0x%s ", mkstring(buf, LONG_LONG_PRLEN, LJUST | LONGLONG_HEX,
+		MKSTR(&offset)));
+	fprintf(ofp, "%s ", mkstring(buf, LONG_PRLEN, LJUST | LONG_DEC,
+		MKSTR(dump_size)));
+	fprintf(ofp, "%s\n", vh->dump_name);
 }

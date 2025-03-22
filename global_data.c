@@ -1,8 +1,8 @@
 /* global_data.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2006, 2010, 2012-2013 David Anderson
- * Copyright (C) 2002-2006, 2010, 2012-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2006, 2010, 2012-2013, 2018 David Anderson
+ * Copyright (C) 2002-2006, 2010, 2012-2013, 2018 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -72,6 +72,7 @@ struct command_table_entry linux_command_table[] = {
 	{"*", 	    cmd_pointer, help_pointer, 0},
 	{"alias",   cmd_alias,   help_alias,   0},
         {"ascii",   cmd_ascii,   help_ascii,   0},
+        {"bpf",     cmd_bpf,     help_bpf,     0},
         {"bt",      cmd_bt,      help_bt,      REFRESH_TASK_TABLE},
 	{"btop",    cmd_btop,    help_btop,    0},
 	{"dev",     cmd_dev,     help_dev,     0},
@@ -92,7 +93,7 @@ struct command_table_entry linux_command_table[] = {
 	{"mach",    cmd_mach,    help_mach,    0},
 	{"map",     cmd_map,     help_map,     HIDDEN_COMMAND},
 	{"mod",     cmd_mod,     help_mod,     0},
-	{"mount",   cmd_mount,   help_mount,   0},
+	{"mount",   cmd_mount,   help_mount,   REFRESH_TASK_TABLE},
 	{"net",	    cmd_net,	help_net,      REFRESH_TASK_TABLE},
 	{"p",       cmd_p,       help_p,       0},
 	{"ps",      cmd_ps,      help_ps,      REFRESH_TASK_TABLE},
@@ -104,6 +105,7 @@ struct command_table_entry linux_command_table[] = {
         {"rd",      cmd_rd,      help_rd,      MINIMAL},
 	{"repeat",  cmd_repeat,  help_repeat,  0},
 	{"runq",    cmd_runq,    help_runq,    REFRESH_TASK_TABLE},
+	{"sbitmapq", cmd_sbitmapq, help_sbitmapq, 0},
         {"search",  cmd_search,  help_search,  0},
         {"set",     cmd_set,     help_set,     REFRESH_TASK_TABLE | MINIMAL},
         {"sig",     cmd_sig,     help_sig,     REFRESH_TASK_TABLE},

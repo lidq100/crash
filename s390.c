@@ -1,8 +1,8 @@
 /* s390.c - core analysis suite
  *
  * Copyright (C) 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2006, 2009-2010, 2012-2013 David Anderson
- * Copyright (C) 2002-2006, 2009-2010, 2012-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2006, 2009-2010, 2012-2014 David Anderson
+ * Copyright (C) 2002-2006, 2009-2010, 2012-2014 Red Hat, Inc. All rights reserved.
  * Copyright (C) 2005, 2006, 2010 Michael Holzheu, IBM Corporation
  *
  * This program is free software; you can redistribute it and/or modify
@@ -57,7 +57,6 @@ static int s390_translate_pte(ulong, void *, ulonglong);
 static ulong s390_processor_speed(void);
 static int s390_eframe_search(struct bt_info *);
 static void s390_back_trace_cmd(struct bt_info *);
-static void s390_dump_irq(int);
 static void s390_get_stack_frame(struct bt_info *, ulong *, ulong *);
 static int s390_dis_filter(ulong, char *, unsigned int);
 static void s390_cmd_mach(void);
@@ -146,9 +145,17 @@ s390_init(int when)
 		break;
 
 	case POST_GDB:
-		machdep->nr_irqs = 0;  /* TBD */
+		if (symbol_exists("irq_desc"))
+			ARRAY_LENGTH_INIT(machdep->nr_irqs, irq_desc,
+				"irq_desc", NULL, 0);
+		else if (kernel_symbol_exists("nr_irqs"))
+			get_symbol_data("nr_irqs", sizeof(unsigned int),
+				&machdep->nr_irqs);
+		else
+			machdep->nr_irqs = 0;
+
 		machdep->vmalloc_start = s390_vmalloc_start;
-		machdep->dump_irq = s390_dump_irq;
+		machdep->dump_irq = generic_dump_irq;
 		if (!machdep->hz)
 			machdep->hz = HZ;
 		machdep->section_size_bits = _SECTION_SIZE_BITS;
@@ -176,7 +183,7 @@ s390_dump_machdep_table(ulong arg)
 	fprintf(fp, ")\n");
 
 	fprintf(fp, "             kvbase: %lx\n", machdep->kvbase);
-	fprintf(fp, "  identity_map_base: %lx\n", machdep->kvbase);
+	fprintf(fp, "  identity_map_base: %lx\n", machdep->identity_map_base);
 	fprintf(fp, "           pagesize: %d\n", machdep->pagesize);
 	fprintf(fp, "          pageshift: %d\n", machdep->pageshift);
 	fprintf(fp, "           pagemask: %llx\n", machdep->pagemask);
@@ -194,7 +201,7 @@ s390_dump_machdep_table(ulong arg)
 	fprintf(fp, "              uvtop: s390_uvtop()\n");
 	fprintf(fp, "              kvtop: s390_kvtop()\n");
 	fprintf(fp, "       get_task_pgd: s390_get_task_pgd()\n");
-	fprintf(fp, "           dump_irq: s390_dump_irq()\n");
+	fprintf(fp, "           dump_irq: generic_dump_irq()\n");
 	fprintf(fp, "    get_stack_frame: s390_get_stack_frame()\n");
 	fprintf(fp, "      get_stackbase: generic_get_stackbase()\n");
 	fprintf(fp, "       get_stacktop: generic_get_stacktop()\n");
@@ -435,6 +442,9 @@ s390_verify_symbol(const char *name, ulong value, char type)
 	if (strstr(name, "L2\002") == name)
 	    	return FALSE;
 
+	if (STREQ(name, ".rodata"))
+		return TRUE;
+
 	/* throw away all symbols containing a '.' */
 	for(i = 0; i < strlen(name);i++){
 		if(name[i] == '.')
@@ -558,7 +568,7 @@ s390_has_cpu(struct bt_info *bt)
 {
 	int cpu = bt->tc->processor;
 
-	if (is_task_active(bt->task) && (kt->cpu_flags[cpu] & ONLINE))
+	if (is_task_active(bt->task) && (kt->cpu_flags[cpu] & ONLINE_MAP))
 		return TRUE;
 	else
 		return FALSE;
@@ -619,7 +629,7 @@ s390_back_trace_cmd(struct bt_info *bt)
 		error(WARNING,
 		"instruction pointer argument ignored on this architecture!\n");
 	}
-	if (is_task_active(bt->task) && !(kt->cpu_flags[cpu] & ONLINE)) {
+	if (is_task_active(bt->task) && !(kt->cpu_flags[cpu] & ONLINE_MAP)) {
 		fprintf(fp, " CPU offline\n");
 		return;
 	}
@@ -951,15 +961,6 @@ s390_get_stack_frame(struct bt_info *bt, ulong *eip, ulong *esp)
 	       		FAULT_ON_ERROR);
 		*eip=r14 & S390_ADDR_MASK;
 	}
-}
-
-/*
- *  cmd_irq() is not implemented for s390.
- */
-static void 
-s390_dump_irq(int irq)
-{
-	error(FATAL, "s390_dump_irq: TBD\n");
 }
 
 /*

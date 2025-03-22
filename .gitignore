@@ -11,3 +11,19 @@ crash.spec
 *.rpm
 gdb.files
 gdb-7.6/
+gdb-10.2/
+gdb-16.2/
+extensions/defs.h
+extensions/*.so
+extensions/eppic
+
+# cscope files
+cscope.*
+ncscope.*
+
+# ctags files
+tags
+TAGS
+
+# Clang's compilation database file
+/compile_commands.json

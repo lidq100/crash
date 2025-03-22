@@ -618,32 +618,6 @@ lkcd_memory_dump(FILE *fp)
 
 }
 
-static void
-lkcd_speedo(void)
-{
-        static int i = 0;
-
-        if (pc->flags & SILENT) {
-                return;
-        }
-
-        switch (++i%4) {
-        case 0:
-                lkcd_print("|\b");
-                break;
-        case 1:
-                lkcd_print("\\\b");
-                break;
-        case 2:
-                lkcd_print("-\b");
-                break;
-        case 3:
-                lkcd_print("/\b");
-                break;
-        }
-	fflush(stdout);
-}
-
 
 /*
  *  The lkcd_lseek() routine does the bulk of the work setting things up 
@@ -811,7 +785,6 @@ lkcd_get_kernel_start(ulong *addr)
 int
 lkcd_lseek(physaddr_t paddr)
 {
-        long i = 0;
 	int err;
         int eof;
         void *dp;
@@ -856,10 +829,6 @@ lkcd_lseek(physaddr_t paddr)
     lseek(lkcd->fd, lkcd->page_offset_max, SEEK_SET);
     eof = FALSE;
     while (!eof) {
-	if( (i++%2048) == 0) {
-	    lkcd_speedo();
-	}
-
 	switch (lkcd_load_dump_page_header(dp, page))
 	{
 	    case LKCD_DUMPFILE_OK:
@@ -1271,9 +1240,10 @@ lkcd_uncompress_gzip(unsigned char *dest, ulong destlen,
 	switch (uncompress(dest, &retlen, source, sourcelen)) 
 	{
 	case Z_OK:
-		if (retlen == destlen)
+		if (retlen == destlen) {
                         rc = TRUE;
                         break;
+		}
 
 		lkcd_print("uncompress: returned length not page size: %ld\n",
 				retlen);

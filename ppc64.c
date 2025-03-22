@@ -1,7 +1,7 @@
 /* ppc64.c -- core analysis suite
  *
- * Copyright (C) 2004-2013 David Anderson
- * Copyright (C) 2004-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2015,2018 David Anderson
+ * Copyright (C) 2004-2015,2018 Red Hat, Inc. All rights reserved.
  * Copyright (C) 2004, 2006 Haren Myneni, IBM Corporation
  *
  * This program is free software; you can redistribute it and/or modify
@@ -15,7 +15,10 @@
  * GNU General Public License for more details.
  */
 #ifdef PPC64
+
 #include "defs.h"
+#include <endian.h>
+#include <ctype.h>
 
 static int ppc64_kvtop(struct task_context *, ulong, physaddr_t *, int);
 static int ppc64_uvtop(struct task_context *, ulong, physaddr_t *, int);
@@ -45,20 +48,104 @@ static ulong ppc64_get_stackbase(ulong);
 static ulong ppc64_get_stacktop(ulong);
 void ppc64_compiler_warning_stub(void);
 static ulong ppc64_in_irqstack(ulong);
+static enum emergency_stack_type ppc64_in_emergency_stack(int cpu, ulong addr,
+							  bool verbose);
+static void ppc64_set_bt_emergency_stack(enum emergency_stack_type type,
+					 struct bt_info *bt);
 static char * ppc64_check_eframe(struct ppc64_pt_regs *);
 static void ppc64_print_eframe(char *, struct ppc64_pt_regs *, 
 		struct bt_info *);
+static int ppc64_get_current_task_reg(int regno, const char *name, int size,
+		  void *value);
 static void parse_cmdline_args(void);
-static int ppc64_paca_init(int);
+static int ppc64_paca_percpu_offset_init(int);
 static void ppc64_init_cpu_info(void);
 static int ppc64_get_cpu_map(void);
 static void ppc64_clear_machdep_cache(void);
+static void ppc64_init_paca_info(void);
 static void ppc64_vmemmap_init(void);
 static int ppc64_get_kvaddr_ranges(struct vaddr_range *);
 static uint get_ptetype(ulong pte);
 static int is_hugepage(ulong pte);
 static int is_hugepd(ulong pte);
 static ulong hugepage_dir(ulong pte);
+static ulong pgd_page_vaddr_l4(ulong pgd);
+static ulong pud_page_vaddr_l4(ulong pud);
+static ulong pmd_page_vaddr_l4(ulong pmd);
+static int is_opal_context(ulong sp, ulong nip);
+void opalmsg(void);
+
+struct user_regs_bitmap_struct {
+	struct ppc64_pt_regs ur;
+	ulong bitmap[32];
+};
+
+static int is_opal_context(ulong sp, ulong nip)
+{
+	uint64_t opal_start, opal_end;
+
+	if (!(machdep->flags & OPAL_FW))
+		return FALSE;
+
+	opal_start = machdep->machspec->opal.base;
+	opal_end   = opal_start + machdep->machspec->opal.size;
+
+	if (((sp >= opal_start) && (sp < opal_end)) ||
+	    ((nip >= opal_start) && (nip < opal_end)))
+		return TRUE;
+
+	return FALSE;
+}
+
+static inline int is_hugepage(ulong pte)
+{
+	if ((machdep->flags & BOOK3E) ||
+		(THIS_KERNEL_VERSION < LINUX(3,10,0))) {
+		/*
+		 * hugepage support via hugepd for book3e and
+		 * also kernel v3.9 & below.
+		 */
+		return 0;
+
+	} else if (THIS_KERNEL_VERSION >= LINUX(4,5,0)) {
+		/*
+		 * leaf pte for huge page, if _PAGE_PTE is set.
+		 */
+		return !!(pte & _PAGE_PTE);
+
+	} else { /* BOOK3S, kernel v3.10 - v4.4 */
+
+		/*
+		 * leaf pte for huge page, bottom two bits != 00
+		 */
+		return ((pte & HUGE_PTE_MASK) != 0x0);
+	}
+}
+
+static inline int is_hugepd(ulong pte)
+{
+	if ((machdep->flags & BOOK3E) ||
+		(THIS_KERNEL_VERSION < LINUX(3,10,0)))
+		return ((pte & PD_HUGE) == 0x0);
+
+	else if (THIS_KERNEL_VERSION >= LINUX(4,5,0)) {
+		/*
+		 * hugepd pointer, if _PAGE_PTE is not set and
+		 * hugepd shift mask is set.
+		 */
+		return (!(pte & _PAGE_PTE) &&
+			((pte & HUGEPD_SHIFT_MASK) != 0));
+
+	} else { /* BOOK3S, kernel v3.10 - v4.4 */
+
+		/*
+		 * hugepd pointer, bottom two bits == 00 and next 4 bits
+		 * indicate size of table
+		 */
+		return (((pte & HUGE_PTE_MASK) == 0x0) &&
+			((pte & HUGEPD_SHIFT_MASK) != 0));
+	}
+}
 
 static inline uint get_ptetype(ulong pte)
 {
@@ -66,39 +153,67 @@ static inline uint get_ptetype(ulong pte)
 
 	if (is_hugepage(pte))
 		pte_type = 1;
-	else if (is_hugepd(pte))
+	else if (!(machdep->flags & RADIX_MMU) &&
+	    (PAGESIZE() != PPC64_64K_PAGE_SIZE) && is_hugepd(pte))
 		pte_type = 2;
 
 	return pte_type;
 }
 
-static int is_hugepage(ulong pte)
-{
-	/*
-	 * leaf pte for huge page, bottom two bits != 00
-	 */
-	return ((pte & HUGE_PTE_MASK) != 0x0);
-}
-
-static inline int is_hugepd(ulong pte)
-{
-	if (THIS_KERNEL_VERSION >= LINUX(3,10,0)) {
-		/*
-		 * hugepd pointer, bottom two bits == 00 and next 4 bits
-		 * indicate size of table
-		*/
-		return (((pte & HUGE_PTE_MASK) == 0x0) &&
-			((pte & HUGEPD_SHIFT_MASK) != 0));
-	} else
-		return ((pte & PD_HUGE) == 0x0);
-}
-
 static inline ulong hugepage_dir(ulong pte)
 {
-	if (THIS_KERNEL_VERSION >= LINUX(3,10,0))
-		return (ulong)(pte & ~HUGEPD_SHIFT_MASK);
-	else
+	if ((machdep->flags & BOOK3E) ||
+		(THIS_KERNEL_VERSION < LINUX(3,10,0)))
 		return (ulong)((pte & ~HUGEPD_SHIFT_MASK) | PD_HUGE);
+	else if (machdep->flags & PHYS_ENTRY_L4)
+		return PTOV(pte & ~HUGEPD_ADDR_MASK);
+	else /* BOOK3S, kernel v3.10 - v4.4 */
+		return (ulong)(pte & ~HUGEPD_SHIFT_MASK);
+}
+
+static inline ulong pgd_page_vaddr_l4(ulong pgd)
+{
+	ulong pgd_val;
+
+	pgd_val = (pgd & ~machdep->machspec->pgd_masked_bits);
+	if (machdep->flags & PHYS_ENTRY_L4) {
+		/*
+		 * physical address is stored starting from kernel v4.6
+		 */
+		pgd_val = PTOV(pgd_val);
+	}
+
+	return pgd_val;
+}
+
+static inline ulong pud_page_vaddr_l4(ulong pud)
+{
+	ulong pud_val;
+
+	pud_val = (pud & ~machdep->machspec->pud_masked_bits);
+	if (machdep->flags & PHYS_ENTRY_L4) {
+		/*
+		 * physical address is stored starting from kernel v4.6
+		 */
+		pud_val = PTOV(pud_val);
+	}
+
+	return pud_val;
+}
+
+static inline ulong pmd_page_vaddr_l4(ulong pmd)
+{
+	ulong pmd_val;
+
+	pmd_val = (pmd & ~machdep->machspec->pmd_masked_bits);
+	if (machdep->flags & PHYS_ENTRY_L4) {
+		/*
+		 * physical address is stored starting from kernel v4.6
+		 */
+		pmd_val = PTOV(pmd_val);
+	}
+
+	return pmd_val;
 }
 
 static int book3e_is_kvaddr(ulong addr)
@@ -117,12 +232,47 @@ static int ppc64_is_vmaddr(ulong addr)
 	return (vt->vmalloc_start && addr >= vt->vmalloc_start);
 }
 
+#define is_RHEL8() (strstr(kt->proc_version, ".el8."))
+
+static int set_ppc64_max_physmem_bits(void)
+{
+	int dimension;
+	char *string;
+
+	if ((string = pc->read_vmcoreinfo("NUMBER(MAX_PHYSMEM_BITS)"))) {
+		machdep->max_physmem_bits = atol(string);
+		free(string);
+		return 0;
+	}
+
+	get_array_length("mem_section", &dimension, 0);
+
+	if ((machdep->flags & VMEMMAP) &&
+	    (THIS_KERNEL_VERSION >= LINUX(4,20,0)) &&
+	    !dimension && (machdep->pagesize == 65536)) {
+		/*
+		 * SPARSEMEM_VMEMMAP & SPARSEMEM_EXTREME configurations with
+		 * 64K pagesize and v4.20 kernel or later.
+		 */
+		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS_4_20;
+	} else if ((machdep->flags & VMEMMAP) &&
+	    ((THIS_KERNEL_VERSION >= LINUX(4,19,0)) || is_RHEL8())) {
+		/* SPARSEMEM_VMEMMAP & v4.19 kernel or later, or RHEL8 */
+		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS_4_19;
+	} else if (THIS_KERNEL_VERSION >= LINUX(3,7,0))
+		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS_3_7;
+	else
+		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS;
+
+	return 0;
+}
 
 struct machine_specific ppc64_machine_specific = { 
-	.hwintrstack = { 0 }, 
+	.hwintrstack = NULL,
 	.hwstackbuf = 0,
 	.hwstacksize = 0,
-	.pte_shift = PTE_SHIFT,
+	.pte_rpn_shift = PTE_RPN_SHIFT_DEFAULT,
+	._page_pte = 0x0UL,
 	._page_present = 0x1UL,
 	._page_user = 0x2UL,
 	._page_rw = 0x4UL,
@@ -137,10 +287,11 @@ struct machine_specific ppc64_machine_specific = {
 };
 
 struct machine_specific book3e_machine_specific = {
-	.hwintrstack = { 0 },
+	.hwintrstack = NULL,
 	.hwstackbuf = 0,
 	.hwstacksize = 0,
-	.pte_shift = PTE_SHIFT_L4_BOOK3E_64K, 
+	.pte_rpn_shift = PTE_RPN_SHIFT_L4_BOOK3E_64K,
+	._page_pte = 0x0UL,
 	._page_present = 0x1UL,
 	._page_user = 0xCUL,
 	._page_rw = 0x30UL,
@@ -154,6 +305,16 @@ struct machine_specific book3e_machine_specific = {
 	.is_vmaddr = book3e_is_vmaddr,
 };
 
+/**
+ * No additional checks are required on PPC64, for checking if PRSTATUS notes
+ * is valid
+ */
+static int ppc64_is_cpu_prstatus_valid(int cpu)
+{
+	return TRUE;
+}
+
+#define SKIBOOT_BASE			0x30000000
 
 /*
  *  Do all necessary machine-specific setup here.  This is called several
@@ -162,8 +323,18 @@ struct machine_specific book3e_machine_specific = {
 void
 ppc64_init(int when)
 {
+	struct machine_specific *ms;
+
+#if defined(__x86_64__)
+        if (ACTIVE())
+                error(FATAL, "compiled for the PPC64 architecture\n");
+#endif
 	switch (when)
 	{
+	case SETUP_ENV:
+		machdep->process_elf_notes = process_elf64_notes;
+		break;
+
 	case PRE_SYMTAB:
 		machdep->machspec = &ppc64_machine_specific;
 		machdep->verify_symbol = ppc64_verify_symbol;
@@ -171,9 +342,9 @@ ppc64_init(int when)
 			return;
 		machdep->stacksize = PPC64_STACK_SIZE;
 		machdep->last_pgd_read = 0;
-                machdep->last_pmd_read = 0;
-                machdep->last_ptbl_read = 0;
-                machdep->machspec->last_level4_read = 0;
+		machdep->last_pud_read = 0;
+		machdep->last_pmd_read = 0;
+		machdep->last_ptbl_read = 0;
 		machdep->verify_paddr = generic_verify_paddr;
 		machdep->ptrs_per_pgd = PTRS_PER_PGD;
 		machdep->flags |= MACHDEP_BT_TEXT;
@@ -206,6 +377,7 @@ ppc64_init(int when)
 			machdep->kvbase = BOOK3E_VMBASE;
 		} else
 			machdep->kvbase = symbol_value("_stext");
+
                 if (symbol_exists("__hash_page_64K"))
                         machdep->pagesize = PPC64_64K_PAGE_SIZE;
                 else
@@ -215,12 +387,12 @@ ppc64_init(int when)
 		machdep->pagemask = ~((ulonglong)machdep->pageoffset);
 		if ((machdep->pgd = (char *)malloc(PAGESIZE())) == NULL)
 			error(FATAL, "cannot malloc pgd space.");
+		if ((machdep->pud = (char *)malloc(PAGESIZE())) == NULL)
+			error(FATAL, "cannot malloc pud space.");
 		if ((machdep->pmd = (char *)malloc(PAGESIZE())) == NULL)
 			error(FATAL, "cannot malloc pmd space.");
 		if ((machdep->ptbl = (char *)malloc(PAGESIZE())) == NULL)
 			error(FATAL, "cannot malloc ptbl space.");
-		if ((machdep->machspec->level4 = (char *)malloc(PAGESIZE())) == NULL)
-			error(FATAL, "cannot malloc level4 space.");
 
 		machdep->identity_map_base = symbol_value("_stext"); 
                 machdep->is_kvaddr = machdep->machspec->is_kvaddr; 
@@ -244,16 +416,99 @@ ppc64_init(int when)
 		machdep->value_to_symbol = generic_machdep_value_to_symbol;
 		machdep->get_kvaddr_ranges = ppc64_get_kvaddr_ranges;
 		machdep->init_kernel_pgd = NULL;
+		machdep->is_cpu_prstatus_valid = ppc64_is_cpu_prstatus_valid;
+
 		if (symbol_exists("vmemmap_populate")) {
+			if (symbol_exists("vmemmap")) {
+				readmem(symbol_value("vmemmap"), KVADDR,
+					&machdep->machspec->vmemmap_base,
+					sizeof(void *), "vmemmap", QUIET|FAULT_ON_ERROR);
+			} else
+				machdep->machspec->vmemmap_base =
+					VMEMMAP_REGION_ID << REGION_SHIFT;
+
 			machdep->flags |= VMEMMAP;
-			machdep->machspec->vmemmap_base = 
-				VMEMMAP_REGION_ID << REGION_SHIFT;
 		}
+
 		machdep->get_irq_affinity = generic_get_irq_affinity;
 		machdep->show_interrupts = generic_show_interrupts;
 		break;
 
 	case POST_GDB:
+		ms = machdep->machspec;
+
+		if (!(machdep->flags & BOOK3E)) {
+			/*
+			 * To determine if the kernel was running on OPAL based platform,
+			 * use struct opal, which is populated with relevant values.
+			 */
+			if (symbol_exists("opal")) {
+				get_symbol_data("opal", sizeof(struct ppc64_opal), &(ms->opal));
+				if (ms->opal.base == SKIBOOT_BASE)
+					machdep->flags |= OPAL_FW;
+			}
+
+			/*
+			 * On Power ISA 3.0 based server processors, a kernel can
+			 * run with radix MMU or standard MMU. Set the flag,
+			 * if it is radix MMU.
+			 */
+			if (symbol_exists("cur_cpu_spec") &&
+			    MEMBER_EXISTS("cpu_spec", "mmu_features")) {
+				ulong cur_cpu_spec;
+				uint mmu_features, offset;
+
+				get_symbol_data("cur_cpu_spec", sizeof(void *), &cur_cpu_spec);
+				offset = MEMBER_OFFSET("cpu_spec", "mmu_features");
+				readmem(cur_cpu_spec + offset, KVADDR, &mmu_features,
+					sizeof(uint), "cpu mmu features", FAULT_ON_ERROR);
+				machdep->flags |= (mmu_features & RADIX_MMU);
+			}
+
+			/*
+			 * Starting with v3.14 we no longer use _PAGE_COHERENT
+			 * bit as it is always set on hash64 and on platforms
+			 * that cannot always set it, _PAGE_NO_CACHE and
+			 * _PAGE_WRITETHRU  can be used to infer it.
+			 */
+			if (THIS_KERNEL_VERSION >= LINUX(3,14,0))
+				ms->_page_coherent = 0x0UL;
+
+			/*
+			 * In kernel v4.5, _PAGE_PTE bit is introduced to
+			 * distinguish PTEs from pointers.
+			 */
+			if (THIS_KERNEL_VERSION >= LINUX(4,5,0)) {
+				ms->_page_pte = 0x1UL;
+				ms->_page_present = 0x2UL;
+				ms->_page_user = 0x4UL;
+				ms->_page_rw = 0x8UL;
+				ms->_page_guarded = 0x10UL;
+			}
+
+			/*
+			 * Starting with kernel v4.6, to accommodate both
+			 * radix and hash MMU modes in a single kernel,
+			 * _PAGE_PTE & _PAGE_PRESENT page flags are changed.
+			 * Also, page table entries store physical addresses.
+			 */
+			if (THIS_KERNEL_VERSION >= LINUX(4,6,0)) {
+				ms->_page_pte = 0x1UL << 62;
+				ms->_page_present = 0x1UL << 63;
+				machdep->flags |= PHYS_ENTRY_L4;
+			}
+
+			if (THIS_KERNEL_VERSION >= LINUX(4,7,0)) {
+				/*
+				 * Starting with kernel v4.7 page table entries
+				 * are always big endian on BOOK3S. Set this
+				 * flag if kernel is not big endian.
+				 */
+				if (__BYTE_ORDER == __LITTLE_ENDIAN)
+					machdep->flags |= SWAP_ENTRY_L4;
+			}
+		}
+
 		if (!(machdep->flags & (VM_ORIG|VM_4_LEVEL))) {
 			if (THIS_KERNEL_VERSION >= LINUX(2,6,14)) {
 				machdep->flags |= VM_4_LEVEL;
@@ -263,63 +518,129 @@ ppc64_init(int when)
 		}
 		if (machdep->flags & VM_ORIG) {
 			/* pre-2.6.14 layout */
-			free(machdep->machspec->level4);
-			machdep->machspec->level4 = NULL;
+			free(machdep->pud);
+			machdep->pud = NULL;
 			machdep->ptrs_per_pgd = PTRS_PER_PGD;
 		} else {
 			/* 2.6.14 layout */
-			struct machine_specific *m = machdep->machspec;
 			if (machdep->pagesize == 65536) {
 				/* 64K pagesize */
-				if (THIS_KERNEL_VERSION >= LINUX(3,10,0)) {
-					m->l1_index_size = PTE_INDEX_SIZE_L4_64K_3_10;
-					m->l2_index_size = PMD_INDEX_SIZE_L4_64K_3_10;
-					m->l3_index_size = PUD_INDEX_SIZE_L4_64K;
-					m->l4_index_size = PGD_INDEX_SIZE_L4_64K_3_10;
+				if (machdep->flags & RADIX_MMU) {
+					ms->l1_index_size = PTE_INDEX_SIZE_RADIX_64K;
+					ms->l2_index_size = PMD_INDEX_SIZE_RADIX_64K;
+					ms->l3_index_size = PUD_INDEX_SIZE_RADIX_64K;
+					ms->l4_index_size = PGD_INDEX_SIZE_RADIX_64K;
+
+				} else if (!(machdep->flags & BOOK3E) &&
+				    (THIS_KERNEL_VERSION >= LINUX(4,6,0))) {
+					ms->l1_index_size = PTE_INDEX_SIZE_L4_64K_3_10;
+
+					if (THIS_KERNEL_VERSION >= LINUX(4,12,0)) {
+						ms->l2_index_size = PMD_INDEX_SIZE_L4_64K_4_12;
+						if (THIS_KERNEL_VERSION >= LINUX(4,17,0))
+							ms->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_17;
+						else
+							ms->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_12;
+						ms->l4_index_size = PGD_INDEX_SIZE_L4_64K_4_12;
+					} else {
+						ms->l2_index_size = PMD_INDEX_SIZE_L4_64K_4_6;
+						ms->l3_index_size = PUD_INDEX_SIZE_L4_64K_4_6;
+						ms->l4_index_size = PGD_INDEX_SIZE_L4_64K_3_10;
+					}
+				} else if (THIS_KERNEL_VERSION >= LINUX(3,10,0)) {
+					ms->l1_index_size = PTE_INDEX_SIZE_L4_64K_3_10;
+					ms->l2_index_size = PMD_INDEX_SIZE_L4_64K_3_10;
+					ms->l3_index_size = PUD_INDEX_SIZE_L4_64K;
+					ms->l4_index_size = PGD_INDEX_SIZE_L4_64K_3_10;
 
 				} else {
-					m->l1_index_size = PTE_INDEX_SIZE_L4_64K;
-					m->l2_index_size = PMD_INDEX_SIZE_L4_64K;
-					m->l3_index_size = PUD_INDEX_SIZE_L4_64K;
-					m->l4_index_size = PGD_INDEX_SIZE_L4_64K;
+					ms->l1_index_size = PTE_INDEX_SIZE_L4_64K;
+					ms->l2_index_size = PMD_INDEX_SIZE_L4_64K;
+					ms->l3_index_size = PUD_INDEX_SIZE_L4_64K;
+					ms->l4_index_size = PGD_INDEX_SIZE_L4_64K;
 				}
+
 				if (!(machdep->flags & BOOK3E))
-					m->pte_shift = symbol_exists("demote_segment_4k") ?
-						PTE_SHIFT_L4_64K_V2 : PTE_SHIFT_L4_64K_V1; 
-				m->l2_masked_bits = PMD_MASKED_BITS_64K;
+					ms->pte_rpn_shift = symbol_exists("demote_segment_4k") ?
+						PTE_RPN_SHIFT_L4_64K_V2 : PTE_RPN_SHIFT_L4_64K_V1;
+
+				if (!(machdep->flags & BOOK3E) &&
+				    (THIS_KERNEL_VERSION >= LINUX(4,6,0))) {
+					ms->pgd_masked_bits = PGD_MASKED_BITS_64K_4_6;
+					ms->pud_masked_bits = PUD_MASKED_BITS_64K_4_6;
+					ms->pmd_masked_bits = PMD_MASKED_BITS_64K_4_6;
+				} else {
+					ms->pgd_masked_bits = PGD_MASKED_BITS_64K;
+					ms->pud_masked_bits = PUD_MASKED_BITS_64K;
+					if ((machdep->flags & BOOK3E) &&
+					    (THIS_KERNEL_VERSION >= LINUX(4,5,0)))
+						ms->pmd_masked_bits = PMD_MASKED_BITS_BOOK3E_64K_4_5;
+					else if (THIS_KERNEL_VERSION >= LINUX(3,11,0))
+						ms->pmd_masked_bits = PMD_MASKED_BITS_64K_3_11;
+					else
+						ms->pmd_masked_bits = PMD_MASKED_BITS_64K;
+				}
 			} else {
 				/* 4K pagesize */
-				m->l1_index_size = PTE_INDEX_SIZE_L4_4K;
-				m->l2_index_size = PMD_INDEX_SIZE_L4_4K;
-				m->l3_index_size = PUD_INDEX_SIZE_L4_4K;
-				m->l4_index_size = PGD_INDEX_SIZE_L4_4K;
-				m->pte_shift = (machdep->flags & BOOK3E) ? 
-					PTE_SHIFT_L4_BOOK3E_4K : PTE_SHIFT_L4_4K; 
-				m->l2_masked_bits = PMD_MASKED_BITS_4K;
+				if (machdep->flags & RADIX_MMU) {
+					ms->l1_index_size = PTE_INDEX_SIZE_RADIX_4K;
+					ms->l2_index_size = PMD_INDEX_SIZE_RADIX_4K;
+					ms->l3_index_size = PUD_INDEX_SIZE_RADIX_4K;
+					ms->l4_index_size = PGD_INDEX_SIZE_RADIX_4K;
+
+				} else {
+					ms->l1_index_size = PTE_INDEX_SIZE_L4_4K;
+					ms->l2_index_size = PMD_INDEX_SIZE_L4_4K;
+					if (THIS_KERNEL_VERSION >= LINUX(3,7,0))
+						ms->l3_index_size = PUD_INDEX_SIZE_L4_4K_3_7;
+					else
+						ms->l3_index_size = PUD_INDEX_SIZE_L4_4K;
+					ms->l4_index_size = PGD_INDEX_SIZE_L4_4K;
+
+					if (machdep->flags & BOOK3E)
+						ms->pte_rpn_shift = PTE_RPN_SHIFT_L4_BOOK3E_4K;
+					else
+						ms->pte_rpn_shift = THIS_KERNEL_VERSION >= LINUX(4,5,0) ?
+							PTE_RPN_SHIFT_L4_4K_4_5 : PTE_RPN_SHIFT_L4_4K;
+				}
+
+				ms->pgd_masked_bits = PGD_MASKED_BITS_4K;
+				ms->pud_masked_bits = PUD_MASKED_BITS_4K;
+				ms->pmd_masked_bits = PMD_MASKED_BITS_4K;
+			}
+
+			ms->pte_rpn_mask = PTE_RPN_MASK_DEFAULT;
+			if (!(machdep->flags & BOOK3E)) {
+				if (THIS_KERNEL_VERSION >= LINUX(4,6,0)) {
+					ms->pte_rpn_mask = PTE_RPN_MASK_L4_4_6;
+					ms->pte_rpn_shift = PTE_RPN_SHIFT_L4_4_6;
+				}
+				if (THIS_KERNEL_VERSION >= LINUX(4,7,0)) {
+					ms->pgd_masked_bits = PGD_MASKED_BITS_4_7;
+					ms->pud_masked_bits = PUD_MASKED_BITS_4_7;
+					ms->pmd_masked_bits = PMD_MASKED_BITS_4_7;
+				}
 			}
 
 			/* Compute ptrs per each level */
-			m->l1_shift = machdep->pageshift;
-			m->ptrs_per_l1 = (1 << m->l1_index_size);
-			m->ptrs_per_l2 = (1 << m->l2_index_size);
-			m->ptrs_per_l3 = (1 << m->l3_index_size);
-
-			machdep->ptrs_per_pgd = m->ptrs_per_l3;
+			ms->l1_shift = machdep->pageshift;
+			ms->ptrs_per_l1 = (1 << ms->l1_index_size);
+			ms->ptrs_per_l2 = (1 << ms->l2_index_size);
+			ms->ptrs_per_l3 = (1 << ms->l3_index_size);
+			ms->ptrs_per_l4 = (1 << ms->l4_index_size);
+			machdep->ptrs_per_pgd = ms->ptrs_per_l4;
 
 			/* Compute shifts */
-			m->l2_shift = m->l1_shift + m->l1_index_size;
-			m->l3_shift = m->l2_shift + m->l2_index_size;
-			m->l4_shift = m->l3_shift + m->l3_index_size;
+			ms->l2_shift = ms->l1_shift + ms->l1_index_size;
+			ms->l3_shift = ms->l2_shift + ms->l2_index_size;
+			ms->l4_shift = ms->l3_shift + ms->l3_index_size;
 		}
 
 		if (machdep->flags & VMEMMAP)
 			ppc64_vmemmap_init();
 
 		machdep->section_size_bits = _SECTION_SIZE_BITS;
-		if (THIS_KERNEL_VERSION >= LINUX(3,7,0))
-			machdep->max_physmem_bits = _MAX_PHYSMEM_BITS_3_7;
-		else
-			machdep->max_physmem_bits = _MAX_PHYSMEM_BITS;
+		set_ppc64_max_physmem_bits();
 
 		ppc64_init_cpu_info();
 		machdep->vmalloc_start = ppc64_vmalloc_start;
@@ -378,24 +699,22 @@ ppc64_init(int when)
 			 */
 			offset = MEMBER_OFFSET("paca_struct", "xHrdIntStack");
 			paca_sym  = symbol_value("paca");
+			if (!(ms->hwintrstack = (ulong *)calloc(NR_CPUS, sizeof(ulong))))
+				error(FATAL, "cannot malloc hwintrstack space.");
 			for (cpu = 0; cpu < kt->cpus; cpu++)  {
-				readmem(paca_sym + (paca_size * cpu) + offset,
-					KVADDR, 
-					&machdep->machspec->hwintrstack[cpu],
-					sizeof(ulong), "PPC64 HW_intr_stack",
-					FAULT_ON_ERROR);
+				readmem(paca_sym + (paca_size * cpu) + offset, KVADDR,
+					&ms->hwintrstack[cpu], sizeof(ulong),
+					"PPC64 HW_intr_stack", FAULT_ON_ERROR);
 			}
-			machdep->machspec->hwstacksize = 8 * machdep->pagesize;
-			if ((machdep->machspec->hwstackbuf = (char *)
-				malloc(machdep->machspec->hwstacksize)) == NULL)
-				error(FATAL, "cannot malloc hwirqstack space.");
-		} else
-			/*
-			 * 'xHrdIntStack' member in "paca_struct" is not 
-			 * available for 2.6 kernel. 
-			 */
-			BZERO(&machdep->machspec->hwintrstack,
-				NR_CPUS*sizeof(ulong));
+			ms->hwstacksize = 8 * machdep->pagesize;
+			if ((ms->hwstackbuf = (char *)malloc(ms->hwstacksize)) == NULL)
+				error(FATAL, "cannot malloc hwirqstack buffer space.");
+		}
+
+		machdep->get_current_task_reg = ppc64_get_current_task_reg;
+
+		ppc64_init_paca_info();
+
 		if (!machdep->hz) {
 			machdep->hz = HZ;
 			if (THIS_KERNEL_VERSION >= LINUX(2,6,0))
@@ -414,7 +733,7 @@ ppc64_init(int when)
 		break;
 
 	case LOG_ONLY:
-		machdep->kvbase = kt->vmcoreinfo._stext_SYMBOL;
+		machdep->identity_map_base = kt->vmcoreinfo._stext_SYMBOL;
 		break;
 	}
 }
@@ -426,7 +745,13 @@ ppc64_init(int when)
 static ulong 
 ppc64_task_to_stackbase(ulong task)
 {
-	if (tt->flags & THREAD_INFO)
+	ulong stackbase;
+
+	if (tt->flags & THREAD_INFO_IN_TASK) {
+		readmem(task + OFFSET(task_struct_stack), KVADDR, &stackbase,
+		    sizeof(void *), "task_struct.stack", FAULT_ON_ERROR);
+		return stackbase;
+	} else if (tt->flags & THREAD_INFO)
 		return task_to_thread_info(task);
 	else 
 		return task;
@@ -447,6 +772,7 @@ ppc64_get_stacktop(ulong task)
 void
 ppc64_dump_machdep_table(ulong arg)
 {
+	struct machine_specific *ms = machdep->machspec;
         int i, c, others; 
  
         others = 0;
@@ -463,6 +789,16 @@ ppc64_dump_machdep_table(ulong arg)
 		fprintf(fp, "%sVMEMMAP", others++ ? "|" : "");
 	if (machdep->flags & VMEMMAP_AWARE)
 		fprintf(fp, "%sVMEMMAP_AWARE", others++ ? "|" : "");
+	if (machdep->flags & BOOK3E)
+		fprintf(fp, "%sBOOK3E", others++ ? "|" : "");
+	if (machdep->flags & PHYS_ENTRY_L4)
+		fprintf(fp, "%sPHYS_ENTRY_L4", others++ ? "|" : "");
+	if (machdep->flags & SWAP_ENTRY_L4)
+		fprintf(fp, "%sSWAP_ENTRY_L4", others++ ? "|" : "");
+	if (machdep->flags & RADIX_MMU)
+		fprintf(fp, "%sRADIX_MMU", others++ ? "|" : "");
+	if (machdep->flags & OPAL_FW)
+		fprintf(fp, "%sOPAL_FW", others++ ? "|" : "");
         fprintf(fp, ")\n");
 
 	fprintf(fp, "             kvbase: %lx\n", machdep->kvbase);
@@ -508,10 +844,12 @@ ppc64_dump_machdep_table(ulong arg)
 	fprintf(fp, "xen_kdump_p2m_create: NULL\n");
         fprintf(fp, "  line_number_hooks: ppc64_line_number_hooks\n");
         fprintf(fp, "      last_pgd_read: %lx\n", machdep->last_pgd_read);
+        fprintf(fp, "      last_pud_read: %lx\n", machdep->last_pud_read);
         fprintf(fp, "      last_pmd_read: %lx\n", machdep->last_pmd_read);
         fprintf(fp, "     last_ptbl_read: %lx\n", machdep->last_ptbl_read);
         fprintf(fp, "clear_machdep_cache: ppc64_clear_machdep_cache()\n");
         fprintf(fp, "                pgd: %lx\n", (ulong)machdep->pgd);
+        fprintf(fp, "                pud: %lx\n", (ulong)machdep->pud);
         fprintf(fp, "                pmd: %lx\n", (ulong)machdep->pmd);
         fprintf(fp, "               ptbl: %lx\n", (ulong)machdep->ptbl);
 	fprintf(fp, "       ptrs_per_pgd: %d\n", machdep->ptrs_per_pgd);
@@ -523,63 +861,57 @@ ppc64_dump_machdep_table(ulong arg)
                         i, machdep->cmdline_args[i] ?
                         machdep->cmdline_args[i] : "(unused)");
         }
-	fprintf(fp, "           machspec: %lx\n", (ulong)machdep->machspec);
+	fprintf(fp, "           machspec: %lx\n", (ulong)ms);
 	fprintf(fp, "            is_kvaddr: %s\n", 
-		machdep->machspec->is_kvaddr == book3e_is_kvaddr ? 
+		ms->is_kvaddr == book3e_is_kvaddr ?
 		"book3e_is_kvaddr()" : "generic_is_kvaddr()");
 	fprintf(fp, "            is_vmaddr: %s\n", 
-		machdep->machspec->is_vmaddr == book3e_is_vmaddr ? 
+		ms->is_vmaddr == book3e_is_vmaddr ?
 		"book3e_is_vmaddr()" : "ppc64_is_vmaddr()");
-	fprintf(fp, "    hwintrstack[%d]: ", NR_CPUS);
-       	for (c = 0; c < NR_CPUS; c++) {
-		for (others = 0, i = c; i < NR_CPUS; i++) {
-			if (machdep->machspec->hwintrstack[i])
-				others++;
+	if (ms->hwintrstack) {
+		fprintf(fp, "    hwintrstack[%d]: ", NR_CPUS);
+		for (c = 0; c < NR_CPUS; c++) {
+			fprintf(fp, "%s%016lx ",
+				((c % 4) == 0) ? "\n  " : "",
+				ms->hwintrstack[c]);
 		}
-		if (!others) {
-			fprintf(fp, "%s%s", 
-			        c && ((c % 4) == 0) ? "\n  " : "",
-				c ? "(remainder unused)" : "(unused)");
-			break;
-		}
-
-		fprintf(fp, "%s%016lx ", 
-			((c % 4) == 0) ? "\n  " : "",
-			machdep->machspec->hwintrstack[c]);
-	}
+	} else
+		fprintf(fp, "          hwintrstack: (unused)");
 	fprintf(fp, "\n");
-	fprintf(fp, "           hwstackbuf: %lx\n", (ulong)machdep->machspec->hwstackbuf);
-	fprintf(fp, "          hwstacksize: %d\n", machdep->machspec->hwstacksize);
-	fprintf(fp, "               level4: %lx\n", (ulong)machdep->machspec->level4);
-	fprintf(fp, "     last_level4_read: %lx\n", (ulong)machdep->machspec->last_level4_read);
-	fprintf(fp, "        l4_index_size: %d\n", machdep->machspec->l4_index_size);
-	fprintf(fp, "        l3_index_size: %d\n", machdep->machspec->l3_index_size);
-	fprintf(fp, "        l2_index_size: %d\n", machdep->machspec->l2_index_size);
-	fprintf(fp, "        l1_index_size: %d\n", machdep->machspec->l1_index_size);
-	fprintf(fp, "          ptrs_per_l3: %d\n", machdep->machspec->ptrs_per_l3);
-	fprintf(fp, "          ptrs_per_l2: %d\n", machdep->machspec->ptrs_per_l2);
-	fprintf(fp, "          ptrs_per_l1: %d\n", machdep->machspec->ptrs_per_l1);
-	fprintf(fp, "             l4_shift: %d\n", machdep->machspec->l4_shift);
-	fprintf(fp, "             l3_shift: %d\n", machdep->machspec->l3_shift);
-	fprintf(fp, "             l2_shift: %d\n", machdep->machspec->l2_shift);
-	fprintf(fp, "             l1_shift: %d\n", machdep->machspec->l1_shift);
-	fprintf(fp, "            pte_shift: %d\n", machdep->machspec->pte_shift);
-	fprintf(fp, "       l2_masked_bits: %x\n", machdep->machspec->l2_masked_bits);
+	fprintf(fp, "           hwstackbuf: %lx\n", (ulong)ms->hwstackbuf);
+	fprintf(fp, "          hwstacksize: %d\n", ms->hwstacksize);
+	fprintf(fp, "        l4_index_size: %d\n", ms->l4_index_size);
+	fprintf(fp, "        l3_index_size: %d\n", ms->l3_index_size);
+	fprintf(fp, "        l2_index_size: %d\n", ms->l2_index_size);
+	fprintf(fp, "        l1_index_size: %d\n", ms->l1_index_size);
+	fprintf(fp, "          ptrs_per_l4: %d\n", ms->ptrs_per_l4);
+	fprintf(fp, "          ptrs_per_l3: %d\n", ms->ptrs_per_l3);
+	fprintf(fp, "          ptrs_per_l2: %d\n", ms->ptrs_per_l2);
+	fprintf(fp, "          ptrs_per_l1: %d\n", ms->ptrs_per_l1);
+	fprintf(fp, "             l4_shift: %d\n", ms->l4_shift);
+	fprintf(fp, "             l3_shift: %d\n", ms->l3_shift);
+	fprintf(fp, "             l2_shift: %d\n", ms->l2_shift);
+	fprintf(fp, "             l1_shift: %d\n", ms->l1_shift);
+	fprintf(fp, "         pte_rpn_mask: %lx\n", ms->pte_rpn_mask);
+	fprintf(fp, "        pte_rpn_shift: %d\n", ms->pte_rpn_shift);
+	fprintf(fp, "      pgd_masked_bits: %lx\n", ms->pgd_masked_bits);
+	fprintf(fp, "      pud_masked_bits: %lx\n", ms->pud_masked_bits);
+	fprintf(fp, "      pmd_masked_bits: %lx\n", ms->pmd_masked_bits);
 	fprintf(fp, "         vmemmap_base: "); 
-	if (machdep->machspec->vmemmap_base)
-		fprintf(fp, "%lx\n", machdep->machspec->vmemmap_base);
+	if (ms->vmemmap_base)
+		fprintf(fp, "%lx\n", ms->vmemmap_base);
 	else
 		fprintf(fp, "(unused)\n");
-	if (machdep->machspec->vmemmap_cnt) {
+	if (ms->vmemmap_cnt) {
 		fprintf(fp, "          vmemmap_cnt: %d\n", 
-			machdep->machspec->vmemmap_cnt);
+			ms->vmemmap_cnt);
 		fprintf(fp, "        vmemmap_psize: %d\n", 
-			machdep->machspec->vmemmap_psize);
-		for (i = 0; i < machdep->machspec->vmemmap_cnt; i++) {
+			ms->vmemmap_psize);
+		for (i = 0; i < ms->vmemmap_cnt; i++) {
 			fprintf(fp, 
 			    "      vmemmap_list[%d]: virt: %lx  phys: %lx\n", i, 
-				machdep->machspec->vmemmap_list[i].virt,
-				machdep->machspec->vmemmap_list[i].phys);
+				ms->vmemmap_list[i].virt,
+				ms->vmemmap_list[i].phys);
 		}
 	} else {
 		fprintf(fp, "          vmemmap_cnt: (unused)\n");
@@ -650,19 +982,16 @@ ppc64_vtop(ulong vaddr, ulong *pgd, physaddr_t *paddr, int verbose)
 	if (!(pte & _PAGE_PRESENT)) {
 		if (pte && verbose) {
 			fprintf(fp, "\n");
-			ppc64_translate_pte(pte, 0, PTE_SHIFT);
+			ppc64_translate_pte(pte, 0, PTE_RPN_SHIFT_DEFAULT);
 		}
 		return FALSE;
 	}
 
-	if (!pte)
-		return FALSE;
-
-	*paddr = PAGEBASE(PTOB(pte >> PTE_SHIFT)) + PAGEOFFSET(vaddr);
+	*paddr = PAGEBASE(PTOB(pte >> PTE_RPN_SHIFT_DEFAULT)) + PAGEOFFSET(vaddr);
 
 	if (verbose) {
 		fprintf(fp, " PAGE: %lx\n\n", PAGEBASE(*paddr));
-		ppc64_translate_pte(pte, 0, PTE_SHIFT);
+		ppc64_translate_pte(pte, 0, PTE_RPN_SHIFT_DEFAULT);
 	}
 
 	return TRUE;
@@ -675,54 +1004,60 @@ ppc64_vtop(ulong vaddr, ulong *pgd, physaddr_t *paddr, int verbose)
 static int
 ppc64_vtop_level4(ulong vaddr, ulong *level4, physaddr_t *paddr, int verbose)
 {
-	ulong *level4_dir;
-	ulong *page_dir;
+	ulong *pgdir;
+	ulong *page_upper;
 	ulong *page_middle;
 	ulong *page_table;
-	ulong level4_pte, pgd_pte, pmd_pte;
+	ulong pgd_pte, pud_pte, pmd_pte;
 	ulong pte;
+	uint  pdshift;
 	uint  hugepage_type = 0; /* 0: regular entry; 1: huge pte; 2: huge pd */
+	uint  swap = !!(machdep->flags & SWAP_ENTRY_L4);
 
 	if (verbose)
 		fprintf(fp, "PAGE DIRECTORY: %lx\n", (ulong)level4);
 
-	level4_dir = (ulong *)((ulong *)level4 + L4_OFFSET(vaddr));
-	FILL_L4(PAGEBASE(level4), KVADDR, PAGESIZE());
-	level4_pte = ULONG(machdep->machspec->level4 + PAGEOFFSET(level4_dir));
+	pgdir = (ulong *)((ulong *)level4 + PGD_OFFSET_L4(vaddr));
+	FILL_PGD(PAGEBASE(level4), KVADDR, PAGESIZE());
+	pgd_pte = swap64(ULONG(machdep->pgd + PAGEOFFSET(pgdir)), swap);
 	if (verbose)
-		fprintf(fp, "  L4: %lx => %lx\n", (ulong)level4_dir, level4_pte);
-	if (!level4_pte)
+		fprintf(fp, "  PGD: %lx => %lx\n", (ulong)pgdir, pgd_pte);
+	if (!pgd_pte)
 		return FALSE;
 
-	hugepage_type = get_ptetype(level4_pte);
+	hugepage_type = get_ptetype(pgd_pte);
 	if (hugepage_type) {
-		pte = level4_pte;
+		pte = pgd_pte;
+		pdshift = machdep->machspec->l4_shift;
 		goto out;
 	}
 
 	/* Sometimes we don't have level3 pagetable entries */
 	if (machdep->machspec->l3_index_size != 0) {
-		page_dir = (ulong *)((ulong *)level4_pte + PGD_OFFSET_L4(vaddr));
-		FILL_PGD(PAGEBASE(level4_pte), KVADDR, PAGESIZE());
-		pgd_pte = ULONG(machdep->pgd + PAGEOFFSET(page_dir));
+		pgd_pte = pgd_page_vaddr_l4(pgd_pte);
+		page_upper = (ulong *)((ulong *)pgd_pte + PUD_OFFSET_L4(vaddr));
+		FILL_PUD(PAGEBASE(pgd_pte), KVADDR, PAGESIZE());
+		pud_pte = swap64(ULONG(machdep->pud + PAGEOFFSET(page_upper)), swap);
 
 		if (verbose)
-			fprintf(fp, "  PGD: %lx => %lx\n", (ulong)page_dir, pgd_pte);
-		if (!pgd_pte)
+			fprintf(fp, "  PUD: %lx => %lx\n", (ulong)page_upper, pud_pte);
+		if (!pud_pte)
 			return FALSE;
 
-		hugepage_type = get_ptetype(pgd_pte);
+		hugepage_type = get_ptetype(pud_pte);
 		if (hugepage_type) {
-			pte = pgd_pte;
+			pte = pud_pte;
+			pdshift = machdep->machspec->l3_shift;
 			goto out;
 		}
 	} else {
-		pgd_pte = level4_pte;
+		pud_pte = pgd_pte;
 	}
 
-	page_middle = (ulong *)((ulong *)pgd_pte + PMD_OFFSET_L4(vaddr));
-	FILL_PMD(PAGEBASE(pgd_pte), KVADDR, PAGESIZE());
-	pmd_pte = ULONG(machdep->pmd + PAGEOFFSET(page_middle));
+	pud_pte = pud_page_vaddr_l4(pud_pte);
+	page_middle = (ulong *)((ulong *)pud_pte + PMD_OFFSET_L4(vaddr));
+	FILL_PMD(PAGEBASE(pud_pte), KVADDR, PAGESIZE());
+	pmd_pte = swap64(ULONG(machdep->pmd + PAGEOFFSET(page_middle)), swap);
 
 	if (verbose)
 		fprintf(fp, "  PMD: %lx => %lx\n", (ulong)page_middle, pmd_pte);
@@ -733,17 +1068,19 @@ ppc64_vtop_level4(ulong vaddr, ulong *level4, physaddr_t *paddr, int verbose)
 	hugepage_type = get_ptetype(pmd_pte);
 	if (hugepage_type) {
 		pte = pmd_pte;
+		pdshift = machdep->machspec->l2_shift;
 		goto out;
 	}
 
-	page_table = (ulong *)(pmd_pte & ~(machdep->machspec->l2_masked_bits))
+	pmd_pte = pmd_page_vaddr_l4(pmd_pte);
+	page_table = (ulong *)(pmd_pte)
 			 + (BTOP(vaddr) & (machdep->machspec->ptrs_per_l1 - 1));
 	if (verbose)
 		fprintf(fp, "  PMD: %lx => %lx\n",(ulong)page_middle,
 			(ulong)page_table);
 
 	FILL_PTBL(PAGEBASE(pmd_pte), KVADDR, PAGESIZE());
-	pte = ULONG(machdep->ptbl + PAGEOFFSET(page_table));
+	pte = swap64(ULONG(machdep->ptbl + PAGEOFFSET(page_table)), swap);
 
 	if (verbose)
 		fprintf(fp, "  PTE: %lx => %lx\n", (ulong)page_table, pte);
@@ -751,13 +1088,10 @@ ppc64_vtop_level4(ulong vaddr, ulong *level4, physaddr_t *paddr, int verbose)
 	if (!(pte & _PAGE_PRESENT)) {
 		if (pte && verbose) {
 			fprintf(fp, "\n");
-			ppc64_translate_pte(pte, 0, machdep->machspec->pte_shift);
+			ppc64_translate_pte(pte, 0, machdep->machspec->pte_rpn_shift);
 		}
 		return FALSE;
 	}
-
-	if (!pte)
-		return FALSE;
 
 out:
 	if (hugepage_type) {
@@ -769,13 +1103,22 @@ out:
 			 * in this directory for all the huge pages
 			 * in this huge page directory.
 			 */
-			readmem(hugepage_dir(pte), KVADDR, &pte, sizeof(pte),
-				"hugepd_entry", RETURN_ON_ERROR);
+			ulong hugepd = hugepage_dir(pte);
+
+			readmem(hugepd, KVADDR, &pte, sizeof(pte),
+                                "hugepd_entry", RETURN_ON_ERROR);
+
+			if (verbose)
+				fprintf(fp, "  HUGE PD: %lx => %lx\n", hugepd, pte);
+
+			if (!pte)
+				return FALSE;
 		}
-		/* TODO: get page offset for huge pages based on page size */
-		*paddr = PAGEBASE(PTOB(pte >> machdep->machspec->pte_shift));
+
+		*paddr = PAGEBASE(PTOB((pte & PTE_RPN_MASK) >> PTE_RPN_SHIFT))
+				+ (vaddr & ((1UL << pdshift) - 1));
 	} else {
-		*paddr = PAGEBASE(PTOB(pte >> machdep->machspec->pte_shift))
+		*paddr = PAGEBASE(PTOB((pte & PTE_RPN_MASK) >> PTE_RPN_SHIFT))
 				+ PAGEOFFSET(vaddr);
 	}
 
@@ -784,7 +1127,7 @@ out:
 			fprintf(fp, " HUGE PAGE: %lx\n\n", PAGEBASE(*paddr));
 		else
 			fprintf(fp, " PAGE: %lx\n\n", PAGEBASE(*paddr));
-		ppc64_translate_pte(pte, 0, machdep->machspec->pte_shift);
+		ppc64_translate_pte(pte, 0, machdep->machspec->pte_rpn_shift);
 	}
 
 	return TRUE;
@@ -879,6 +1222,70 @@ ppc64_kvtop(struct task_context *tc, ulong kvaddr,
 		return ppc64_vtop(kvaddr, (ulong *)vt->kernel_pgd[0], paddr, verbose);
 }
 
+static void
+ppc64_init_paca_info(void)
+{
+	struct machine_specific *ms = machdep->machspec;
+	ulong *paca_ptr;
+	int i;
+
+	if (!(paca_ptr = (ulong *)calloc(kt->cpus, sizeof(ulong))))
+		error(FATAL, "cannot malloc paca pointers space.\n");
+
+	/* Get paca pointers for all CPUs. */
+	if (symbol_exists("paca_ptrs")) {
+		ulong paca_loc;
+
+		readmem(symbol_value("paca_ptrs"), KVADDR, &paca_loc, sizeof(void *),
+			"paca double pointer", RETURN_ON_ERROR);
+		readmem(paca_loc, KVADDR, paca_ptr, sizeof(void *) * kt->cpus,
+			"paca pointers", RETURN_ON_ERROR);
+	} else if (symbol_exists("paca") &&
+		   (get_symbol_type("paca", NULL, NULL) == TYPE_CODE_PTR)) {
+		readmem(symbol_value("paca"), KVADDR, paca_ptr, sizeof(void *) * kt->cpus,
+			"paca pointers", RETURN_ON_ERROR);
+	} else {
+		free(paca_ptr);
+		return;
+	}
+
+	/* Initialize emergency stacks info. */
+	if (MEMBER_EXISTS("paca_struct", "emergency_sp")) {
+		ulong offset = MEMBER_OFFSET("paca_struct", "emergency_sp");
+
+		if (!(ms->emergency_sp = (ulong *)calloc(kt->cpus, sizeof(ulong))))
+			error(FATAL, "cannot malloc emergency stack space.\n");
+		for (i = 0; i < kt->cpus; i++)
+			readmem(paca_ptr[i] + offset, KVADDR, &ms->emergency_sp[i],
+				sizeof(void *), "paca->emergency_sp",
+				RETURN_ON_ERROR);
+	}
+
+	if (MEMBER_EXISTS("paca_struct", "nmi_emergency_sp")) {
+		ulong offset = MEMBER_OFFSET("paca_struct", "nmi_emergency_sp");
+
+		if (!(ms->nmi_emergency_sp = (ulong *)calloc(kt->cpus, sizeof(ulong))))
+			error(FATAL, "cannot malloc NMI emergency stack space.\n");
+		for (i = 0; i < kt->cpus; i++)
+			readmem(paca_ptr[i] + offset, KVADDR, &ms->nmi_emergency_sp[i],
+				sizeof(void *), "paca->nmi_emergency_sp",
+				RETURN_ON_ERROR);
+	}
+
+	if (MEMBER_EXISTS("paca_struct", "mc_emergency_sp")) {
+		ulong offset = MEMBER_OFFSET("paca_struct", "mc_emergency_sp");
+
+		if (!(ms->mc_emergency_sp = (ulong *)calloc(kt->cpus, sizeof(ulong))))
+			error(FATAL, "cannot malloc machine check emergency stack space.\n");
+		for (i = 0; i < kt->cpus; i++)
+			readmem(paca_ptr[i] + offset, KVADDR, &ms->mc_emergency_sp[i],
+				sizeof(void *), "paca->mc_emergency_sp",
+				RETURN_ON_ERROR);
+	}
+
+	free(paca_ptr);
+}
+
 /*
  *  Verify that the kernel has made the vmemmap list available,
  *  and if so, stash the relevant data required to make vtop
@@ -892,10 +1299,32 @@ void ppc64_vmemmap_init(void)
 	long backing_size, virt_addr_offset, phys_offset, list_offset;
 	ulong *vmemmap_list;
 	char *vmemmap_buf;
-	struct machine_specific *ms;
-	
-	if (!(kernel_symbol_exists("vmemmap_list")) ||
-	    !(kernel_symbol_exists("mmu_psize_defs")) ||
+	struct machine_specific *ms = machdep->machspec;
+
+	ld = &list_data;
+	BZERO(ld, sizeof(struct list_data));
+
+	/*
+	 * vmemmap_list is missing or set to 0 in the kernel would imply
+	 * vmemmap region is mapped in the kernel pagetable. So, read vmemmap_list
+	 * anyway and use the translation method accordingly.
+	 */
+	if (kernel_symbol_exists("vmemmap_list"))
+		readmem(symbol_value("vmemmap_list"), KVADDR, &ld->start,
+				sizeof(void *), "vmemmap_list", RETURN_ON_ERROR|QUIET);
+	if (!ld->start) {
+		/*
+		 * vmemmap_list is set to 0 or missing. Do kernel pagetable walk
+		 * for vmemmap address translation.
+		 */
+		ms->vmemmap_list = NULL;
+		ms->vmemmap_cnt = 0;
+
+		machdep->flags |= VMEMMAP_AWARE;
+		return;
+	}
+
+	if (!(kernel_symbol_exists("mmu_psize_defs")) ||
 	    !(kernel_symbol_exists("mmu_vmemmap_psize")) ||
 	    !STRUCT_EXISTS("vmemmap_backing") ||
 	    !STRUCT_EXISTS("mmu_psize_def") ||
@@ -904,8 +1333,6 @@ void ppc64_vmemmap_init(void)
 	    !MEMBER_EXISTS("vmemmap_backing", "virt_addr") ||
 	    !MEMBER_EXISTS("vmemmap_backing", "list"))
 		return;
-
-	ms = machdep->machspec;
 
 	backing_size = STRUCT_SIZE("vmemmap_backing");
 	virt_addr_offset = MEMBER_OFFSET("vmemmap_backing", "virt_addr");
@@ -925,14 +1352,8 @@ void ppc64_vmemmap_init(void)
 
 	ms->vmemmap_psize = 1 << shift;
 
-        ld =  &list_data;
-        BZERO(ld, sizeof(struct list_data));
-	if (!readmem(symbol_value("vmemmap_list"),
-	    KVADDR, &ld->start, sizeof(void *), "vmemmap_list",
-	    RETURN_ON_ERROR))
-		return;
-        ld->end = symbol_value("vmemmap_list");
-        ld->list_head_offset = list_offset;
+	ld->end = symbol_value("vmemmap_list");
+	ld->list_head_offset = list_offset;
 
         hq_open();
 	cnt = do_list(ld);
@@ -978,7 +1399,7 @@ ppc64_vmemmap_to_phys(ulong kvaddr, physaddr_t *paddr, int verbose)
 {
 	int i;
 	ulong offset;
-	struct machine_specific *ms;
+	struct machine_specific *ms = machdep->machspec;
 
 	if (!(machdep->flags & VMEMMAP_AWARE)) {
 		/*
@@ -998,7 +1419,12 @@ ppc64_vmemmap_to_phys(ulong kvaddr, physaddr_t *paddr, int verbose)
 		return FALSE;
 	}
 
-	ms = machdep->machspec;
+	/**
+	 * When vmemmap_list is not populated, kernel does the mapping in init_mm
+	 * page table, so do a pagetable walk in kernel page table
+	 */
+	if (!ms->vmemmap_list)
+		return ppc64_vtop_level4(kvaddr, (ulong *)vt->kernel_pgd[0], paddr, verbose);
 
 	for (i = 0; i < ms->vmemmap_cnt; i++) {
 		if ((kvaddr >= ms->vmemmap_list[i].virt) &&
@@ -1239,7 +1665,7 @@ ppc64_get_task_pgd(ulong task)
  *  If a physaddr pointer is passed in, don't print anything.
  */
 static int
-ppc64_translate_pte(ulong pte, void *physaddr, ulonglong pte_shift)
+ppc64_translate_pte(ulong pte, void *physaddr, ulonglong pte_rpn_shift)
 {
         int c, len1, len2, len3, others, page_present;
         char buf[BUFSIZE];
@@ -1250,8 +1676,10 @@ ppc64_translate_pte(ulong pte, void *physaddr, ulonglong pte_shift)
         char *arglist[MAXARGS];
         ulong paddr;
 
-        paddr =  PTOB(pte >> pte_shift);
-        page_present = (pte & _PAGE_PRESENT);
+	if (STREQ(pc->curcmd, "pte"))
+		pte_rpn_shift = machdep->machspec->pte_rpn_shift;
+        paddr =  PTOB(pte >> pte_rpn_shift);
+        page_present = !!(pte & _PAGE_PRESENT);
 
         if (physaddr) {
                 *((ulong *)physaddr) = paddr;
@@ -1260,12 +1688,12 @@ ppc64_translate_pte(ulong pte, void *physaddr, ulonglong pte_shift)
 
         sprintf(ptebuf, "%lx", pte);
         len1 = MAX(strlen(ptebuf), strlen("PTE"));
-        fprintf(fp, "%s  ", mkstring(buf, len1, CENTER|LJUST, "PTE"));
 
         if (!page_present && pte) {
                 swap_location(pte, buf);
                 if ((c = parse_line(buf, arglist)) != 3)
                         error(FATAL, "cannot determine swap location\n");
+                fprintf(fp, "%s  ", mkstring(buf2, len1, CENTER|LJUST, "PTE"));
 
                 len2 = MAX(strlen(arglist[0]), strlen("SWAP"));
                 len3 = MAX(strlen(arglist[2]), strlen("OFFSET"));
@@ -1284,6 +1712,7 @@ ppc64_translate_pte(ulong pte, void *physaddr, ulonglong pte_shift)
                 return page_present;
         }
 
+        fprintf(fp, "%s  ", mkstring(buf, len1, CENTER|LJUST, "PTE"));
         sprintf(physbuf, "%lx", paddr);
         len2 = MAX(strlen(physbuf), strlen("PHYSICAL"));
         fprintf(fp, "%s  ", mkstring(buf, len2, CENTER|LJUST, "PHYSICAL"));
@@ -1297,6 +1726,8 @@ ppc64_translate_pte(ulong pte, void *physaddr, ulonglong pte_shift)
         others = 0;
 
         if (pte) {
+                if (pte & _PAGE_PTE)
+                        fprintf(fp, "%sPTE", others++ ? "|" : "");
                 if (pte & _PAGE_PRESENT)
                         fprintf(fp, "%sPRESENT", others++ ? "|" : "");
                 if (pte & _PAGE_USER)
@@ -1343,9 +1774,10 @@ ppc64_check_sp_in_HWintrstack(ulong sp, struct bt_info *bt)
 	 * 
 	 * Note: HW Interrupt stack is used only in 2.4 kernel.
 	 */
-	if (is_task_active(bt->task) && (tt->panic_task != bt->task) &&
-		machdep->machspec->hwintrstack[bt->tc->processor]) {
+	if (machdep->machspec->hwintrstack && is_task_active(bt->task) &&
+	    (bt->task != tt->panic_task)) {
 		ulong newsp;
+
 		readmem(machdep->machspec->hwintrstack[bt->tc->processor],
 			KVADDR, &newsp, sizeof(ulong),
 			"stack pointer", FAULT_ON_ERROR);
@@ -1385,6 +1817,9 @@ ppc64_eframe_search(struct bt_info *bt_in)
 
         	for (c = 0; c < NR_CPUS; c++) {
                 	if (tt->hardirq_ctx[c]) {
+				if ((bt->flags & BT_CPUMASK) && 
+				    !(NUM_IN_BITMAP(bt->cpumask, c)))
+					continue;
 				bt->hp->esp = tt->hardirq_ctx[c];
 				fprintf(fp, "CPU %d HARD IRQ STACK:\n", c);
 				if ((cnt = ppc64_eframe_search(bt)))
@@ -1395,6 +1830,9 @@ ppc64_eframe_search(struct bt_info *bt_in)
 		}
         	for (c = 0; c < NR_CPUS; c++) {
 			if (tt->softirq_ctx[c]) {
+				if ((bt->flags & BT_CPUMASK) && 
+				    !(NUM_IN_BITMAP(bt->cpumask, c)))
+					continue;
 				bt->hp->esp = tt->softirq_ctx[c];
 				fprintf(fp, "CPU %d SOFT IRQ STACK:\n", c);
 				if ((cnt = ppc64_eframe_search(bt)))
@@ -1418,6 +1856,11 @@ ppc64_eframe_search(struct bt_info *bt_in)
 			addr = bt->stackbase +
 				roundup(SIZE(thread_info), sizeof(ulong));
 		} else if (!INSTACK(addr, bt)) {
+			enum emergency_stack_type estype;
+
+			if ((estype = ppc64_in_emergency_stack(bt->tc->processor, addr, false)))
+				ppc64_set_bt_emergency_stack(estype, bt);
+
 			/*
 			 * If the user specified SP is in HW interrupt stack
 			 * (only for tasks running on other CPUs and in 2.4
@@ -1520,6 +1963,84 @@ ppc64_in_irqstack(ulong addr)
 }
 
 /*
+ * Check if the CPU is running in any of its emergency stacks.
+ * Returns
+ *	NONE_STACK          : if input is invalid or addr is not within any emergency stack.
+ *	EMERGENCY_STACK     : if the addr is within emergency stack.
+ *	NMI_EMERGENCY_STACK : if the addr is within NMI emergency stack.
+ *	MC_EMERGENCY_STACK  : if the addr is within machine check emergency stack.
+ */
+static enum emergency_stack_type
+ppc64_in_emergency_stack(int cpu, ulong addr, bool verbose)
+{
+	struct machine_specific *ms = machdep->machspec;
+	ulong base, top;
+
+	if (cpu < 0  || cpu >= kt->cpus)
+		return NONE_STACK;
+
+	if (ms->emergency_sp && IS_KVADDR(ms->emergency_sp[cpu])) {
+		top = ms->emergency_sp[cpu];
+		base =  top - STACKSIZE();
+		if (addr >= base && addr < top) {
+			if (verbose)
+				fprintf(fp, "---<Emergency Stack>---\n");
+			return EMERGENCY_STACK;
+		}
+	}
+
+	if (ms->nmi_emergency_sp && IS_KVADDR(ms->nmi_emergency_sp[cpu])) {
+		top = ms->nmi_emergency_sp[cpu];
+		base = top - STACKSIZE();
+		if (addr >= base && addr < top) {
+			if (verbose)
+				fprintf(fp, "---<NMI Emergency Stack>---\n");
+			return NMI_EMERGENCY_STACK;
+		}
+	}
+
+	if (ms->mc_emergency_sp && IS_KVADDR(ms->mc_emergency_sp[cpu])) {
+		top = ms->mc_emergency_sp[cpu];
+		base =  top - STACKSIZE();
+		if (addr >= base && addr < top) {
+			if (verbose)
+				fprintf(fp, "---<Machine Check Emergency Stack>---\n");
+			return MC_EMERGENCY_STACK;
+		}
+	}
+
+	return NONE_STACK;
+}
+
+static void
+ppc64_set_bt_emergency_stack(enum emergency_stack_type type, struct bt_info *bt)
+{
+	struct machine_specific *ms = machdep->machspec;
+	ulong top;
+
+	switch (type) {
+	case EMERGENCY_STACK:
+		top = ms->emergency_sp[bt->tc->processor];
+		break;
+	case NMI_EMERGENCY_STACK:
+		top = ms->nmi_emergency_sp[bt->tc->processor];
+		break;
+	case MC_EMERGENCY_STACK:
+		top = ms->mc_emergency_sp[bt->tc->processor];
+		break;
+	default:
+		top = 0;
+		break;
+	}
+
+	if (top) {
+		bt->stackbase = top - STACKSIZE();
+		bt->stacktop = top;
+		alter_stackbuf(bt);
+	}
+}
+
+/*
  *  Unroll a kernel stack.
  */
 static void
@@ -1599,10 +2120,13 @@ ppc64_back_trace_cmd(struct bt_info *bt)
 static void
 ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 {
+	enum emergency_stack_type estype;
+	ulong newpc = 0, newsp, marker;
+	int c = bt->tc->processor;
+	ulong nmi_sp = 0;
+	int eframe_found;
 	int frame = 0;
 	ulong lr = 0; /* hack...need to pass in initial lr reg */
-	ulong newpc = 0, newsp, marker;
-	int eframe_found;
 
 	if (!INSTACK(req->sp, bt)) {
 		ulong irqstack;
@@ -1612,7 +2136,11 @@ ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 			bt->stackbase = irqstack;
 			bt->stacktop = bt->stackbase + STACKSIZE();
 			alter_stackbuf(bt);
-		} else if (ms->hwintrstack[bt->tc->processor]) {
+		} else if ((estype = ppc64_in_emergency_stack(c, req->sp, true))) {
+			if (estype == NMI_EMERGENCY_STACK)
+				nmi_sp = req->sp;
+			ppc64_set_bt_emergency_stack(estype, bt);
+		} else if (ms->hwintrstack) {
 			bt->stacktop = ms->hwintrstack[bt->tc->processor] +
 				sizeof(ulong);
 			bt->stackbase = ms->hwintrstack[bt->tc->processor] - 
@@ -1620,9 +2148,7 @@ ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 			bt->stackbuf = ms->hwstackbuf;
 			alter_stackbuf(bt);
 		} else {
-			if (CRASHDEBUG(1)) {
-				fprintf(fp, "cannot find the stack info.\n");
-			}
+			fprintf(fp, "cannot find the stack info.\n");
 			return;
 		}
 	}
@@ -1652,13 +2178,20 @@ ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 				newsp = 
 				*(ulong *)&bt->stackbuf[newsp - bt->stackbase];
 			if (!INSTACK(newsp, bt)) {
-                        	/*
-                         	* Switch HW interrupt stack to process's stack.
-                         	*/
-                        	bt->stackbase = GET_STACKBASE(bt->task);
-                        	bt->stacktop = GET_STACKTOP(bt->task);
-                        	alter_stackbuf(bt);
-                	}  
+				if ((estype = ppc64_in_emergency_stack(c, newsp, true))) {
+					if (!nmi_sp && estype == NMI_EMERGENCY_STACK)
+						nmi_sp = newsp;
+					ppc64_set_bt_emergency_stack(estype, bt);
+				} else {
+					/*
+					 * Switch HW interrupt stack or emergency stack
+					 * to process's stack.
+					 */
+					bt->stackbase = GET_STACKBASE(bt->task);
+					bt->stacktop = GET_STACKTOP(bt->task);
+					alter_stackbuf(bt);
+				}
+			}
 			if (IS_KVADDR(newsp) && INSTACK(newsp, bt))
 				newpc = *(ulong *)&bt->stackbuf[newsp + 16 -
 						bt->stackbase];
@@ -1700,6 +2233,16 @@ ppc64_back_trace(struct gnu_request *req, struct bt_info *bt)
 				newpc = regs.nip;
 				newsp = regs.gpr[1];
 			} 
+		}
+
+		/*
+		 * NMI stack may not be re-entrant. In so, an SP in the NMI stack
+		 * is likely to point back to an SP within the NMI stack, in case
+		 * of a nested NMI.
+		 */
+		if (nmi_sp && nmi_sp == newsp) {
+			fprintf(fp, "---<Nested NMI>---\n");
+			break;
 		}
 
 		/*
@@ -1815,14 +2358,10 @@ ppc64_print_stack_entry(int frame,
 					lr);
 				return;
 			}
-			if (req->pc != lr) {
-				fprintf(fp, "\n [Link Register ] ");
-				fprintf(fp, " [%lx] %s at %lx",
-					req->sp, lrname, lr);
-			}
 			req->ra = lr;
 		}
-		if (!req->name || STREQ(req->name,lrname)) 
+		if (!req->name || STREQ(req->name, lrname) ||
+		    !is_kernel_text(req->pc))
 			fprintf(fp, "  (unreliable)");
 		
 		fprintf(fp, "\n"); 
@@ -1849,37 +2388,53 @@ ppc64_check_eframe(struct ppc64_pt_regs *regs)
 	case 0x100:
 		return("System Reset");
 	case 0x200:
-		return("machine check");
+		return("Machine Check");
 	case 0x300:
-		return("Data Access error");
+		return("Data Access");
 	case 0x380:
 		return("Data SLB Access");
 	case 0x400:
-		return("Instruction bus error");
+		return("Instruction Access");
 	case 0x480:
 		return("Instruction SLB Access");
 	case 0x500:
 		return("Hardware Interrupt");
 	case 0x600:
-		return("Alingment");
+		return("Alignment");
 	case 0x700:
-		return("Breakpoint trap");
+		return("Program Check");
 	case 0x800:
-		return("FPU unavailable");
+		return("FPU Unavailable");
 	case 0x900:
 		return("Decrementer");
+	case 0x980:
+		return("Hypervisor Decrementer");
 	case 0xa00:
-		return("reserved");
+		return("Doorbell");
 	case 0xb00:
 		return("reserved");
 	case 0xc00:
-		return("syscall");
+		return("System Call");
 	case 0xd00:
-		return("single-step/watch");
+		return("Single Step");
 	case 0xe00:
 		return("fp assist");
+	case 0xe40:
+		return("Emulation Assist");
+	case 0xe60:
+		return("HMI");
+	case 0xe80:
+		return("Hypervisor Doorbell");
 	case 0xf00:
 		return("Performance Monitor");
+	case 0xf20:
+		return("Altivec Unavailable");
+	case 0x1300:    
+		return("Instruction Breakpoint");
+	case 0x1500:
+		return("Denormalisation");
+	case 0x1700:    
+		return("Altivec Assist");
 	}
 	
 	/* No exception frame exists */
@@ -1892,8 +2447,8 @@ ppc64_print_regs(struct ppc64_pt_regs *regs)
 	int i;
 
         /* print out the gprs... */
-        for(i=0; i<32; i++) {
-                if(!(i % 3))
+        for (i=0; i<32; i++) {
+                if (i && !(i % 3))
                         fprintf(fp, "\n");
 
                 fprintf(fp, " R%d:%s %016lx   ", i,
@@ -1924,6 +2479,22 @@ ppc64_print_regs(struct ppc64_pt_regs *regs)
         fprintf(fp, "    Syscall Result: %016lx\n", regs->result);
 }
 
+static void ppc64_print_nip_lr(struct ppc64_pt_regs *regs, int print_lr)
+{
+	char buf[BUFSIZE];
+	char *sym_buf;
+
+	sym_buf = value_to_symstr(regs->nip, buf, 0);
+	if (sym_buf[0] != NULLCHAR)
+		fprintf(fp, " [NIP  : %s]\n", sym_buf);
+
+	if (print_lr) {
+		sym_buf = value_to_symstr(regs->link, buf, 0);
+		if (sym_buf[0] != NULLCHAR)
+			fprintf(fp, " [LR   : %s]\n", sym_buf);
+	}
+}
+
 /*
  * Print the exception frame information
  */
@@ -1934,63 +2505,228 @@ ppc64_print_eframe(char *efrm_str, struct ppc64_pt_regs *regs,
 	if (BT_REFERENCE_CHECK(bt))
 		return;
 
-	fprintf(fp, " %s  [%lx] exception frame:", efrm_str, regs->trap);
+	fprintf(fp, " %s [%lx] exception frame:\n", efrm_str, regs->trap);
 	ppc64_print_regs(regs);
-	fprintf(fp, "\n");
+	ppc64_print_nip_lr(regs, 1);
+}
+
+static int
+ppc64_get_current_task_reg(int regno, const char *name, int size,
+		  void *value)
+{
+	struct bt_info bt_info, bt_setup;
+	struct task_context *tc;
+	struct user_regs_bitmap_struct *ur_bitmap;
+	ulong ip, sp;
+	bool ret = FALSE;
+
+	/* Currently only handling registers available in ppc64_pt_regs:
+	 *
+	 * 0-31:   r0-r31
+	 * 64:     pc/nip
+	 * 65:     msr
+	 *
+	 * 67:     lr
+	 * 68:     ctr
+	 */
+	switch (regno) {
+	case PPC64_R0_REGNUM ... PPC64_R31_REGNUM:
+
+	case PPC64_PC_REGNUM:
+	case PPC64_MSR_REGNUM:
+	case PPC64_LR_REGNUM:
+	case PPC64_CTR_REGNUM:
+		break;
+
+	default:
+		// return false if we can't get that register
+		if (CRASHDEBUG(1))
+			error(WARNING, "unsupported register, regno=%d\n", regno);
+		return FALSE;
+	}
+
+	tc = CURRENT_CONTEXT();
+	if (!tc)
+		return FALSE;
+	BZERO(&bt_setup, sizeof(struct bt_info));
+	clone_bt_info(&bt_setup, &bt_info, tc);
+	fill_stackbuf(&bt_info);
+
+	// reusing the get_dumpfile_regs function to get pt regs structure
+	get_dumpfile_regs(&bt_info, &sp, &ip);
+	if (bt_info.stackbuf)
+		FREEBUF(bt_info.stackbuf);
+	ur_bitmap = (struct user_regs_bitmap_struct *)bt_info.machdep;
+
+	if (!ur_bitmap) {
+		error(WARNING, "pt_regs not available for cpu %d\n", tc->processor);
+		return FALSE;
+	}
+	if (!bt_info.need_free) {
+		goto get_all;
+	}
+
+	switch (regno) {
+	case PPC64_R0_REGNUM ... PPC64_R31_REGNUM:
+		if (!NUM_IN_BITMAP(ur_bitmap->bitmap,
+		    REG_SEQ(ppc64_pt_regs, gpr[0]) + regno - PPC64_R0_REGNUM)) {
+			FREEBUF(ur_bitmap);
+			return FALSE;
+		}
+		break;
+	case PPC64_PC_REGNUM:
+		if (!NUM_IN_BITMAP(ur_bitmap->bitmap,
+		    REG_SEQ(ppc64_pt_regs, nip))) {
+			FREEBUF(ur_bitmap);
+			return FALSE;
+		}
+		break;
+	case PPC64_MSR_REGNUM:
+		if (!NUM_IN_BITMAP(ur_bitmap->bitmap,
+		    REG_SEQ(ppc64_pt_regs, msr))) {
+			FREEBUF(ur_bitmap);
+			return FALSE;
+		}
+		break;
+	case PPC64_LR_REGNUM:
+		if (!NUM_IN_BITMAP(ur_bitmap->bitmap,
+		    REG_SEQ(ppc64_pt_regs, link))) {
+			FREEBUF(ur_bitmap);
+			return FALSE;
+		}
+		break;
+	case PPC64_CTR_REGNUM:
+		if (!NUM_IN_BITMAP(ur_bitmap->bitmap,
+		    REG_SEQ(ppc64_pt_regs, ctr))) {
+			FREEBUF(ur_bitmap);
+			return FALSE;
+		}
+		break;
+	}
+
+get_all:
+	switch (regno) {
+	case PPC64_R0_REGNUM ... PPC64_R31_REGNUM:
+		if (size != sizeof(ur_bitmap->ur.gpr[regno]))
+			break;
+		memcpy(value, &ur_bitmap->ur.gpr[regno], size);
+		ret = TRUE;
+		break;
+
+	case PPC64_PC_REGNUM:
+		if (size != sizeof(ur_bitmap->ur.nip))
+			break;
+		memcpy(value, &ur_bitmap->ur.nip, size);
+		ret = TRUE;
+		break;
+
+	case PPC64_MSR_REGNUM:
+		if (size != sizeof(ur_bitmap->ur.msr))
+			break;
+		memcpy(value, &ur_bitmap->ur.msr, size);
+		ret = TRUE;
+		break;
+
+	case PPC64_LR_REGNUM:
+		if (size != sizeof(ur_bitmap->ur.link))
+			break;
+		memcpy(value, &ur_bitmap->ur.link, size);
+		ret = TRUE;
+		break;
+
+	case PPC64_CTR_REGNUM:
+		if (size != sizeof(ur_bitmap->ur.ctr))
+			break;
+		memcpy(value, &ur_bitmap->ur.ctr, size);
+		ret = TRUE;
+		break;
+	}
+	if (bt_info.need_free) {
+		FREEBUF(ur_bitmap);
+		bt_info.need_free = FALSE;
+	}
+
+	return ret;
 }
 
 /*
- * get SP and IP from the saved ptregs.
+ * For vmcore typically saved with KDump or FADump, get SP and IP values
+ * from the saved ptregs.
  */
 static int
-ppc64_kdump_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
+ppc64_vmcore_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 {
 	struct ppc64_pt_regs *pt_regs;
 	unsigned long unip;
+	/*
+	 * TRUE: task is running in a different context (userspace, OPAL..)
+	 * FALSE: task is probably running in kernel space.
+	 */
+	int out_of_context = FALSE;
 
 	pt_regs = (struct ppc64_pt_regs *)bt_in->machdep;
 	if (!pt_regs || !pt_regs->gpr[1]) {
+		if (bt_in->hp) {
+			if (bt_in->hp->esp) {
+				*ksp = bt_in->hp->esp;
+				if (!bt_in->hp->eip) {
+					if (IS_KVADDR(*ksp)) {
+						readmem(*ksp+16, KVADDR, &unip, sizeof(ulong),
+							"Regs NIP value", FAULT_ON_ERROR);
+						*nip = unip;
+					}
+				} else
+					*nip = bt_in->hp->eip;
+
+			}
+			return TRUE;
+		}
+
 		/*
 		 * Not collected regs. May be the corresponding CPU not
-		 * responded to an IPI.
+		 * responded to an IPI in case of KDump OR f/w has not
+		 * not provided the register info in case of FADump.
 		 */
 		fprintf(fp, "%0lx: GPR1 register value (SP) was not saved\n",
 			bt_in->task);
 		return FALSE;
 	}
+
 	*ksp = pt_regs->gpr[1];
 	if (IS_KVADDR(*ksp)) {
 		readmem(*ksp+16, KVADDR, &unip, sizeof(ulong), "Regs NIP value",
 			FAULT_ON_ERROR);
 		*nip = unip;
 	} else {
-		if (IN_TASK_VMA(bt_in->task, *ksp))
+		*nip = pt_regs->nip;
+		if (IN_TASK_VMA(bt_in->task, *ksp)) {
 			fprintf(fp, "%0lx: Task is running in user space\n",
 				bt_in->task);
-		else 
+			out_of_context = TRUE;
+		} else if (is_opal_context(*ksp, *nip)) {
+			fprintf(fp, "%0lx: Task is running in OPAL (firmware) context\n",
+				bt_in->task);
+			out_of_context = TRUE;
+		} else
 			fprintf(fp, "%0lx: Invalid Stack Pointer %0lx\n",
 				bt_in->task, *ksp);
-		*nip = pt_regs->nip;
 	}
 
-	if (bt_in->flags && 
-	((BT_TEXT_SYMBOLS|BT_TEXT_SYMBOLS_PRINT|BT_TEXT_SYMBOLS_NOPRINT))) 
+	if (bt_in->flags &&
+	((BT_TEXT_SYMBOLS|BT_TEXT_SYMBOLS_PRINT|BT_TEXT_SYMBOLS_NOPRINT)))
 		return TRUE;
 
 	/*
 	 * Print the collected regs for the active task
 	 */
 	ppc64_print_regs(pt_regs);
-	if (!IS_KVADDR(*ksp)) 
-		return FALSE;
-	
-	fprintf(fp, " NIP [%016lx] %s\n", pt_regs->nip,
-		closest_symbol(pt_regs->nip));
-	if (unip != pt_regs->link)
-		fprintf(fp, " LR  [%016lx] %s\n", pt_regs->link,
-			closest_symbol(pt_regs->link));
 
-	fprintf(fp, "\n");
+	if (out_of_context)
+		return TRUE;
+	if (!IS_KVADDR(*ksp))
+		return FALSE;
+
+	ppc64_print_nip_lr(pt_regs, (unip != pt_regs->link) ? 1 : 0);
 
 	return TRUE;
 }
@@ -2001,8 +2737,7 @@ ppc64_kdump_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 static int
 ppc64_get_dumpfile_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 {
-	int panic_task;
-	int i, panic;
+	int i, ret, panic_task;
 	char *sym;
 	ulong *up;
 	struct bt_info bt_local, *bt;
@@ -2012,18 +2747,13 @@ ppc64_get_dumpfile_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 	int check_hardirq, check_softirq;
 	int check_intrstack = TRUE;
 	struct ppc64_pt_regs *pt_regs;
+	struct syment *sp;
 
-	/* 
-	 * For the kdump vmcore, Use SP and IP values that are saved in ptregs.
-	 */ 
-	if (pc->flags & KDUMP)
-		return ppc64_kdump_stack_frame(bt_in, nip, ksp);
+	bt = &bt_local;
+	BCOPY(bt_in, bt, sizeof(struct bt_info));
+	ms = machdep->machspec;
+	ur_nip = ur_ksp = 0;
 
-        bt = &bt_local;
-        BCOPY(bt_in, bt, sizeof(struct bt_info));
-        ms = machdep->machspec;
-        ur_nip = ur_ksp = 0;
-	
 	panic_task = tt->panic_task == bt->task ? TRUE : FALSE;
 
 	check_hardirq = check_softirq = tt->flags & IRQSTACKS ? TRUE : FALSE;
@@ -2031,14 +2761,32 @@ ppc64_get_dumpfile_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 		pt_regs = (struct ppc64_pt_regs *)bt->machdep;
 		ur_nip = pt_regs->nip;
 		ur_ksp = pt_regs->gpr[1];
-	} else if (bt->task != tt->panic_task) {
+		if (!(bt->flags & BT_NO_PRINT_REGS)) {
+			/* Print the collected regs for panic task. */
+			ppc64_print_regs(pt_regs);
+			ppc64_print_nip_lr(pt_regs, 1);
+		}
+	} else if ((pc->flags & KDUMP) ||
+		   ((pc->flags & DISKDUMP) &&
+		    (*diskdump_flags & KDUMP_CMPRS_LOCAL))) {
+		/*
+		 * For the KDump or FADump vmcore, use SP and IP values
+		 * that are saved in ptregs.
+		 */
+		ret = ppc64_vmcore_stack_frame(bt_in, nip, ksp);
+		if (ret)
+			return TRUE;
+	}
+
+	if (bt->task != tt->panic_task) {
 		char cpu_frozen = FALSE;
 		/*
 		 * Determine whether the CPU responded to an IPI.
 		 * We captured the GPR1 register value in the
 		 * platform_freeze_cpu() function.
 		 */
-		if (symbol_exists("dump_header")) { /* Diskdump */
+		if ((sp = symbol_search("dump_header")) && 
+		    !is_symbol_text(sp)) { /* Diskdump */
 			ulong task_addr;
 			/*
 			 * The dump_header struct is specified in the module.
@@ -2068,7 +2816,7 @@ ppc64_get_dumpfile_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 			if (cpu_frozen) 
 				readmem(ur_ksp, KVADDR, &ur_ksp, sizeof(ulong),
 					"Stack Pointer", FAULT_ON_ERROR);
-			else
+			else if (symbol_exists("platform_freeze_cpu"))
 				fprintf(fp, 
 				"%0lx: GPR1 register value (SP) was not saved\n",
 					bt->task);
@@ -2086,10 +2834,8 @@ ppc64_get_dumpfile_stack_frame(struct bt_info *bt_in, ulong *nip, ulong *ksp)
 			fprintf(fp, "Could not find SP for task %0lx\n",
 				bt->task);
 		}
-		return TRUE;
 	}
 
-	panic = FALSE;
 	/*
 	 * Check the process stack first. We are scanning stack for only
 	 * panic task. Even though we have dumping CPU's regs, we will be
@@ -2106,19 +2852,28 @@ retry:
                 if (STREQ(sym, ".netconsole_netdump") || 
 			STREQ(sym, ".netpoll_start_netdump") ||
 		 	STREQ(sym, ".start_disk_dump") ||
+		 	STREQ(sym, "crash_kexec") ||
+			STREQ(sym, "crash_fadump") ||
+		 	STREQ(sym, "crash_ipi_callback") ||
 		 	STREQ(sym, ".crash_kexec") ||
 			STREQ(sym, ".crash_fadump") ||
+		 	STREQ(sym, ".crash_ipi_callback") ||
 			STREQ(sym, ".disk_dump")) {
                         *nip = *up;
                         *ksp = bt->stackbase + 
 				((char *)(up) - 16 - bt->stackbuf);
+			/*
+			 * Check whether this symbol relates to a
+			 * backtrace or not
+			 */
+			ur_ksp =  *(ulong *)&bt->stackbuf[(*ksp) - bt->stackbase];
+			if (!INSTACK(ur_ksp, bt))
+				continue;
+
                         return TRUE;
                 }
 	}
 
-	if (panic) 
-		return TRUE;
-	
 	bt->flags &= ~(BT_HARDIRQ|BT_SOFTIRQ);
 
 	if (check_hardirq &&
@@ -2141,7 +2896,7 @@ retry:
 		goto retry;
 	} 
 
-	if (check_intrstack && ms->hwintrstack[bt->tc->processor]) {
+	if (check_intrstack && ms->hwintrstack) {
 		bt->stacktop = ms->hwintrstack[bt->tc->processor] +
 			sizeof(ulong);
 		bt->stackbase = ms->hwintrstack[bt->tc->processor] -
@@ -2150,13 +2905,13 @@ retry:
 		alter_stackbuf(bt);
 		check_intrstack = FALSE;
 		goto retry;
-	} 
+	}
 	/*
 	 *  We didn't find what we were looking for, so just use what was
 	 *  passed in the ELF header.
 	 */
 	if (ur_nip && ur_ksp) {
-        	*nip = ur_nip;
+		*nip = ur_nip;
 		*ksp = ur_ksp;
 		return TRUE;
 	}
@@ -2174,19 +2929,29 @@ static void
 ppc64_get_stack_frame(struct bt_info *bt, ulong *pcp, ulong *spp)
 {
 	ulong ksp, nip;
-	
+	struct user_regs_bitmap_struct *ur_bitmap;
+
 	nip = ksp = 0;
 
-	if (DUMPFILE() && is_task_active(bt->task)) 
+	if (DUMPFILE() && is_task_active(bt->task)) {
 		ppc64_get_dumpfile_stack_frame(bt, &nip, &ksp);
-	else
+		bt->need_free = FALSE;
+	} else {
 		get_ppc64_frame(bt, &nip, &ksp);
+		ur_bitmap = (struct user_regs_bitmap_struct *)GETBUF(sizeof(*ur_bitmap));
+		memset(ur_bitmap, 0, sizeof(*ur_bitmap));
+		ur_bitmap->ur.nip = nip;
+		ur_bitmap->ur.gpr[1] = ksp;
+		SET_BIT(ur_bitmap->bitmap, REG_SEQ(ppc64_pt_regs, nip));
+		SET_BIT(ur_bitmap->bitmap, REG_SEQ(ppc64_pt_regs, gpr[0]) + 1);
+		bt->machdep = ur_bitmap;
+		bt->need_free = TRUE;
+	}
 
 	if (pcp)
 		*pcp = nip;
 	if (spp)
 		*spp = ksp;
-
 }
 
 static ulong
@@ -2219,6 +2984,7 @@ get_ppc64_frame(struct bt_info *bt, ulong *getpc, ulong *getsp)
 	ulong sp;
 	ulong *stack;
 	ulong task;
+	char *closest;
 	struct ppc64_pt_regs regs;
 
 	ip = 0;
@@ -2232,7 +2998,8 @@ get_ppc64_frame(struct bt_info *bt, ulong *getpc, ulong *getsp)
 		sizeof(struct ppc64_pt_regs),
 		"PPC64 pt_regs", FAULT_ON_ERROR);
 	ip = regs.nip; 
-	if (STREQ(closest_symbol(ip), ".__switch_to")) {
+	closest = closest_symbol(ip);
+	if (STREQ(closest, ".__switch_to") || STREQ(closest, "__switch_to")) {
 		/* NOTE: _switch_to() calls _switch() which
 		 * is asm.  _switch leaves pc == lr.
 		 * Working through this frame is tricky,
@@ -2465,10 +3232,10 @@ ppc64_dis_filter(ulong vaddr, char *inbuf, unsigned int output_radix)
 	if ((FIRSTCHAR(argv[argc-1]) == '<') && 
 	    (LASTCHAR(argv[argc-1]) == '>')) {
 		p1 = rindex(inbuf, '<');
-		while ((p1 > inbuf) && !STRNEQ(p1, " 0x")) 
+		while ((p1 > inbuf) && !(STRNEQ(p1, " 0x") || STRNEQ(p1, ",0x"))) 
 			p1--;
 
-		if (!STRNEQ(p1, " 0x"))
+		if (!(STRNEQ(p1, " 0x") || STRNEQ(p1, ",0x")))
 			return FALSE;
 		p1++;
 
@@ -2496,6 +3263,123 @@ ppc64_get_smp_cpus(void)
 	return get_cpus_online();
 }
 
+
+/*
+ * Definitions derived from OPAL. These need to track corresponding values in
+ * https://github.com/open-power/skiboot/blob/master/include/mem-map.h
+ */
+#define SKIBOOT_CONSOLE_DUMP_START	0x31000000
+#define SKIBOOT_CONSOLE_DUMP_SIZE	0x100000
+#define ASCII_UNLIMITED ((ulong)(-1) >> 1)
+
+void
+opalmsg(void)
+{
+	struct memloc {
+		uint8_t u8;
+		uint16_t u16;
+		uint32_t u32;
+		uint64_t u64;
+		uint64_t limit64;
+	};
+	int i, a;
+	size_t typesz;
+	void *location;
+	char readtype[20];
+	struct memloc mem;
+	int displayed, per_line;
+	int lost;
+	ulong error_handle;
+	long count = SKIBOOT_CONSOLE_DUMP_SIZE;
+	ulonglong addr = SKIBOOT_CONSOLE_DUMP_START;
+
+	if (!(machdep->flags & OPAL_FW))
+		error(FATAL, "dump was not captured on OPAL based system");
+
+	if (CRASHDEBUG(4))
+		fprintf(fp, "<addr: %llx count: %ld (%s)>\n",
+				addr, count, "PHYSADDR");
+
+	BZERO(&mem, sizeof(struct memloc));
+	lost = typesz = per_line = 0;
+	location = NULL;
+
+	/* ASCII */
+	typesz = SIZEOF_8BIT;
+	location = &mem.u8;
+	sprintf(readtype, "ascii");
+	per_line = 256;
+	displayed = 0;
+
+	error_handle = FAULT_ON_ERROR;
+
+	for (i = a = 0; i < count; i++) {
+		if (!readmem(addr, PHYSADDR, location, typesz,
+					readtype, error_handle)) {
+			addr += typesz;
+			lost += 1;
+			continue;
+		}
+
+		if (isprint(mem.u8)) {
+			if ((a % per_line) == 0) {
+				if (displayed && i)
+					fprintf(fp, "\n");
+			}
+			fprintf(fp, "%c", mem.u8);
+			displayed++;
+			a++;
+		} else {
+			if (count == ASCII_UNLIMITED)
+				return;
+			a = 0;
+		}
+
+		addr += typesz;
+	}
+
+	if (lost != count)
+		fprintf(fp, "\n");
+}
+
+static void ppc64_print_emergency_stack_info(void)
+{
+	struct machine_specific *ms = machdep->machspec;
+	char buf[32];
+	int i;
+
+	fprintf(fp, "    EMERGENCY STACK: ");
+	if (ms->emergency_sp) {
+		fprintf(fp, "\n");
+		for (i = 0; i < kt->cpus; i++) {
+			sprintf(buf, "CPU %d", i);
+			fprintf(fp, "%19s: %lx\n", buf, ms->emergency_sp[i]);
+		}
+	} else
+		fprintf(fp, "(unused)\n");
+
+	fprintf(fp, "NMI EMERGENCY STACK: ");
+	if (ms->nmi_emergency_sp) {
+		fprintf(fp, "\n");
+		for (i = 0; i < kt->cpus; i++) {
+			sprintf(buf, "CPU %d", i);
+			fprintf(fp, "%19s: %lx\n", buf, ms->nmi_emergency_sp[i]);
+		}
+	} else
+		fprintf(fp, "(unused)\n");
+
+	fprintf(fp, " MC EMERGENCY STACK: ");
+	if (ms->mc_emergency_sp) {
+		fprintf(fp, "\n");
+		for (i = 0; i < kt->cpus; i++) {
+			sprintf(buf, "CPU %d", i);
+			fprintf(fp, "%19s: %lx\n", buf, ms->mc_emergency_sp[i]);
+		}
+	} else
+		fprintf(fp, "(unused)\n");
+	fprintf(fp, "\n");
+}
+
 /*
  *  Machine dependent command.
  */
@@ -2504,7 +3388,7 @@ ppc64_cmd_mach(void)
 {
         int c;
 
-        while ((c = getopt(argcnt, args, "cm")) != EOF) {
+	while ((c = getopt(argcnt, args, "cmo")) != EOF) {
                 switch(c)
                 {
 		case 'c':
@@ -2512,6 +3396,8 @@ ppc64_cmd_mach(void)
 			fprintf(fp, "PPC64: '-%c' option is not supported\n", 
 				c);
 			break;
+		case 'o':
+			return opalmsg();
                 default:
                         argerrs++;
                         break;
@@ -2546,6 +3432,8 @@ ppc64_display_machine_stats(void)
         else
                 fprintf(fp, "(unknown)\n");
         fprintf(fp, "                 HZ: %d\n", machdep->hz);
+	fprintf(fp, "                MMU: %s\n", machdep->flags & RADIX_MMU
+							? "RADIX" : "HASH");
         fprintf(fp, "          PAGE SIZE: %d\n", PAGESIZE());
 //      fprintf(fp, "      L1 CACHE SIZE: %d\n", l1_cache_size());
         fprintf(fp, "KERNEL VIRTUAL BASE: %lx\n", machdep->kvbase);
@@ -2572,6 +3460,8 @@ ppc64_display_machine_stats(void)
 			fprintf(fp, "%19s: %lx\n", buf, tt->softirq_ctx[c]);
 		}
 	}
+
+	ppc64_print_emergency_stack_info();
 }
 
 static const char *hook_files[] = {
@@ -2795,7 +3685,7 @@ parse_cmdline_args(void)
  * Initialize the per cpu data_offset values from paca structure.
  */
 static int
-ppc64_paca_init(int map)
+ppc64_paca_percpu_offset_init(int map)
 {
 	int i, cpus, nr_paca;
 	char *cpu_paca_buf;
@@ -2861,16 +3751,18 @@ ppc64_get_cpu_map(void)
 	int map;
 
 	if (cpu_map_addr("possible"))
-		map = POSSIBLE;
+		map = POSSIBLE_MAP;
 	else if (cpu_map_addr("present"))
-		map = PRESENT;
+		map = PRESENT_MAP;
 	else if (cpu_map_addr("online"))
-		map = ONLINE;
+		map = ONLINE_MAP;
+	else if (cpu_map_addr("active"))
+		map = ACTIVE_MAP;
 	else {
 		map = 0;
 		error(FATAL,
-			"PPC64: cannot find 'cpu_possible_map' or\
-			'cpu_present_map' or 'cpu_online_map' symbols\n");
+			"PPC64: cannot find 'cpu_possible_map', "
+			"'cpu_present_map', 'cpu_online_map' or 'cpu_active_map' symbols\n");
 	}
 	return map;
 }
@@ -2895,10 +3787,11 @@ ppc64_init_cpu_info(void)
 	 * which was removed post v2.6.15 ppc64 and now we get the per cpu
 	 * data_offset from __per_cpu_offset symbol during kernel_init()
 	 * call. Hence for backward (pre-2.6.36) compatibility, call
-	 * ppc64_paca_init() only if symbol __per_cpu_offset does not exist.
+	 * ppc64_paca_percpu_offset_init() only if symbol __per_cpu_offset
+	 * does not exist.
 	 */
 	if (!symbol_exists("__per_cpu_offset"))
-		cpus = ppc64_paca_init(map);
+		cpus = ppc64_paca_percpu_offset_init(map);
 	else {
 		if (!(nr_cpus = get_array_length("__per_cpu_offset", NULL, 0)))
 			nr_cpus = (kt->kernel_NR_CPUS ? kt->kernel_NR_CPUS :
@@ -2911,15 +3804,15 @@ ppc64_init_cpu_info(void)
 	}
 	switch (map)
 	{
-	case POSSIBLE:
+	case POSSIBLE_MAP:
 		if (cpus > kt->cpus) {
 			i = get_highest_cpu_online() + 1;
 			if (i > kt->cpus)
 				kt->cpus = i;
 		}
 		break;
-	case ONLINE:
-	case PRESENT:
+	case ONLINE_MAP:
+	case PRESENT_MAP:
 		kt->cpus = cpus;
 		break;
 	}
@@ -2930,8 +3823,8 @@ ppc64_init_cpu_info(void)
 void
 ppc64_clear_machdep_cache(void)
 {
-	if (machdep->machspec->last_level4_read != vt->kernel_pgd[0])
-        	machdep->machspec->last_level4_read = 0;
+	if (machdep->last_pgd_read != vt->kernel_pgd[0])
+		machdep->last_pgd_read = 0;
 }
 
 static int 

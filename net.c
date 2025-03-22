@@ -1,8 +1,8 @@
 /* net.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2013 David Anderson
- * Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2016 David Anderson
+ * Copyright (C) 2002-2016 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -64,13 +64,14 @@ struct devinfo {
 /* bytes needed for <ip address>:<port> notation */
 #define BYTES_IP_TUPLE	(BYTES_IP_ADDR + BYTES_PORT_NUM + 1)
 
-static void show_net_devices(void);
-static void show_net_devices_v2(void);
-static void show_net_devices_v3(void);
+static void show_net_devices(ulong);
+static void show_net_devices_v2(ulong);
+static void show_net_devices_v3(ulong);
 static void print_neighbour_q(ulong, int);
 static void get_netdev_info(ulong, struct devinfo *);
 static void get_device_name(ulong, char *);
-static void get_device_address(ulong, char *);
+static long get_device_address(ulong, char **, long);
+static void get_device_ip6_address(ulong, char **, long);
 static void get_sock_info(ulong, char *);
 static void dump_arp(void);
 static void arp_state_to_flags(unsigned char);
@@ -114,6 +115,13 @@ net_init(void)
 		net->dev_ip_ptr = MEMBER_OFFSET_INIT(net_device_ip_ptr,
 			"net_device", "ip_ptr");
 		MEMBER_OFFSET_INIT(net_device_dev_list, "net_device", "dev_list");
+		MEMBER_OFFSET_INIT(net_device_ip6_ptr, "net_device", "ip6_ptr");
+		MEMBER_OFFSET_INIT(inet6_dev_addr_list, "inet6_dev", "addr_list");
+		MEMBER_OFFSET_INIT(inet6_ifaddr_addr, "inet6_ifaddr", "addr");
+		MEMBER_OFFSET_INIT(inet6_ifaddr_if_list, "inet6_ifaddr", "if_list");
+		MEMBER_OFFSET_INIT(inet6_ifaddr_if_next, "inet6_ifaddr", "if_next");
+		MEMBER_OFFSET_INIT(in6_addr_in6_u, "in6_addr", "in6_u");
+
 		MEMBER_OFFSET_INIT(net_dev_base_head, "net", "dev_base_head");
 		ARRAY_LENGTH_INIT(net->net_device_name_index,
 			net_device_name, "net_device.name", NULL, sizeof(char));
@@ -137,6 +145,8 @@ net_init(void)
 			error(WARNING, 
 				"net_init: unknown device type for net device");
 	}
+	if (VALID_MEMBER(task_struct_nsproxy))
+		MEMBER_OFFSET_INIT(nsproxy_net_ns, "nsproxy", "net_ns");
 
 	if (net->flags & NETDEV_INIT) {
 		MK_TYPE_T(net->dev_name_t, net->netdevice, "name");
@@ -159,6 +169,11 @@ net_init(void)
 				"neigh_hash_table", "hash_shift");
 			MEMBER_OFFSET_INIT(neigh_table_hash_buckets,
 				"neigh_hash_table", "hash_buckets");
+			/* Linux 6.13 and later */
+			if (INVALID_MEMBER(neigh_table_hash_buckets)) {
+				MEMBER_OFFSET_INIT(neigh_table_hash_heads, "neigh_hash_table", "hash_heads");
+				MEMBER_OFFSET_INIT(neighbour_hash, "neighbour", "hash");
+			}
 		} else {
 			MEMBER_OFFSET_INIT(neigh_table_hash_buckets,
 				"neigh_table", "hash_buckets");
@@ -197,6 +212,9 @@ net_init(void)
 			MEMBER_OFFSET_INIT(sock_common_skc_family,
 				"sock_common", "skc_family");
 			MEMBER_OFFSET_INIT(sock_sk_type, "sock", "sk_type");
+			MEMBER_OFFSET_INIT(sock_sk_common, "sock", "__sk_common");
+			MEMBER_OFFSET_INIT(sock_common_skc_v6_daddr, "sock_common", "skc_v6_daddr");
+			MEMBER_OFFSET_INIT(sock_common_skc_v6_rcv_saddr, "sock_common", "skc_v6_rcv_saddr");
 			/*
 			 *  struct inet_sock {
         		 *	struct sock       sk;
@@ -239,14 +257,21 @@ net_init(void)
 						ANON_MEMBER_OFFSET_INIT(inet_opt_rcv_saddr, "sock_common",
 							"skc_rcv_saddr");
 					MEMBER_OFFSET_INIT(inet_opt_dport, "inet_sock", "inet_dport");
-					if (INVALID_MEMBER(inet_opt_dport))
-						ANON_MEMBER_OFFSET_INIT(inet_opt_dport, "sock_common", 
+					if (INVALID_MEMBER(inet_opt_dport)) {
+						MEMBER_OFFSET_INIT(inet_opt_dport, "sock_common", 
 							"skc_dport");
+						if (INVALID_MEMBER(inet_opt_dport))
+							ANON_MEMBER_OFFSET_INIT(inet_opt_dport, "sock_common", 
+								"skc_dport");
+					}
 					MEMBER_OFFSET_INIT(inet_opt_sport, "inet_sock", "inet_sport");
 					MEMBER_OFFSET_INIT(inet_opt_num, "inet_sock", "inet_num");
-					if (INVALID_MEMBER(inet_opt_num))
-						ANON_MEMBER_OFFSET_INIT(inet_opt_num, "sock_common", 
+					if (INVALID_MEMBER(inet_opt_num)) {
+						MEMBER_OFFSET_INIT(inet_opt_num, "sock_common", "skc_num");
+						if (INVALID_MEMBER(inet_opt_num))
+							ANON_MEMBER_OFFSET_INIT(inet_opt_num, "sock_common", 
 							"skc_num");
+					}
 				}
 			}	
 
@@ -304,7 +329,7 @@ net_init(void)
  * The net command...
  */
 
-#define NETOPTS	  "n:asSR:xd"
+#define NETOPTS	  "N:asSR:xdn"
 #define s_FLAG FOREACH_s_FLAG
 #define S_FLAG FOREACH_S_FLAG
 #define x_FLAG FOREACH_x_FLAG
@@ -324,8 +349,10 @@ void
 cmd_net(void)
 {
 	int c;
-	ulong sflag;
+	ulong sflag, nflag, aflag;
 	ulong value;
+	ulong task;
+	struct task_context *tc = NULL;
 	struct in_addr in_addr;
 	struct reference reference, *ref;
 
@@ -333,7 +360,8 @@ cmd_net(void)
 		error(FATAL, "net subsystem not initialized!");
 
 	ref = NULL;
-	sflag = 0;
+	sflag = nflag = aflag = 0;
+	task = pid_to_task(0);
 
 	while ((c = getopt(argcnt, args, NETOPTS)) != EOF) {
 		switch (c) {
@@ -349,9 +377,10 @@ cmd_net(void)
 
 		case 'a':
 			dump_arp();
+			aflag++;
 			break;
 
-		case 'n':
+		case 'N':
 			value = stol(optarg, FAULT_ON_ERROR, NULL);
 			in_addr.s_addr = (in_addr_t)value;
 			fprintf(fp, "%s\n", inet_ntoa(in_addr));
@@ -387,6 +416,22 @@ cmd_net(void)
 			sflag |= d_FLAG;
 			break;
 
+		case 'n':
+			nflag = 1;
+			task = CURRENT_TASK();
+			if (args[optind]) {
+				switch (str_to_context(args[optind],
+					 &value, &tc)) {
+				case STR_PID:
+				case STR_TASK:
+					task = tc->task;
+					break;
+				case STR_INVALID:
+					error(FATAL, "invalid task or pid value: %s\n", args[optind]);
+				}
+			}
+			break;
+
 		default:
 			argerrs++;
 			break;
@@ -396,11 +441,14 @@ cmd_net(void)
 	if (argerrs) 
 		cmd_usage(pc->curcmd, SYNOPSIS);
 
-	if (sflag)
+	if (sflag & (s_FLAG|S_FLAG))
 		dump_sockets(sflag, ref);
-
-	if (argcnt == 1)
-		show_net_devices();
+	else {
+		if ((argcnt == 1) || nflag)
+			show_net_devices(task);
+		else if (!aflag)
+			cmd_usage(pc->curcmd, SYNOPSIS);
+	}
 }
 
 /*
@@ -408,17 +456,18 @@ cmd_net(void)
  */
 
 static void
-show_net_devices(void)
+show_net_devices(ulong task)
 {
 	ulong next;
 	long flen;
-	char buf[BUFSIZE];
+	char *buf;
+	long buflen = BUFSIZE;
 
 	if (symbol_exists("dev_base_head")) {
-		show_net_devices_v2();
+		show_net_devices_v2(task);
 		return;
 	} else if (symbol_exists("init_net")) {
-		show_net_devices_v3();
+		show_net_devices_v3(task);
 		return;
 	}
 
@@ -430,9 +479,10 @@ show_net_devices(void)
 	if (!net->netdevice || !next)
 		return;
 
+	buf = GETBUF(buflen);
 	flen = MAX(VADDR_PRLEN, strlen(net->netdevice));
 
-	fprintf(fp, "%s  NAME   IP ADDRESS(ES)\n",
+	fprintf(fp, "%s  NAME       IP ADDRESS(ES)\n",
 		mkstring(upper_case(net->netdevice, buf), 
 			flen, CENTER|LJUST, NULL));
 
@@ -441,31 +491,36 @@ show_net_devices(void)
                     mkstring(buf, flen, CENTER|RJUST|LONG_HEX, MKSTR(next)));
 
 		get_device_name(next, buf);
-		fprintf(fp, "%-6s ", buf);
+		fprintf(fp, "%-10s ", buf);
 
-		get_device_address(next, buf);
+		get_device_address(next, &buf, buflen);
+		get_device_ip6_address(next, &buf, buflen);
 		fprintf(fp, "%s\n", buf);
 
         	readmem(next+net->dev_next, KVADDR, &next, 
 			sizeof(void *), "(net_)device.next", FAULT_ON_ERROR);
 	} while (next);
+
+	FREEBUF(buf);
 }
 
 static void
-show_net_devices_v2(void)
+show_net_devices_v2(ulong task)
 {
 	struct list_data list_data, *ld;
 	char *net_device_buf;
-	char buf[BUFSIZE];
+	char *buf;
+	long buflen = BUFSIZE;
 	int ndevcnt, i;
 	long flen;
 
 	if (!net->netdevice) /* initialized in net_init() */
 		return;
 
+	buf = GETBUF(buflen);
 	flen = MAX(VADDR_PRLEN, strlen(net->netdevice));
 
-	fprintf(fp, "%s  NAME   IP ADDRESS(ES)\n",
+	fprintf(fp, "%s  NAME       IP ADDRESS(ES)\n",
 		mkstring(upper_case(net->netdevice, buf), 
 			flen, CENTER|LJUST, NULL));
 
@@ -490,31 +545,36 @@ show_net_devices_v2(void)
 			MKSTR(ld->list_ptr[i])));
 
 		get_device_name(ld->list_ptr[i], buf);
-		fprintf(fp, "%-6s ", buf);
+		fprintf(fp, "%-10s ", buf);
 
-		get_device_address(ld->list_ptr[i], buf);
+		get_device_address(ld->list_ptr[i], &buf, buflen);
+		get_device_ip6_address(ld->list_ptr[i], &buf, buflen);
 		fprintf(fp, "%s\n", buf);
 	}
 	
 	FREEBUF(ld->list_ptr);
 	FREEBUF(net_device_buf);
+	FREEBUF(buf);
 }
 
 static void
-show_net_devices_v3(void)
+show_net_devices_v3(ulong task)
 {
+	ulong nsproxy_p, net_ns_p;
 	struct list_data list_data, *ld;
 	char *net_device_buf;
-	char buf[BUFSIZE];
+	char *buf;
+	long buflen = BUFSIZE;
 	int ndevcnt, i;
 	long flen;
 
 	if (!net->netdevice) /* initialized in net_init() */
 		return;
 
+	buf = GETBUF(buflen);
 	flen = MAX(VADDR_PRLEN, strlen(net->netdevice));
 
-	fprintf(fp, "%s  NAME   IP ADDRESS(ES)\n",
+	fprintf(fp, "%s  NAME       IP ADDRESS(ES)\n",
 		mkstring(upper_case(net->netdevice, buf), 
 			flen, CENTER|LJUST, NULL));
 
@@ -523,8 +583,15 @@ show_net_devices_v3(void)
 	ld =  &list_data;
 	BZERO(ld, sizeof(struct list_data));
 	ld->flags |= LIST_ALLOCATE;
-	ld->start = ld->end =
-		 symbol_value("init_net") + OFFSET(net_dev_base_head);
+	if (VALID_MEMBER(nsproxy_net_ns)) {
+		readmem(task + OFFSET(task_struct_nsproxy), KVADDR, &nsproxy_p,
+			sizeof(ulong), "task_struct.nsproxy", FAULT_ON_ERROR);
+		if (!readmem(nsproxy_p + OFFSET(nsproxy_net_ns), KVADDR, &net_ns_p,
+			sizeof(ulong), "nsproxy.net_ns", RETURN_ON_ERROR|QUIET))
+			error(FATAL, "cannot determine net_namespace location!\n");
+	} else
+		net_ns_p = symbol_value("init_net");
+	ld->start = ld->end = net_ns_p + OFFSET(net_dev_base_head);
 	ld->list_head_offset = OFFSET(net_device_dev_list);
 
 	ndevcnt = do_list(ld);
@@ -542,14 +609,16 @@ show_net_devices_v3(void)
 			MKSTR(ld->list_ptr[i])));
 
 		get_device_name(ld->list_ptr[i], buf);
-		fprintf(fp, "%-6s ", buf);
+		fprintf(fp, "%-10s ", buf);
 
-		get_device_address(ld->list_ptr[i], buf);
+		get_device_address(ld->list_ptr[i], &buf, buflen);
+		get_device_ip6_address(ld->list_ptr[i], &buf, buflen);
 		fprintf(fp, "%s\n", buf);
 	}
 	
 	FREEBUF(ld->list_ptr);
 	FREEBUF(net_device_buf);
+	FREEBUF(buf);
 }
 
 /*
@@ -634,9 +703,13 @@ dump_arp(void)
 		"neigh_table key_len", FAULT_ON_ERROR);
 
 	if (VALID_MEMBER(neigh_table_nht_ptr)) {
-		readmem(nht + OFFSET(neigh_table_hash_buckets),
-			KVADDR, &hash, sizeof(hash),
-			"neigh_hash_table hash_buckets ptr", FAULT_ON_ERROR);
+		/* Linux 6.13 and later */
+		if (VALID_MEMBER(neigh_table_hash_heads))
+			readmem(nht + OFFSET(neigh_table_hash_heads), KVADDR, &hash,
+				sizeof(hash), "neigh_hash_table hash_heads ptr", FAULT_ON_ERROR);
+		else
+			readmem(nht + OFFSET(neigh_table_hash_buckets), KVADDR, &hash,
+				sizeof(hash), "neigh_hash_table hash_buckets ptr", FAULT_ON_ERROR);
 
 		readmem(hash, KVADDR, hash_buckets, hash_bytes,
 			"neigh_hash_table hash_buckets", FAULT_ON_ERROR);
@@ -767,8 +840,15 @@ print_neighbour_q(ulong addr, int key_len)
 
 		arp_state_to_flags(state);
 
-		readmem(addr + OFFSET(neighbour_next), KVADDR, 
-			&addr, sizeof(addr), "neighbour next", FAULT_ON_ERROR);
+		/* Linux 6.13 and later kernels use hlist. */
+		if (VALID_MEMBER(neighbour_hash)) {
+			readmem(addr + OFFSET(neighbour_hash), KVADDR, &addr,
+				sizeof(addr), "neighbour hash", FAULT_ON_ERROR);
+			if (addr)
+				addr -= OFFSET(neighbour_hash);
+		} else
+			readmem(addr + OFFSET(neighbour_next), KVADDR, &addr,
+				sizeof(addr), "neighbour next", FAULT_ON_ERROR);
 	}
 
 	FREEBUF(ha_buf);
@@ -832,19 +912,24 @@ get_device_name(ulong devaddr, char *buf)
  *  in_ifaddr->ifa_next points to the next in_ifaddr in the list (if any).
  * 
  */
-static void
-get_device_address(ulong devaddr, char *buf)
+static long
+get_device_address(ulong devaddr, char **bufp, long buflen)
 {
 	ulong ip_ptr, ifa_list;
 	struct in_addr ifa_address;
+	char *buf;
+	char buf2[BUFSIZE];
+	long pos = 0;
 
-	BZERO(buf, BUFSIZE);
+	buf = *bufp;
+	BZERO(buf, buflen);
+	BZERO(buf2, BUFSIZE);
 
         readmem(devaddr + net->dev_ip_ptr, KVADDR,
         	&ip_ptr, sizeof(ulong), "ip_ptr", FAULT_ON_ERROR);
 
 	if (!ip_ptr)
-		return;
+		return buflen;
 
         readmem(ip_ptr + OFFSET(in_device_ifa_list), KVADDR,
         	&ifa_list, sizeof(ulong), "ifa_list", FAULT_ON_ERROR);
@@ -854,12 +939,102 @@ get_device_address(ulong devaddr, char *buf)
         		&ifa_address, sizeof(struct in_addr), "ifa_address", 
 			FAULT_ON_ERROR);
 
-		sprintf(&buf[strlen(buf)], "%s%s", 
-			strlen(buf) ? ", " : "",
-			inet_ntoa(ifa_address));
+		sprintf(buf2, "%s%s", pos ? ", " : "", inet_ntoa(ifa_address));
+		if (pos + strlen(buf2) >= buflen) {
+			RESIZEBUF(*bufp, buflen, buflen * 2);
+			buf = *bufp;
+			BZERO(buf + buflen, buflen);
+			buflen *= 2;
+		}
+		BCOPY(buf2, &buf[pos], strlen(buf2));
+		pos += strlen(buf2);
 
         	readmem(ifa_list + OFFSET(in_ifaddr_ifa_next), KVADDR,
         		&ifa_list, sizeof(ulong), "ifa_next", FAULT_ON_ERROR);
+	}
+	return buflen;
+}
+
+static void
+get_device_ip6_address(ulong devaddr, char **bufp, long buflen)
+{
+	ulong ip6_ptr = 0, pos = 0, bufsize = buflen, addr = 0;
+	struct in6_addr ip6_addr;
+	char *buf;
+	char str[INET6_ADDRSTRLEN] = {0};
+	char buffer[INET6_ADDRSTRLEN + 2] = {0};
+	uint len = 0;
+
+	buf = *bufp;
+	pos = strlen(buf);
+
+	readmem(devaddr + OFFSET(net_device_ip6_ptr), KVADDR,
+		&ip6_ptr, sizeof(ulong), "ip6_ptr", FAULT_ON_ERROR);
+
+	if (!ip6_ptr)
+		return;
+
+	/*
+	 * 502a2ffd7376 ("ipv6: convert idev_list to list macros")
+	 * v2.6.35-rc1~473^2~733
+	 */
+	if (VALID_MEMBER(inet6_ifaddr_if_list)) {
+		struct list_data list_data, *ld;
+		ulong cnt = 0, i;
+
+		ld = &list_data;
+		BZERO(ld, sizeof(struct list_data));
+		ld->flags |= LIST_ALLOCATE;
+		ld->start = ip6_ptr + OFFSET(inet6_dev_addr_list);
+		ld->list_head_offset = OFFSET(inet6_ifaddr_if_list);
+		cnt = do_list(ld);
+
+		for (i = 1; i < cnt; i++) {
+
+			addr = ld->list_ptr[i] + OFFSET(inet6_ifaddr_addr);
+			readmem(addr + OFFSET(in6_addr_in6_u), KVADDR, &ip6_addr,
+				sizeof(struct in6_addr), "in6_addr.in6_u", FAULT_ON_ERROR);
+
+			inet_ntop(AF_INET6, (void*)&ip6_addr, str, INET6_ADDRSTRLEN);
+			sprintf(buffer, "%s%s", pos ? ", " : "", str);
+			len = strlen(buffer);
+			if (pos + len >= bufsize) {
+				RESIZEBUF(*bufp, bufsize, bufsize + buflen);
+				buf = *bufp;
+				BZERO(buf + bufsize, buflen);
+				bufsize += buflen;
+			}
+			BCOPY(buffer, &buf[pos], len);
+			pos += len;
+		}
+
+		FREEBUF(ld->list_ptr);
+		return;
+	}
+
+	if (INVALID_MEMBER(inet6_ifaddr_if_next))
+		return;
+
+	readmem(ip6_ptr + OFFSET(inet6_dev_addr_list), KVADDR,
+		&addr, sizeof(void *), "inet6_dev.addr_list", FAULT_ON_ERROR);
+
+	while (addr) {
+		readmem(addr + OFFSET(in6_addr_in6_u), KVADDR, &ip6_addr,
+			sizeof(struct in6_addr), "in6_addr.in6_u", FAULT_ON_ERROR);
+		inet_ntop(AF_INET6, (void*)&ip6_addr, str, INET6_ADDRSTRLEN);
+		sprintf(buffer, "%s%s", pos ? ", " : "", str);
+		len = strlen(buffer);
+
+		if (pos + len >= bufsize) {
+			RESIZEBUF(*bufp, bufsize, bufsize + buflen);
+			buf = *bufp;
+			BZERO(buf + bufsize, buflen);
+			bufsize += buflen;
+		}
+		BCOPY(buffer, &buf[pos], len);
+		pos += len;
+		readmem(addr + OFFSET(inet6_ifaddr_if_next), KVADDR, &addr,
+			sizeof(void *), "inet6_ifaddr.if_next", FAULT_ON_ERROR);
 	}
 }
 
@@ -1045,12 +1220,19 @@ get_sock_info(ulong sock, char *buf)
 		break;
 
 	case SOCK_V2:
-		if (INVALID_MEMBER(ipv6_pinfo_rcv_saddr) ||
-		    INVALID_MEMBER(ipv6_pinfo_daddr))
+		if (VALID_MEMBER(ipv6_pinfo_rcv_saddr) &&
+		    VALID_MEMBER(ipv6_pinfo_daddr)) {
+			ipv6_rcv_saddr = ipv6_pinfo + OFFSET(ipv6_pinfo_rcv_saddr);
+			ipv6_daddr = ipv6_pinfo + OFFSET(ipv6_pinfo_daddr);
+		} else if (VALID_MEMBER(sock_sk_common) &&
+			   VALID_MEMBER(sock_common_skc_v6_daddr) &&
+			   VALID_MEMBER(sock_common_skc_v6_rcv_saddr)) {
+			ipv6_rcv_saddr = sock + OFFSET(sock_sk_common) + OFFSET(sock_common_skc_v6_rcv_saddr);
+			ipv6_daddr = sock + OFFSET(sock_sk_common) + OFFSET(sock_common_skc_v6_daddr);
+		} else {
+			sprintf(&buf[strlen(buf)], "%s", "(cannot get IPv6 addresses)");
 			break;
-
-        	ipv6_rcv_saddr = ipv6_pinfo + OFFSET(ipv6_pinfo_rcv_saddr);
-		ipv6_daddr = ipv6_pinfo + OFFSET(ipv6_pinfo_daddr);
+		}
 
 		if (!readmem(ipv6_rcv_saddr, KVADDR, u6_addr16_src, SIZE(in6_addr),
                     "ipv6_rcv_saddr buffer", QUIET|RETURN_ON_ERROR))
@@ -1220,7 +1402,7 @@ dump_hw_addr(unsigned char *ha, int len)
 }
 
 /*
- *  help -n output
+ *  help -N output
  */
 void
 dump_net_table(void)
@@ -1314,7 +1496,8 @@ dump_sockets_workhorse(ulong task, ulong flag, struct reference *ref)
 	int max_fdset = 0;
 	int max_fds = 0;
 	ulong open_fds_addr = 0;
-	fd_set open_fds;
+	ulong *open_fds;
+	int open_fds_size;
 	ulong fd;
 	ulong file;
 	int i, j;
@@ -1387,12 +1570,18 @@ dump_sockets_workhorse(ulong task, ulong flag, struct reference *ref)
             		sizeof(void *), "files_struct fd addr", FAULT_ON_ERROR);
 	}
 
+	open_fds_size = MAX(max_fdset, max_fds) / BITS_PER_BYTE;
+	open_fds = (ulong *)GETBUF(open_fds_size);
+	if (!open_fds)
+		return;
+
 	if (open_fds_addr) 
-		readmem(open_fds_addr, KVADDR, &open_fds, sizeof(fd_set),
+		readmem(open_fds_addr, KVADDR, open_fds, open_fds_size,
 	               	"files_struct open_fds", FAULT_ON_ERROR);
     	if (!open_fds_addr || !fd) { 
 		if (!NET_REFERENCE_CHECK(ref))
 			fprintf(fp, "No open sockets.\n");
+		FREEBUF(open_fds);
         	return;
 	}
 
@@ -1420,10 +1609,10 @@ dump_sockets_workhorse(ulong task, ulong flag, struct reference *ref)
     	j = 0;
     	for (;;) {
 	        unsigned long set;
-	        i = j * __NFDBITS;
+	        i = j * BITS_PER_LONG;
 	        if (((max_fdset >= 0) && (i >= max_fdset)) || (i >= max_fds))
 	            	break;
-	        set = open_fds.__fds_bits[j++];
+	        set = open_fds[j++];
 	        while (set) {
 	            	if (set & 1) {
 		                readmem(fd + i*sizeof(struct file *), KVADDR, 
@@ -1446,6 +1635,8 @@ dump_sockets_workhorse(ulong task, ulong flag, struct reference *ref)
 
 	if (NET_REFERENCE_FOUND(ref))
 		fprintf(fp, "\n");
+
+	FREEBUF(open_fds);
 }
 
 

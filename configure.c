@@ -104,6 +104,11 @@ void add_extra_lib(char *);
 #undef X86_64
 #undef ARM
 #undef ARM64
+#undef MIPS
+#undef SPARC64
+#undef MIPS64
+#undef RISCV64
+#undef LOONGARCH64
 
 #define UNKNOWN 0
 #define X86     1
@@ -116,6 +121,11 @@ void add_extra_lib(char *);
 #define X86_64  8
 #define ARM	9
 #define ARM64   10
+#define MIPS    11
+#define SPARC64 12
+#define MIPS64  13
+#define RISCV64 14
+#define LOONGARCH64    15
 
 #define TARGET_X86    "TARGET=X86"
 #define TARGET_ALPHA  "TARGET=ALPHA"
@@ -127,6 +137,11 @@ void add_extra_lib(char *);
 #define TARGET_X86_64 "TARGET=X86_64"
 #define TARGET_ARM    "TARGET=ARM"
 #define TARGET_ARM64  "TARGET=ARM64"
+#define TARGET_MIPS   "TARGET=MIPS"
+#define TARGET_MIPS64 "TARGET=MIPS64"
+#define TARGET_SPARC64 "TARGET=SPARC64"
+#define TARGET_RISCV64 "TARGET=RISCV64"
+#define TARGET_LOONGARCH64	"TARGET=LOONGARCH64"
 
 #define TARGET_CFLAGS_X86    "TARGET_CFLAGS=-D_FILE_OFFSET_BITS=64"
 #define TARGET_CFLAGS_ALPHA  "TARGET_CFLAGS="
@@ -143,14 +158,31 @@ void add_extra_lib(char *);
 #define TARGET_CFLAGS_PPC_ON_PPC64   "TARGET_CFLAGS=-m32 -D_FILE_OFFSET_BITS=64 -fPIC"
 #define TARGET_CFLAGS_ARM64            "TARGET_CFLAGS="
 #define TARGET_CFLAGS_ARM64_ON_X86_64  "TARGET_CFLAGS="
+#define TARGET_CFLAGS_PPC64_ON_X86_64  "TARGET_CFLAGS="
+#define TARGET_CFLAGS_MIPS            "TARGET_CFLAGS=-D_FILE_OFFSET_BITS=64"
+#define TARGET_CFLAGS_MIPS_ON_X86     "TARGET_CFLAGS=-D_FILE_OFFSET_BITS=64"
+#define TARGET_CFLAGS_MIPS_ON_X86_64  "TARGET_CFLAGS=-m32 -D_FILE_OFFSET_BITS=64"
+#define TARGET_CFLAGS_MIPS64          "TARGET_CFLAGS="
+#define TARGET_CFLAGS_SPARC64         "TARGET_CFLAGS="
+#define TARGET_CFLAGS_RISCV64         "TARGET_CFLAGS="
+#define TARGET_CFLAGS_RISCV64_ON_X86_64	"TARGET_CFLAGS="
+#define TARGET_CFLAGS_LOONGARCH64     "TARGET_CFLAGS="
+#define TARGET_CFLAGS_LOONGARCH64_ON_X86_64	"TARGET_CFLAGS="
 
+#ifndef GDB_TARGET_DEFAULT
 #define GDB_TARGET_DEFAULT        "GDB_CONF_FLAGS="
+#endif
 #define GDB_TARGET_ARM_ON_X86     "GDB_CONF_FLAGS=--target=arm-elf-linux"
-#define GDB_TARGET_ARM_ON_X86_64  "GDB_CONF_FLAGS=--target=arm-elf-linux CFLAGS=-m32"
-#define GDB_TARGET_X86_ON_X86_64  "GDB_CONF_FLAGS=--target=i686-pc-linux-gnu CFLAGS=-m32"
-#define GDB_TARGET_PPC_ON_PPC64   "GDB_CONF_FLAGS=--target=ppc-elf-linux CFLAGS=-m32"
+#define GDB_TARGET_ARM_ON_X86_64  "GDB_CONF_FLAGS=--target=arm-elf-linux CFLAGS=-m32 CXXFLAGS=-m32"
+#define GDB_TARGET_X86_ON_X86_64  "GDB_CONF_FLAGS=--target=i686-pc-linux-gnu CFLAGS=-m32 CXXFLAGS=-m32"
+#define GDB_TARGET_PPC_ON_PPC64   "GDB_CONF_FLAGS=--target=ppc-elf-linux CFLAGS=-m32 CXXFLAGS=-m32"
 #define GDB_TARGET_ARM64_ON_X86_64  "GDB_CONF_FLAGS=--target=aarch64-elf-linux"   /* TBD */
-
+#define GDB_TARGET_PPC64_ON_X86_64  "GDB_CONF_FLAGS=--target=powerpc64le-unknown-linux-gnu"
+#define GDB_TARGET_MIPS_ON_X86     "GDB_CONF_FLAGS=--target=mipsel-elf-linux"
+#define GDB_TARGET_MIPS_ON_X86_64  "GDB_CONF_FLAGS=--target=mipsel-elf-linux CFLAGS=-m32 CXXFLAGS=-m32"
+#define GDB_TARGET_RISCV64_ON_X86_64  "GDB_CONF_FLAGS=--target=riscv64-unknown-linux-gnu"
+#define GDB_TARGET_LOONGARCH64_ON_X86_64  "GDB_CONF_FLAGS=--target=loongarch64-unknown-linux-gnu"
+     
 /*
  *  The original plan was to allow the use of a particular version
  *  of gdb for a given architecture.  But for practical purposes,
@@ -164,9 +196,11 @@ void add_extra_lib(char *);
 #define GDB_7_0   (3)
 #define GDB_7_3_1 (4)
 #define GDB_7_6   (5)
-#define SUPPORTED_GDB_VERSIONS (GDB_7_6 + 1)
+#define GDB_10_2   (6)
+#define GDB_16_2   (7)
+#define SUPPORTED_GDB_VERSIONS (GDB_16_2 + 1)
 
-int default_gdb = GDB_7_6;
+int default_gdb = GDB_16_2;
 
 struct supported_gdb_version {
 	char *GDB;
@@ -227,10 +261,28 @@ struct supported_gdb_version {
 	    "7.6",
 	    "GDB_FILES=${GDB_7.6_FILES}",
 	    "GDB_OFILES=${GDB_7.6_OFILES}",
-	    "GDB_PATCH_FILES=gdb-7.6.patch",
+	    "GDB_PATCH_FILES=gdb-7.6.patch gdb-7.6-ppc64le-support.patch gdb-7.6-proc_service.h.patch",
 	    "GDB_FLAGS=-DGDB_7_6",
 	    "GPLv3"
 	},
+        {
+            "GDB=gdb-10.2",
+            "10.2",
+            "GDB_FILES=${GDB_10.2_FILES}",
+            "GDB_OFILES=${GDB_10.2_OFILES}",
+            "GDB_PATCH_FILES=gdb-10.2.patch",
+            "GDB_FLAGS=-DGDB_10_2",
+            "GPLv3"
+        },
+        {
+            "GDB=gdb-16.2",
+            "16.2",
+            "GDB_FILES=${GDB_16.2_FILES}",
+            "GDB_OFILES=${GDB_16.2_OFILES}",
+            "GDB_PATCH_FILES=gdb-16.2.patch",
+            "GDB_FLAGS=-DGDB_16_2",
+            "GPLv3"
+        },
 };
 
 #define DAEMON  0x1
@@ -336,6 +388,7 @@ get_current_configuration(struct supported_gdb_version *sp)
 	static char buf[512];
 	char *p;
 
+#ifndef CONF_TARGET_ARCH
 #ifdef __alpha__
         target_data.target = ALPHA;
 #endif
@@ -366,6 +419,25 @@ get_current_configuration(struct supported_gdb_version *sp)
 #ifdef __aarch64__
         target_data.target = ARM64;
 #endif
+#ifdef __mips__
+#ifndef __mips64
+	target_data.target = MIPS;
+#else
+	target_data.target = MIPS64;
+#endif
+#endif
+#ifdef __sparc_v9__
+	target_data.target = SPARC64;
+#endif
+#if defined(__riscv) && (__riscv_xlen == 64)
+	target_data.target = RISCV64;
+#endif
+#ifdef __loongarch64
+	target_data.target = LOONGARCH64;
+#endif
+#else
+       target_data.target = CONF_TARGET_ARCH;
+#endif
 
 	set_initial_target(sp);
 
@@ -382,6 +454,14 @@ get_current_configuration(struct supported_gdb_version *sp)
 			 *  X86_64 when built as a 32-bit executable.
 			 */
 			target_data.target = ARM;
+		} else if ((target_data.target == X86 || target_data.target == X86_64) &&
+			   (name_to_target((char *)target_data.target_as_param) == MIPS)) {
+			/*
+			 *  Debugging of MIPS little-endian core files
+			 *  supported on X86, and on X86_64 when built as a
+			 *  32-bit executable.
+			 */
+			target_data.target = MIPS;
 		} else if ((target_data.target == X86_64) &&
 			(name_to_target((char *)target_data.target_as_param) == X86)) {
 			/*
@@ -394,6 +474,12 @@ get_current_configuration(struct supported_gdb_version *sp)
 			 *  Build an ARM64 crash binary on an X86_64 host.
 			 */
 			target_data.target = ARM64;
+		} else if ((target_data.target == X86_64) &&
+			(name_to_target((char *)target_data.target_as_param) == PPC64)) {
+			/*
+			 *  Build a PPC64 little-endian crash binary on an X86_64 host.
+			 */
+			target_data.target = PPC64;
 		} else if ((target_data.target == PPC64) &&
 			(name_to_target((char *)target_data.target_as_param) == PPC)) {
 			/*
@@ -405,6 +491,18 @@ get_current_configuration(struct supported_gdb_version *sp)
 			if ((target_data.initial_gdb_target != UNKNOWN) &&
 			    (target_data.host != target_data.initial_gdb_target))
 				arch_mismatch(sp);
+		} else if ((target_data.target == X86_64) &&
+			(name_to_target((char *)target_data.target_as_param) == RISCV64)) {
+			/*
+			 *  Build an RISCV64 crash binary on an X86_64 host.
+			 */
+			target_data.target = RISCV64;
+		} else if ((target_data.target == X86_64) &&
+			(name_to_target((char *)target_data.target_as_param) == LOONGARCH64)) {
+			/*
+			 *  Build an LOONGARCH64 crash binary on an X86_64 host.
+			 */
+			target_data.target = LOONGARCH64;
 		} else {
 			fprintf(stderr,
 			    "\ntarget=%s is not supported on the %s host architecture\n\n",
@@ -432,6 +530,35 @@ get_current_configuration(struct supported_gdb_version *sp)
 		    (target_data.initial_gdb_target != ARM))
 			arch_mismatch(sp);
 
+		if ((target_data.initial_gdb_target == MIPS) &&
+		    (target_data.target != MIPS)) {
+			if ((target_data.target == X86) ||
+			    (target_data.target == X86_64))
+				target_data.target = MIPS;
+			else
+				arch_mismatch(sp);
+		}
+
+		if ((target_data.initial_gdb_target == MIPS64) &&
+		    (target_data.target != MIPS64))
+			arch_mismatch(sp);
+
+		if ((target_data.initial_gdb_target == LOONGARCH64) &&
+			(target_data.target != LOONGARCH64)) {
+			if (target_data.target == X86_64)
+				target_data.target = LOONGARCH64;
+			else
+				arch_mismatch(sp);
+		}
+
+		if ((target_data.initial_gdb_target == RISCV64) &&
+		    (target_data.target != RISCV64)) {
+			if (target_data.target == X86_64)
+				target_data.target = RISCV64;
+			else
+				arch_mismatch(sp);
+		}
+
 		if ((target_data.initial_gdb_target == X86) &&
 		    (target_data.target != X86)) {
 			if (target_data.target == X86_64) 
@@ -454,6 +581,17 @@ get_current_configuration(struct supported_gdb_version *sp)
 		    (target_data.initial_gdb_target != ARM64))
 			arch_mismatch(sp);
 
+		if ((target_data.initial_gdb_target == PPC64) &&
+		    (target_data.target != PPC64)) {
+			if (target_data.target == X86_64) 
+				target_data.target = PPC64;
+			else
+				arch_mismatch(sp);
+		}
+		if ((target_data.target == PPC64) &&
+		    (target_data.initial_gdb_target != PPC64))
+			arch_mismatch(sp);
+
 		if ((target_data.initial_gdb_target == PPC) &&
 		    (target_data.target != PPC)) {
 			if (target_data.target == PPC64) 
@@ -463,6 +601,10 @@ get_current_configuration(struct supported_gdb_version *sp)
 		}
 		if ((target_data.target == PPC) &&
 		    (target_data.initial_gdb_target != PPC))
+			arch_mismatch(sp);
+
+		if ((target_data.target == SPARC64) &&
+		    (target_data.initial_gdb_target != SPARC64))
 			arch_mismatch(sp);
 	}
 
@@ -571,6 +713,21 @@ show_configuration(void)
 	case ARM64:
 		printf("TARGET: ARM64\n");
 		break;
+	case MIPS:
+		printf("TARGET: MIPS\n");
+		break;
+	case MIPS64:
+		printf("TARGET: MIPS64\n");
+		break;
+	case SPARC64:
+		printf("TARGET: SPARC64\n");
+		break;
+	case RISCV64:
+		printf("TARGET: RISCV64\n");
+		break;
+	case LOONGARCH64:
+		printf("TARGET: LOONGARCH64\n");
+		break;
 	}
 
 	if (strlen(target_data.program)) {
@@ -640,7 +797,11 @@ build_configure(struct supported_gdb_version *sp)
 		break;
 	case PPC64:
                 target = TARGET_PPC64;
-                target_CFLAGS = TARGET_CFLAGS_PPC64;
+		if (target_data.host == X86_64) {
+			target_CFLAGS = TARGET_CFLAGS_PPC64_ON_X86_64;
+			gdb_conf_flags = GDB_TARGET_PPC64_ON_X86_64;
+		} else
+			target_CFLAGS = TARGET_CFLAGS_PPC64;
                 break;
 	case X86_64:
                 target = TARGET_X86_64;
@@ -664,6 +825,41 @@ build_configure(struct supported_gdb_version *sp)
 			gdb_conf_flags = GDB_TARGET_ARM64_ON_X86_64;
 		} else
 			target_CFLAGS = TARGET_CFLAGS_ARM64;
+		break;
+	case MIPS:
+                target = TARGET_MIPS;
+                if (target_data.host == X86) {
+                        target_CFLAGS = TARGET_CFLAGS_MIPS_ON_X86;
+			gdb_conf_flags = GDB_TARGET_MIPS_ON_X86;
+                } else if (target_data.host == X86_64) {
+                        target_CFLAGS = TARGET_CFLAGS_MIPS_ON_X86_64;
+			gdb_conf_flags = GDB_TARGET_MIPS_ON_X86_64;
+		} else
+                        target_CFLAGS = TARGET_CFLAGS_MIPS;
+		break;
+	case MIPS64:
+		target = TARGET_MIPS64;
+		target_CFLAGS = TARGET_CFLAGS_MIPS64;
+		break;
+	case SPARC64:
+		target = TARGET_SPARC64;
+		target_CFLAGS = TARGET_CFLAGS_SPARC64;
+		break;
+	case RISCV64:
+		target = TARGET_RISCV64;
+		if (target_data.host == X86_64) {
+			target_CFLAGS = TARGET_CFLAGS_RISCV64_ON_X86_64;
+			gdb_conf_flags = GDB_TARGET_RISCV64_ON_X86_64;
+		} else
+			target_CFLAGS = TARGET_CFLAGS_RISCV64;
+		break;
+	case LOONGARCH64:
+		target = TARGET_LOONGARCH64;
+		if (target_data.host == X86_64) {
+			target_CFLAGS = TARGET_CFLAGS_LOONGARCH64_ON_X86_64;
+			gdb_conf_flags = GDB_TARGET_LOONGARCH64_ON_X86_64;
+		} else
+			target_CFLAGS = TARGET_CFLAGS_LOONGARCH64;
 		break;
 	}
 
@@ -1195,8 +1391,7 @@ make_build_data(char *target)
         p = fgets(inbuf1, 79, fp1);
 
         p = fgets(inbuf2, 79, fp2);
-        p = strstr(inbuf2, ")");
-        p++;
+        p = strstr(inbuf2, " ");
         *p = '\0';
 
         p = fgets(inbuf3, 79, fp3);
@@ -1204,7 +1399,9 @@ make_build_data(char *target)
 	lower_case(target_data.program, progname);
 
 	fprintf(fp4, "char *build_command = \"%s\";\n", progname);
-        if (strlen(hostname))
+        if (getenv("SOURCE_DATE_EPOCH"))
+                fprintf(fp4, "char *build_data = \"reproducible build\";\n");
+        else if (strlen(hostname))
                 fprintf(fp4, "char *build_data = \"%s by %s on %s\";\n",
                         strip_linefeeds(inbuf1), inbuf2, hostname);
         else
@@ -1256,12 +1453,12 @@ make_spec_file(struct supported_gdb_version *sp)
 	printf("License: %s\n", sp->GPL);
 	printf("Group: Development/Debuggers\n");
 	printf("Source: %%{name}-%%{version}.tar.gz\n");
-	printf("URL: http://people.redhat.com/anderson\n");
+	printf("URL: https://github.com/crash-utility\n");
 	printf("Distribution: Linux 2.2 or greater\n");
 	printf("Vendor: Red Hat, Inc.\n");
 	printf("Packager: Dave Anderson <anderson@redhat.com>\n");
 	printf("ExclusiveOS: Linux\n");
-	printf("ExclusiveArch: %%{ix86} alpha ia64 ppc ppc64 ppc64pseries ppc64iseries x86_64 s390 s390x arm aarch64\n");
+	printf("ExclusiveArch: %%{ix86} alpha ia64 ppc ppc64 ppc64pseries ppc64iseries x86_64 s390 s390x arm aarch64 ppc64le mips mipsel mips64el sparc64 riscv64 loongarch64\n");
 	printf("Buildroot: %%{_tmppath}/%%{name}-root\n");
 	printf("BuildRequires: ncurses-devel zlib-devel bison\n");
 	printf("Requires: binutils\n");
@@ -1411,7 +1608,18 @@ setup_gdb_defaults(void)
 			fprintf(stderr, ".gdb configuration: %s\n", sp->GDB_VERSION_IN);
 			return store_gdb_defaults(sp);
 		}
-
+                if (strcmp(buf, "10.2") == 0) {
+                        fclose(fp);
+                        sp = &supported_gdb_versions[GDB_10_2];
+                        fprintf(stderr, ".gdb configuration: %s\n", sp->GDB_VERSION_IN);
+                        return store_gdb_defaults(sp);
+                }
+                if (strcmp(buf, "16.2") == 0) {
+                        fclose(fp);
+                        sp = &supported_gdb_versions[GDB_16_2];
+                        fprintf(stderr, ".gdb configuration: %s\n", sp->GDB_VERSION_IN);
+                        return store_gdb_defaults(sp);
+                }
         }
 	
 	fclose(fp);
@@ -1488,6 +1696,16 @@ set_initial_target(struct supported_gdb_version *sp)
 		target_data.initial_gdb_target = ARM64;
 	else if (strncmp(buf, "ARM", strlen("ARM")) == 0)
 		target_data.initial_gdb_target = ARM;
+	else if (strncmp(buf, "MIPS64", strlen("MIPS64")) == 0)
+		target_data.initial_gdb_target = MIPS64;
+	else if (strncmp(buf, "MIPS", strlen("MIPS")) == 0)
+		target_data.initial_gdb_target = MIPS;
+	else if (strncmp(buf, "SPARC64", strlen("SPARC64")) == 0)
+		target_data.initial_gdb_target = SPARC64;
+	else if (strncmp(buf, "RISCV64", strlen("RISCV64")) == 0)
+		target_data.initial_gdb_target = RISCV64;
+	else if (strncmp(buf, "LOONGARCH64", strlen("LOONGARCH64")) == 0)
+		target_data.initial_gdb_target = LOONGARCH64;
 }
 
 char *
@@ -1505,6 +1723,11 @@ target_to_name(int target)
 	case X86_64: return("X86_64");
 	case ARM:    return("ARM"); 
 	case ARM64:  return("ARM64");
+	case MIPS:   return("MIPS");
+	case MIPS64: return("MIPS64");
+	case SPARC64: return("SPARC64");
+	case RISCV64: return("RISCV64");
+	case LOONGARCH64: return("LOONGARCH64");
 	}
 
 	return "UNKNOWN";
@@ -1528,6 +1751,10 @@ name_to_target(char *name)
         else if (strncmp(name, "PPC64", strlen("PPC64")) == 0)
                 return PPC64;
         else if (strncmp(name, "ppc64", strlen("ppc64")) == 0)
+                return PPC64;
+        else if (strncmp(name, "ppc64le", strlen("ppc64le")) == 0)
+                return PPC64;
+	else if (strncmp(name, "PPC64LE", strlen("PPC64LE")) == 0)
                 return PPC64;
         else if (strncmp(name, "PPC", strlen("PPC")) == 0)
                 return PPC;
@@ -1555,6 +1782,24 @@ name_to_target(char *name)
                 return ARM;
         else if (strncmp(name, "arm", strlen("arm")) == 0)
                 return ARM;
+        else if (strncmp(name, "mips", strlen("mips")) == 0)
+                return MIPS;
+        else if (strncmp(name, "MIPS", strlen("MIPS")) == 0)
+                return MIPS;
+	else if (strncmp(name, "mips64", strlen("mips64")) == 0)
+		return MIPS64;
+	else if (strncmp(name, "MIPS64", strlen("MIPS64")) == 0)
+		return MIPS64;
+	else if (strncmp(name, "sparc64", strlen("sparc64")) == 0)
+		return SPARC64;
+	else if (strncmp(name, "RISCV64", strlen("RISCV64")) == 0)
+		return RISCV64;
+	else if (strncmp(name, "riscv64", strlen("riscv64")) == 0)
+		return RISCV64;
+	else if (strncmp(name, "loongarch64", strlen("loongarch64")) == 0)
+		return LOONGARCH64;
+	else if (strncmp(name, "LOONGARCH64", strlen("LOONGARCH64")) == 0)
+		return LOONGARCH64;
 
 	return UNKNOWN;
 }
@@ -1605,18 +1850,27 @@ get_extra_flags(char *filename, char *initial)
  *  a CFLAGS.extra file and an LDFLAGS.extra file.
 
  *  For lzo: 
+ *    - enter -DLZO in the CFLAGS.extra file
+ *    - enter -llzo2 in the LDFLAGS.extra file
+ *
+ *  For snappy:
  *    - enter -DSNAPPY in the CFLAGS.extra file
  *    - enter -lsnappy in the LDFLAGS.extra file
  *
- *  For snappy:
- *    - enter -DLZO in the CFLAGS.extra file
- *    - enter -llzo2 in the LDFLAGS.extra file.
+ *  For zstd:
+ *    - enter -DZSTD in the CFLAGS.extra file
+ *    - enter -lzstd in the LDFLAGS.extra file
+ *
+ *  For valgrind:
+ *    - enter -DVALGRIND in the CFLAGS.extra file
  */
 void
 add_extra_lib(char *option)
 {
 	int lzo, add_DLZO, add_llzo2; 
 	int snappy, add_DSNAPPY, add_lsnappy;
+	int zstd, add_DZSTD, add_lzstd;
+	int valgrind, add_DVALGRIND;
 	char *cflags, *ldflags;
 	FILE *fp_cflags, *fp_ldflags;
 	char *mode;
@@ -1624,6 +1878,8 @@ add_extra_lib(char *option)
 
 	lzo = add_DLZO = add_llzo2 = 0;
 	snappy = add_DSNAPPY = add_lsnappy = 0;
+	zstd = add_DZSTD = add_lzstd = 0;
+	valgrind = add_DVALGRIND = 0;
 
 	ldflags = get_extra_flags("LDFLAGS.extra", NULL);
 	cflags = get_extra_flags("CFLAGS.extra", NULL);
@@ -1644,11 +1900,31 @@ add_extra_lib(char *option)
 			add_lsnappy++;
 	}
 
-	if ((lzo || snappy) &&
+	if (strcmp(option, "zstd") == 0) {
+		zstd++;
+		if (!cflags || !strstr(cflags, "-DZSTD"))
+			add_DZSTD++;
+		if (!ldflags || !strstr(ldflags, "-lzstd"))
+			add_lzstd++;
+	}
+
+	if (strcmp(option, "valgrind") == 0) {
+		valgrind++;
+		if (!cflags || !strstr(cflags, "-DVALGRIND"))
+			add_DVALGRIND++;
+	}
+
+	if ((lzo || snappy || zstd) &&
 	    file_exists("diskdump.o") && (unlink("diskdump.o") < 0)) {
 		perror("diskdump.o");
 		return;
 	} 
+
+	if (valgrind &&
+	    file_exists("tools.o") && (unlink("tools.o") < 0)) {
+		perror("tools.o");
+		return;
+	}
 
 	mode = file_exists("CFLAGS.extra") ? "r+" : "w+";
 	if ((fp_cflags = fopen("CFLAGS.extra", mode)) == NULL) {
@@ -1663,22 +1939,28 @@ add_extra_lib(char *option)
 		return;
 	}
 
-	if (add_DLZO || add_DSNAPPY) {
+	if (add_DLZO || add_DSNAPPY || add_DZSTD || add_DVALGRIND) {
 		while (fgets(inbuf, 512, fp_cflags))
 			;
 		if (add_DLZO)
 			fputs("-DLZO\n", fp_cflags);
 		if (add_DSNAPPY)
 			fputs("-DSNAPPY\n", fp_cflags);
+		if (add_DZSTD)
+			fputs("-DZSTD\n", fp_cflags);
+		if (add_DVALGRIND)
+			fputs("-DVALGRIND\n", fp_cflags);
 	}
 
-	if (add_llzo2 || add_lsnappy) {
+	if (add_llzo2 || add_lsnappy || add_lzstd) {
 		while (fgets(inbuf, 512, fp_ldflags))
 			;
 		if (add_llzo2)
 			fputs("-llzo2\n", fp_ldflags);
 		if (add_lsnappy)
 			fputs("-lsnappy\n", fp_ldflags);
+		if (add_lzstd)
+			fputs("-lzstd\n", fp_ldflags);
 	}
 
 	fclose(fp_cflags);

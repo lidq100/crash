@@ -1,8 +1,8 @@
 /* s390.c - core analysis suite
  *
  * Copyright (C) 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2006, 2009-2013 David Anderson
- * Copyright (C) 2002-2006, 2009-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2006, 2009-2014 David Anderson
+ * Copyright (C) 2002-2006, 2009-2014 Red Hat, Inc. All rights reserved.
  * Copyright (C) 2005, 2006, 2010-2013 Michael Holzheu, IBM Corporation
  *
  * This program is free software; you can redistribute it and/or modify
@@ -26,7 +26,8 @@
 
 /* Flags used in entries of page dirs and page tables.
  */
-#define S390X_PAGE_PRESENT   0x001ULL    /* set: loaded in physical memory
+#define S390X_PTE_FLAG_BITS     0xfffULL /* Page table entry flag bits */
+#define S390X_PAGE_PRESENT      0x001ULL /* set: loaded in physical memory
                                           * clear: not loaded in physical mem */
 #define S390X_PAGE_RO           0x200ULL /* HW read-only */
 #define S390X_PAGE_INVALID      0x400ULL /* HW invalid */
@@ -41,8 +42,55 @@
 #define KERNEL_STACK_SIZE STACKSIZE() // can be 8192 or 16384
 
 #define LOWCORE_SIZE 8192
+#define VX_SA_SIZE (32 * 16)
 
 #define S390X_PSW_MASK_PSTATE	0x0001000000000000UL
+
+#define S390X_LC_VMCORE_INFO	0xe0c
+#define S390X_LC_OS_INFO	0xe18
+
+/*
+ * Flags for Region and Segment table entries.
+ */
+#define S390X_RTE_FLAG_BITS_FC0    0xfffULL
+#define S390X_RTE_FLAG_BITS_FC1    0x7fffffffULL
+#define S390X_RTE_TL           0x3ULL
+#define S390X_RTE_TL_10        0x2ULL
+#define S390X_RTE_TL_01        0x1ULL
+#define S390X_RTE_TT           0xcULL
+#define S390X_RTE_TT_10        0x8ULL
+#define S390X_RTE_TT_01        0x4ULL
+#define S390X_RTE_CR           0x10ULL
+#define S390X_RTE_I            0x20ULL
+#define S390X_RTE_TF           0xc0ULL
+#define S390X_RTE_TF_10        0x80ULL
+#define S390X_RTE_TF_01        0x40ULL
+#define S390X_RTE_P            0x200ULL
+#define S390X_RTE_FC           0x400ULL
+#define S390X_RTE_F            0x800ULL
+#define S390X_RTE_ACC          0xf000ULL
+#define S390X_RTE_ACC_1000     0x8000ULL
+#define S390X_RTE_ACC_0100     0x4000ULL
+#define S390X_RTE_ACC_0010     0x2000ULL
+#define S390X_RTE_ACC_0001     0x1000ULL
+#define S390X_RTE_AV           0x10000ULL
+
+#define S390X_STE_FLAG_BITS_FC0    0x7ffULL
+#define S390X_STE_FLAG_BITS_FC1    0xfffffULL
+#define S390X_STE_TT           0xcULL
+#define S390X_STE_TT_10        0x8ULL
+#define S390X_STE_TT_01        0x4ULL
+#define S390X_STE_CS           0x10ULL
+#define S390X_STE_I            0x20ULL
+#define S390X_STE_P            0x200ULL
+#define S390X_STE_FC           0x400ULL
+#define S390X_STE_F            0x800ULL
+#define S390X_STE_ACC          0xf000ULL
+#define S390X_STE_ACC_1000     0x8000ULL
+#define S390X_STE_ACC_0100     0x4000ULL
+#define S390X_STE_ACC_0010     0x2000ULL
+#define S390X_STE_ACC_0001     0x1000ULL
+#define S390X_STE_AV           0x10000ULL
 
 /*
  * S390x prstatus ELF Note
@@ -72,6 +120,11 @@ struct s390x_nt_fpregset {
 	uint64_t	fprs[16];
 } __attribute__ ((packed));
 
+struct s390x_vxrs {
+	uint64_t	low;
+	uint64_t	high;
+} __attribute__ ((packed));
+
 /*
  * s390x CPU info
  */
@@ -87,6 +140,8 @@ struct s390x_cpu
 	uint64_t	timer;
 	uint64_t	todcmp;
 	uint32_t	todpreg;
+	uint64_t		vxrs_low[16];
+	struct s390x_vxrs	vxrs_high[16];
 };
 
 /*
@@ -104,7 +159,6 @@ static int s390x_translate_pte(ulong, void *, ulonglong);
 static ulong s390x_processor_speed(void);
 static int s390x_eframe_search(struct bt_info *);
 static void s390x_back_trace_cmd(struct bt_info *);
-static void s390x_dump_irq(int);
 static void s390x_get_stack_frame(struct bt_info *, ulong *, ulong *);
 static int s390x_dis_filter(ulong, char *, unsigned int);
 static void s390x_cmd_mach(void);
@@ -115,6 +169,19 @@ static struct line_number_hook s390x_line_number_hooks[];
 static int s390x_is_uvaddr(ulong, struct task_context *);
 static int s390x_get_kvaddr_ranges(struct vaddr_range *);
 static int set_s390x_max_physmem_bits(void);
+static ulong s390x_generic_VTOP(ulong vaddr);
+static ulong s390x_generic_PTOV(ulong paddr);
+static int s390x_generic_IS_VMALLOC_ADDR(ulong vaddr);
+static ulong s390x_vr_VTOP(ulong vaddr);
+static ulong s390x_vr_PTOV(ulong paddr);
+static int s390x_vr_IS_VMALLOC_ADDR(ulong vaddr);
+static int s390x_vr_is_kvaddr(ulong);
+
+struct machine_specific s390x_machine_specific = {
+	.virt_to_phys = s390x_generic_VTOP,
+	.phys_to_virt = s390x_generic_PTOV,
+	.is_vmalloc_addr = s390x_generic_IS_VMALLOC_ADDR,
+};
 
 /*
  * struct lowcore name (old: "_lowcore", new: "lowcore")
@@ -130,6 +197,27 @@ static unsigned long readmem_ul(unsigned long addr)
 
 	readmem(addr, KVADDR, &rc, sizeof(rc), "readmem_ul", FAULT_ON_ERROR);
 	return rc;
+}
+
+/*
+ * Print hex data
+ */
+static void print_hex_buf(void *buf, int len, int cols, char *tag)
+{
+	int j, first = 1;
+
+	for (j = 0; j < len; j += 8) {
+		if (j % (cols * 8) == 0) {
+			if (first)
+				first = 0;
+			else
+				fprintf(fp, "\n");
+			fprintf(fp, "%s", tag);
+		}
+		fprintf(fp, "%#018lx ", *((unsigned long *)(buf + j)));
+	}
+	if (len)
+		fprintf(fp, "\n");
 }
 
 /*
@@ -168,11 +256,27 @@ static int
 set_s390x_max_physmem_bits(void)
 {
 	int array_len, dimension;
+	char *string;
+
+	if ((string = pc->read_vmcoreinfo("NUMBER(MAX_PHYSMEM_BITS)"))) {
+		machdep->max_physmem_bits = atol(string);
+		free(string);
+		return TRUE;
+	}
 
 	machdep->max_physmem_bits = _MAX_PHYSMEM_BITS_OLD;
 
 	if (!kernel_symbol_exists("mem_section"))
 		return TRUE;
+
+	/*
+	 *  The mem_section was changed to be a pointer in 4.15, so it's 
+	 *  guaranteed to be a newer kernel.
+	 */
+	if (get_symbol_type("mem_section", NULL, NULL) == TYPE_CODE_PTR) {
+		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS_NEW;
+		return TRUE;
+	}
 
 	if (!(array_len = get_array_length("mem_section", &dimension, 0)))
 		return FALSE;
@@ -221,7 +325,7 @@ static struct s390x_cpu *s390x_cpu_get(struct bt_info *bt)
 	readmem(lowcore_ptr + cpu * sizeof(long), KVADDR,
 		&prefix, sizeof(long), "lowcore_ptr", FAULT_ON_ERROR);
 	for (i = 0; i < s390x_cpu_cnt; i++) {
-		if (s390x_cpu_vec[i].prefix == prefix)
+		if (s390x_cpu_vec[i].prefix == VTOP(prefix))
 			return &s390x_cpu_vec[i];
 	}
 	error(FATAL, "cannot determine CPU for task: %lx\n", bt->task);
@@ -271,6 +375,16 @@ static void s390x_elf_nt_prefix_add(struct s390x_cpu *cpu, void *desc)
 	memcpy(&cpu->prefix, desc, sizeof(cpu->prefix));
 }
 
+static void s390x_elf_nt_vxrs_low_add(struct s390x_cpu *cpu, void *desc)
+{
+	memcpy(&cpu->vxrs_low, desc, sizeof(cpu->vxrs_low));
+}
+
+static void s390x_elf_nt_vxrs_high_add(struct s390x_cpu *cpu, void *desc)
+{
+	memcpy(&cpu->vxrs_high, desc, sizeof(cpu->vxrs_high));
+}
+
 static void *get_elf_note_desc(Elf64_Nhdr *note)
 {
 	void *ptr = note;
@@ -315,6 +429,12 @@ static void s390x_elf_note_add(int elf_cpu_nr, void *note_ptr)
 	case NT_S390_PREFIX:
 		s390x_elf_nt_prefix_add(cpu, desc);
 		break;
+	case NT_S390_VXRS_LOW:
+		s390x_elf_nt_vxrs_low_add(cpu, desc);
+		break;
+	case NT_S390_VXRS_HIGH:
+		s390x_elf_nt_vxrs_high_add(cpu, desc);
+		break;
 	}
 }
 
@@ -349,6 +469,282 @@ static void s390x_check_live(void)
 		pc->flags2 |= LIVE_DUMP;
 }
 
+static char *
+vmcoreinfo_read_string_s390x(const char *vmcoreinfo, const char *key)
+{
+	char *value_string = NULL;
+	size_t value_length;
+	char keybuf[128];
+	char *p1, *p2;
+
+	sprintf(keybuf, "%s=", key);
+
+	if ((p1 = strstr(vmcoreinfo, keybuf))) {
+		p2 = p1 + strlen(keybuf);
+		p1 = strstr(p2, "\n");
+		value_length = p1-p2;
+		value_string = calloc(value_length + 1, sizeof(char));
+		strncpy(value_string, p2, value_length);
+		value_string[value_length] = NULLCHAR;
+	}
+
+	return value_string;
+}
+
+/*
+ * Check the value in well-known lowcore location and process it as either
+ * an explicit KASLR offset (early dump case) or as vmcoreinfo pointer to
+ * read the relocated _stext symbol value (important for s390 and lkcd dump
+ * formats).
+ */
+static void s390x_check_kaslr(void)
+{
+	char *_stext_string, *vmcoreinfo;
+	Elf64_Nhdr note;
+	char str[128];
+	ulong addr;
+
+	/* Read the value from well-known lowcore location*/
+	if (!readmem(S390X_LC_VMCORE_INFO, PHYSADDR, &addr,
+		    sizeof(addr), "s390x vmcoreinfo ptr",
+		    QUIET|RETURN_ON_ERROR))
+		return;
+	if (addr == 0)
+		return;
+	/* Check for explicit kaslr offset flag */
+	if (addr & 0x1UL) {
+		/* Drop the last bit to get an offset value */
+		addr &= ~(0x1UL);
+		/* Make sure the offset is aligned by 0x1000 */
+		if (addr && !(addr & 0xfff)) {
+					kt->relocate = addr * (-1);
+					kt->flags |= RELOC_SET;
+					kt->flags2 |= KASLR;
+		}
+		return;
+	}
+	/* Use the addr value as vmcoreinfo pointer */
+	if (!readmem(addr, PHYSADDR, &note,
+		     sizeof(note), "Elf64_Nhdr vmcoreinfo",
+		     QUIET|RETURN_ON_ERROR))
+		return;
+	memset(str, 0, sizeof(str));
+	if (!readmem(addr + sizeof(note), PHYSADDR, str,
+		     note.n_namesz, "VMCOREINFO",
+		     QUIET|RETURN_ON_ERROR))
+		return;
+	if (memcmp(str, "VMCOREINFO", sizeof("VMCOREINFO")) != 0)
+		return;
+	if ((vmcoreinfo = malloc(note.n_descsz + 1)) == NULL) {
+		error(INFO, "s390x_check_kaslr: cannot malloc vmcoreinfo buffer\n");
+		return;
+	}
+	addr = addr + sizeof(note) + note.n_namesz + 1;
+	if (!readmem(addr, PHYSADDR, vmcoreinfo,
+		     note.n_descsz, "s390x vmcoreinfo",
+		     QUIET|RETURN_ON_ERROR)) {
+		free(vmcoreinfo);
+		return;
+	}
+	vmcoreinfo[note.n_descsz] = NULLCHAR;
+	/*
+	 * Read relocated _stext symbol value and store it in the kernel_table
+	 * for further processing within derive_kaslr_offset().
+	 */
+	if ((_stext_string = vmcoreinfo_read_string_s390x(vmcoreinfo,
+							  "SYMBOL(_stext)"))) {
+		kt->vmcoreinfo._stext_SYMBOL = htol(_stext_string,
+						    RETURN_ON_ERROR, NULL);
+		free(_stext_string);
+	}
+	free(vmcoreinfo);
+}
+
+#define OS_INFO_VERSION_MAJOR		1
+#define OS_INFO_VERSION_MINOR		1
+
+#define OS_INFO_VMCOREINFO		0
+#define OS_INFO_REIPL_BLOCK		1
+#define OS_INFO_FLAGS_ENTRY		2
+#define OS_INFO_RESERVED		3
+#define OS_INFO_IDENTITY_BASE		4
+#define OS_INFO_KASLR_OFFSET		5
+#define OS_INFO_KASLR_OFF_PHYS		6
+#define OS_INFO_VMEMMAP			7
+#define OS_INFO_AMODE31_START		8
+#define OS_INFO_AMODE31_END		9
+
+struct os_info_entry {
+	union {
+		__u64	addr;
+		__u64	val;
+	};
+	__u64	size;
+	__u32	csum;
+} __attribute__((packed));
+
+struct os_info {
+	__u64	magic;
+	__u32	csum;
+	__u16	version_major;
+	__u16	version_minor;
+	__u64	crashkernel_addr;
+	__u64	crashkernel_size;
+	struct	os_info_entry entry[10];
+	__u8	reserved[3864];
+} __attribute__((packed));
+
+struct vm_info {
+	__u64 __identity_base;
+	__u64 __kaslr_offset;
+	__u64 __kaslr_offset_phys;
+	__u64 amode31_start;
+	__u64 amode31_end;
+};
+
+static bool
+vmcoreinfo_read_u64(const char *key, __u64 *val)
+{
+	char *string;
+
+	string = pc->read_vmcoreinfo(key);
+	if (string) {
+		*val = strtoul(string, NULL, 16);
+		free(string);
+		return true;
+	}
+
+	return false;
+}
+
+static bool vmcoreinfo_read_vm_info(struct vm_info *_vm_info)
+{
+	struct vm_info vm_info;
+
+	if (!vmcoreinfo_read_u64("IDENTITYBASE",  &vm_info.__identity_base) ||
+	    !vmcoreinfo_read_u64("KERNELOFFSET",  &vm_info.__kaslr_offset) ||
+	    !vmcoreinfo_read_u64("KERNELOFFPHYS", &vm_info.__kaslr_offset_phys) ||
+	    !vmcoreinfo_read_u64("SAMODE31",      &vm_info.amode31_start) ||
+	    !vmcoreinfo_read_u64("EAMODE31",      &vm_info.amode31_end))
+		return false;
+
+	*_vm_info = vm_info;
+
+	return true;
+}
+
+static bool os_info_read_vm_info(struct vm_info *vm_info)
+{
+	struct os_info os_info;
+	ulong addr;
+
+	if (!readmem(S390X_LC_OS_INFO, PHYSADDR, &addr,
+		    sizeof(addr), "s390x os_info ptr",
+		    QUIET|RETURN_ON_ERROR))
+		return false;
+
+	if (addr == 0)
+		return true;
+
+	if (!readmem(addr, PHYSADDR, &os_info,
+		    offsetof(struct os_info, reserved), "s390x os_info header",
+		    QUIET|RETURN_ON_ERROR))
+		return false;
+
+	vm_info->__identity_base      = os_info.entry[OS_INFO_IDENTITY_BASE].val;
+	vm_info->__kaslr_offset       = os_info.entry[OS_INFO_KASLR_OFFSET].val;
+	vm_info->__kaslr_offset_phys  = os_info.entry[OS_INFO_KASLR_OFF_PHYS].val;
+	vm_info->amode31_start        = os_info.entry[OS_INFO_AMODE31_START].val;
+	vm_info->amode31_end          = os_info.entry[OS_INFO_AMODE31_END].val;
+
+	return true;
+}
+
+static bool vm_info_empty(struct vm_info *vm_info)
+{
+	return !vm_info->__kaslr_offset;
+}
+
+static bool s390x_init_vm(void)
+{
+	struct vm_info vm_info;
+
+	if (pc->flags & PROC_KCORE) {
+		if (!vmcoreinfo_read_vm_info(&vm_info))
+			return true;
+	} else {
+		if (!os_info_read_vm_info(&vm_info))
+			return false;
+	}
+	if (vm_info_empty(&vm_info))
+		return true;
+
+	machdep->identity_map_base		= vm_info.__identity_base;
+	machdep->kvbase				= vm_info.__kaslr_offset;
+	machdep->machspec->__kaslr_offset_phys	= vm_info.__kaslr_offset_phys;
+	machdep->machspec->amode31_start	= vm_info.amode31_start;
+	machdep->machspec->amode31_end		= vm_info.amode31_end;
+
+	machdep->is_kvaddr			= s390x_vr_is_kvaddr;
+	machdep->machspec->virt_to_phys		= s390x_vr_VTOP;
+	machdep->machspec->phys_to_virt		= s390x_vr_PTOV;
+	machdep->machspec->is_vmalloc_addr	= s390x_vr_IS_VMALLOC_ADDR;
+
+	return true;
+}
+
+static ulong s390x_generic_VTOP(ulong vaddr)
+{
+	return vaddr - machdep->kvbase;
+}
+
+static ulong s390x_generic_PTOV(ulong paddr)
+{
+	return paddr + machdep->kvbase;
+}
+
+static int s390x_generic_IS_VMALLOC_ADDR(ulong vaddr)
+{
+	return vt->vmalloc_start && vaddr >= vt->vmalloc_start;
+}
+
+static ulong s390x_vr_VTOP(ulong vaddr)
+{
+	if (vaddr < LOWCORE_SIZE)
+		return vaddr;
+	if ((vaddr < machdep->machspec->amode31_end) &&
+	    (vaddr >= machdep->machspec->amode31_start))
+		return vaddr;
+	if (vaddr < machdep->kvbase)
+		return vaddr - machdep->identity_map_base;
+	return vaddr - machdep->kvbase + machdep->machspec->__kaslr_offset_phys;
+}
+
+static ulong s390x_vr_PTOV(ulong paddr)
+{
+	return paddr + machdep->identity_map_base;
+}
+
+static int s390x_vr_IS_VMALLOC_ADDR(ulong vaddr)
+{
+	return (vaddr >= vt->vmalloc_start && vaddr < machdep->kvbase);
+}
+
+ulong s390x_VTOP(ulong vaddr)
+{
+	return machdep->machspec->virt_to_phys(vaddr);
+}
+
+ulong s390x_PTOV(ulong paddr)
+{
+	return machdep->machspec->phys_to_virt(paddr);
+}
+
+int s390x_IS_VMALLOC_ADDR(ulong vaddr)
+{
+	return machdep->machspec->is_vmalloc_addr(vaddr);
+}
+
 /*
  *  Do all necessary machine-specific setup here.  This is called several
  *  times during initialization.
@@ -363,6 +759,7 @@ s390x_init(int when)
 		machdep->process_elf_notes = s390x_process_elf_notes;
 		break;
 	case PRE_SYMTAB:
+		machdep->machspec = &s390x_machine_specific;
 		machdep->verify_symbol = s390x_verify_symbol;
 		if (pc->flags & KERNEL_DEBUG_QUERY)
 			return;
@@ -382,12 +779,16 @@ s390x_init(int when)
 		machdep->verify_paddr = generic_verify_paddr;
 		machdep->get_kvaddr_ranges = s390x_get_kvaddr_ranges;
 		machdep->ptrs_per_pgd = PTRS_PER_PGD;
+		if (DUMPFILE() && !(kt->flags & RELOC_SET))
+			s390x_check_kaslr();
 		break;
 
 	case PRE_GDB:
 		machdep->kvbase = 0;
 		machdep->identity_map_base = 0;
 		machdep->is_kvaddr =  generic_is_kvaddr;
+		if (!s390x_init_vm())
+			error(FATAL, "cannot initialize VM parameters.");
 		machdep->is_uvaddr =  s390x_is_uvaddr;
 		machdep->eframe_search = s390x_eframe_search;
 		machdep->back_trace = s390x_back_trace_cmd;
@@ -412,9 +813,17 @@ s390x_init(int when)
 		break;
 
 	case POST_GDB:
-		machdep->nr_irqs = 0;  /* TBD */
+		if (symbol_exists("irq_desc"))
+			ARRAY_LENGTH_INIT(machdep->nr_irqs, irq_desc,
+				"irq_desc", NULL, 0);
+		else if (kernel_symbol_exists("nr_irqs"))
+			get_symbol_data("nr_irqs", sizeof(unsigned int),
+				&machdep->nr_irqs);
+		else
+			machdep->nr_irqs = 0;
+
 		machdep->vmalloc_start = s390x_vmalloc_start;
-		machdep->dump_irq = s390x_dump_irq;
+		machdep->dump_irq = generic_dump_irq;
 		if (!machdep->hz)
 			machdep->hz = HZ;
 		machdep->section_size_bits = _SECTION_SIZE_BITS;
@@ -443,7 +852,7 @@ s390x_dump_machdep_table(ulong arg)
 	fprintf(fp, ")\n");
 
 	fprintf(fp, "             kvbase: %lx\n", machdep->kvbase);
-	fprintf(fp, "  identity_map_base: %lx\n", machdep->kvbase);
+	fprintf(fp, "  identity_map_base: %lx\n", machdep->identity_map_base);
 	fprintf(fp, "           pagesize: %d\n", machdep->pagesize);
 	fprintf(fp, "          pageshift: %d\n", machdep->pageshift);
 	fprintf(fp, "           pagemask: %llx\n", machdep->pagemask);
@@ -462,7 +871,7 @@ s390x_dump_machdep_table(ulong arg)
 	fprintf(fp, "              uvtop: s390x_uvtop()\n");
 	fprintf(fp, "              kvtop: s390x_kvtop()\n");
 	fprintf(fp, "       get_task_pgd: s390x_get_task_pgd()\n");
-	fprintf(fp, "           dump_irq: s390x_dump_irq()\n");
+	fprintf(fp, "           dump_irq: generic_dump_irq()\n");
 	fprintf(fp, "    get_stack_frame: s390x_get_stack_frame()\n");
 	fprintf(fp, "      get_stackbase: generic_get_stackbase()\n");
 	fprintf(fp, "       get_stacktop: generic_get_stacktop()\n");
@@ -474,7 +883,9 @@ s390x_dump_machdep_table(ulong arg)
 	fprintf(fp, "         dis_filter: s390x_dis_filter()\n");
 	fprintf(fp, "           cmd_mach: s390x_cmd_mach()\n");
 	fprintf(fp, "       get_smp_cpus: s390x_get_smp_cpus()\n");
-	fprintf(fp, "          is_kvaddr: generic_is_kvaddr()\n");
+	fprintf(fp, "          is_kvaddr: %s()\n", machdep->is_kvaddr == s390x_vr_is_kvaddr ?
+					  "s390x_vr_is_kvaddr" :
+					  "generic_is_kvaddr");
 	fprintf(fp, "          is_uvaddr: s390x_is_uvaddr()\n");
 	fprintf(fp, "       verify_paddr: generic_verify_paddr()\n");
 	fprintf(fp, "  get_kvaddr_ranges: s390x_get_kvaddr_ranges()\n");
@@ -493,6 +904,12 @@ s390x_dump_machdep_table(ulong arg)
 	fprintf(fp, "   max_physmem_bits: %ld\n", machdep->max_physmem_bits);
 	fprintf(fp, "  section_size_bits: %ld\n", machdep->section_size_bits);
 	fprintf(fp, "           machspec: %lx\n", (ulong)machdep->machspec);
+}
+
+static int
+s390x_vr_is_kvaddr(ulong vaddr)
+{
+	return (vaddr < LOWCORE_SIZE) || (vaddr >= machdep->identity_map_base);
 }
 
 /*
@@ -559,26 +976,149 @@ static inline int s390x_pte_present(unsigned long x){
  * page table traversal functions 
  */
 
+/* Print flags of Segment-Table entry with format control = 1 */
+static void print_segment_entry_fc1(ulong val)
+{
+	fprintf(fp, "AV=%u; ACC=%u%u%u%u; F=%u; FC=%u; P=%u; I=%u; CS=%u; TT=%u%u\n",
+		!!(val & S390X_STE_AV),
+		!!(val & S390X_STE_ACC_1000),
+		!!(val & S390X_STE_ACC_0100),
+		!!(val & S390X_STE_ACC_0010),
+		!!(val & S390X_STE_ACC_0001),
+		!!(val & S390X_STE_F),
+		!!(val & S390X_STE_FC),
+		!!(val & S390X_STE_P),
+		!!(val & S390X_STE_I),
+		!!(val & S390X_STE_CS),
+		!!(val & S390X_STE_TT_10),
+		!!(val & S390X_STE_TT_01));
+}
+
+/* Print flags of Segment-Table entry with format control = 0 */
+static void print_segment_entry_fc0(ulong val)
+{
+	fprintf(fp, "FC=%u; P=%u; I=%u; CS=%u; TT=%u%u\n",
+		!!(val & S390X_STE_FC),
+		!!(val & S390X_STE_P),
+		!!(val & S390X_STE_I),
+		!!(val & S390X_STE_CS),
+		!!(val & S390X_STE_TT_10),
+		!!(val & S390X_STE_TT_01));
+}
+
+/* Print flags of Region-Third-Table entry with format control = 1 */
+static void print_region_third_entry_fc1(ulong val)
+{
+	fprintf(fp, "AV=%u; ACC=%u%u%u%u; F=%u; FC=%u; P=%u; I=%u; CR=%u; TT=%u%u\n",
+		!!(val & S390X_RTE_AV),
+		!!(val & S390X_RTE_ACC_1000),
+		!!(val & S390X_RTE_ACC_0100),
+		!!(val & S390X_RTE_ACC_0010),
+		!!(val & S390X_RTE_ACC_0001),
+		!!(val & S390X_RTE_F),
+		!!(val & S390X_RTE_FC),
+		!!(val & S390X_RTE_P),
+		!!(val & S390X_RTE_I),
+		!!(val & S390X_RTE_CR),
+		!!(val & S390X_RTE_TT_10),
+		!!(val & S390X_RTE_TT_01));
+}
+
+/* Print flags of Region-Third-Table entry with format control = 0 */
+static void print_region_third_entry_fc0(ulong val)
+{
+	fprintf(fp, "FC=%u; P=%u; TF=%u%u; I=%u; CR=%u; TT=%u%u; TL=%u%u\n",
+		!!(val & S390X_RTE_FC),
+		!!(val & S390X_RTE_P),
+		!!(val & S390X_RTE_TF_10),
+		!!(val & S390X_RTE_TF_01),
+		!!(val & S390X_RTE_I),
+		!!(val & S390X_RTE_CR),
+		!!(val & S390X_RTE_TT_10),
+		!!(val & S390X_RTE_TT_01),
+		!!(val & S390X_RTE_TL_10),
+		!!(val & S390X_RTE_TL_01));
+}
+
+/* Print flags of Region-First/Second-Table entry */
+static void print_region_first_second_entry(ulong val)
+{
+	fprintf(fp, "P=%u; TF=%u%u; I=%u; TT=%u%u; TL=%u%u\n",
+		!!(val & S390X_RTE_P),
+		!!(val & S390X_RTE_TF_10),
+		!!(val & S390X_RTE_TF_01),
+		!!(val & S390X_RTE_I),
+		!!(val & S390X_RTE_TT_10),
+		!!(val & S390X_RTE_TT_01),
+		!!(val & S390X_RTE_TL_10),
+		!!(val & S390X_RTE_TL_01));
+}
+
+/* Print the binary flags for Region or Segment table entry */
+static void s390x_print_te_binary_flags(ulong val, int level)
+{
+	fprintf(fp, "       flags in binary : ");
+	switch (level) {
+	case 0:
+		if (val & S390X_STE_FC)
+			print_segment_entry_fc1(val);
+		else
+			print_segment_entry_fc0(val);
+		break;
+	case 1:
+		if (val & S390X_RTE_FC)
+			print_region_third_entry_fc1(val);
+		else
+			print_region_third_entry_fc0(val);
+		break;
+	case 2:
+	case 3:
+		print_region_first_second_entry(val);
+		break;
+	}
+}
+
 /* Region or segment table traversal function */
 static ulong _kl_rsg_table_deref_s390x(ulong vaddr, ulong table,
-					 int len, int level)
+				       int len, int level, int verbose)
 {
-	ulong offset, entry;
+	const char *name_vec[] = {"STE", "RTTE", "RSTE", "RFTE"};
+	ulong offset, entry, flags, addr;
+	int flags_prt_len;
 
 	offset = ((vaddr >> (11*level + 20)) & 0x7ffULL) * 8;
 	if (offset >= (len + 1)*4096)
 		/* Offset is over the table limit. */
 		return 0;
-	readmem(table + offset, KVADDR, &entry, sizeof(entry), "entry",
-		FAULT_ON_ERROR);
+	addr = table + offset;
+	readmem(addr, KVADDR, &entry, sizeof(entry), "entry", FAULT_ON_ERROR);
+	if (verbose) {
+		flags_prt_len = 3;
+		if (entry & S390X_RTE_FC)
+			if (level) {
+				flags = entry & S390X_RTE_FLAG_BITS_FC1;
+				flags_prt_len = 8;
+			} else {
+				flags = entry & S390X_STE_FLAG_BITS_FC1;
+				flags_prt_len = 5;
+			}
+		else
+			if (level)
+				flags = entry & S390X_RTE_FLAG_BITS_FC0;
+			else
+				flags = entry & S390X_STE_FLAG_BITS_FC0;
+		fprintf(fp, "%5s: %016lx => %016lx (flags = %0*lx)\n",
+			name_vec[level], addr, entry, flags_prt_len, flags);
+		s390x_print_te_binary_flags(entry, level);
+	}
 	/*
 	 * Check if the segment table entry could be read and doesn't have
 	 * any of the reserved bits set.
 	 */
-	if ((entry & 0xcULL) != (level << 2))
+	if ((entry & S390X_RTE_TT) != (level << 2))
 		return 0;
 	/* Check if the region table entry has the invalid bit set. */
-	if (entry & 0x20ULL)
+	if (entry & S390X_RTE_I)
 		return 0;
 	/* Region table entry is valid and well formed. */
 	return entry;
@@ -601,13 +1141,20 @@ static int swap_entry(ulong entry)
 }
 
 /* Page table traversal function */
-static ulong _kl_pg_table_deref_s390x(ulong vaddr, ulong table)
+static ulong _kl_pg_table_deref_s390x(ulong vaddr, ulong table, int verbose)
 {
-	ulong offset, entry;
+	ulong offset, entry, addr;
 
 	offset = ((vaddr >> 12) & 0xffULL) * 8;
-	readmem(table + offset, KVADDR, &entry, sizeof(entry), "entry",
-		FAULT_ON_ERROR);
+	addr = table + offset;
+	readmem(addr, KVADDR, &entry, sizeof(entry), "entry", FAULT_ON_ERROR);
+	if (verbose) {
+		fprintf(fp, "%5s: %016lx => %016lx (flags = %03llx)\n",
+			"PTE", addr, entry, entry & S390X_PTE_FLAG_BITS);
+		fprintf(fp, "       flags in binary : I=%u; P=%u\n",
+			!!(entry & S390X_PAGE_INVALID), !!(entry & S390X_PAGE_RO));
+		fprintf(fp, "%5s: %016llx\n", "PAGE", entry & ~S390X_PTE_FLAG_BITS);
+	}
 	/*
 	 * Return zero if the page table entry has the reserved (0x800) or
 	 * the invalid (0x400) bit set and it is not a swap entry.
@@ -624,6 +1171,9 @@ int s390x_vtop(ulong table, ulong vaddr, physaddr_t *phys_addr, int verbose)
 	ulong entry, paddr;
 	int level, len;
 
+	if (verbose)
+		fprintf(fp, "PAGE DIRECTORY: %016lx\n", table);
+
 	*phys_addr = 0;
 	/*
 	 * Walk the region and segment tables.
@@ -636,20 +1186,21 @@ int s390x_vtop(ulong table, ulong vaddr, physaddr_t *phys_addr, int verbose)
 	/* Read the first entry to find the number of page table levels. */
 	readmem(table, KVADDR, &entry, sizeof(entry), "entry", FAULT_ON_ERROR);
 	level = (entry & 0xcULL) >> 2;
-	if ((vaddr >> (31 + 11*level)) != 0ULL) {
+	if ((level < 3) && (vaddr >> (31 + 11*level)) != 0ULL) {
 		/* Address too big for the number of page table levels. */
 		return FALSE;
 	}
 	while (level >= 0) {
-		entry = _kl_rsg_table_deref_s390x(vaddr, table, len, level);
+		entry = _kl_rsg_table_deref_s390x(vaddr, table, len, level,
+						  verbose);
 		if (!entry)
 			return FALSE;
-		table = entry & ~0xfffULL;
+		table = PTOV(entry & ~0xfffULL);
 		/* Check if this a 2GB page */
 		if ((entry & 0x400ULL) && (level == 1)) {
 			/* Add the 2GB frame offset & return the final value. */
 			table &= ~0x7fffffffULL;
-			*phys_addr = table + (vaddr & 0x7fffffffULL);
+			*phys_addr = VTOP(table + (vaddr & 0x7fffffffULL));
 			return TRUE;
 		}
 		len = entry & 0x3ULL;
@@ -660,12 +1211,12 @@ int s390x_vtop(ulong table, ulong vaddr, physaddr_t *phys_addr, int verbose)
 	if (entry & 0x400ULL) {
 		/* Add the 1MB page offset and return the final value. */
 		table &= ~0xfffffULL;
-		*phys_addr = table + (vaddr & 0xfffffULL);
+		*phys_addr = VTOP(table + (vaddr & 0xfffffULL));
 		return TRUE;
 	}
 
 	/* Get the page table entry */
-	entry = _kl_pg_table_deref_s390x(vaddr, entry & ~0x7ffULL);
+	entry = _kl_pg_table_deref_s390x(vaddr, PTOV(entry & ~0x7ffULL), verbose);
 	if (!entry)
 		return FALSE;
 
@@ -692,7 +1243,7 @@ s390x_vmalloc_start(void)
 {
 	unsigned long highmem_addr,high_memory;
 	highmem_addr=symbol_value("high_memory");
-       	readmem(highmem_addr, PHYSADDR, &high_memory,sizeof(long),
+	readmem(highmem_addr, KVADDR, &high_memory,sizeof(long),
 		"highmem",FAULT_ON_ERROR);
 	return high_memory;
 }
@@ -745,6 +1296,9 @@ s390x_verify_symbol(const char *name, ulong value, char type)
         /* reject L2^B symbols */
 	if (strstr(name, "L2\002") == name)
 	    	return FALSE;
+
+	if (STREQ(name, ".rodata"))
+		return TRUE;
 
 	/* throw away all symbols containing a '.' */
 	for(i = 0; i < strlen(name);i++){
@@ -872,7 +1426,7 @@ s390x_has_cpu(struct bt_info *bt)
 {
 	int cpu = bt->tc->processor;
 
-	if (is_task_active(bt->task) && (kt->cpu_flags[cpu] & ONLINE))
+	if (is_task_active(bt->task) && (kt->cpu_flags[cpu] & ONLINE_MAP))
 		return TRUE;
 	else
 		return FALSE;
@@ -916,14 +1470,65 @@ s390x_get_lowcore(struct bt_info *bt, char* lowcore)
 }
 
 /*
+ * Copy VX registers out of s390x cpu
+ */
+static void vx_copy(void *buf, struct s390x_cpu *s390x_cpu)
+{
+	char *_buf = buf;
+	int i;
+
+	for (i = 0; i < 16; i++) {
+		memcpy(&_buf[i * 16], &s390x_cpu->fprs[i], 8);
+		memcpy(&_buf[i * 16 + 8], &s390x_cpu->vxrs_low[i], 8);
+	}
+	memcpy(&_buf[16 * 16], &s390x_cpu->vxrs_high[0], 16 * 16);
+}
+
+/*
+ * Check if VX registers are available
+ */
+static int has_vx_regs(char *lowcore)
+{
+	unsigned long addr = *((uint64_t *)(lowcore + 0x11b0));
+
+	if (addr == 0 || addr % 1024)
+		return 0;
+	return 1;
+}
+
+/*
+ * Print vector registers for cpu
+ */
+static void
+s390x_print_vx_sa(struct bt_info *bt, char *lc)
+{
+	char vx_sa[VX_SA_SIZE];
+	uint64_t addr;
+
+	if (!(bt->flags & BT_SHOW_ALL_REGS))
+		return;
+	if (!has_vx_regs(lc))
+		return;
+	if (!s390x_cpu_vec) {
+		/* Pointer to save area */
+		addr = *((uint64_t *)(lc + 0x11b0));
+		readmem(addr, KVADDR, vx_sa, sizeof(vx_sa), "vx_sa",
+			FAULT_ON_ERROR);
+	} else {
+		/* Get data from s390x cpu */
+		vx_copy(vx_sa, s390x_cpu_get(bt));
+	}
+	fprintf(fp, "  -vector registers:\n");
+	print_hex_buf(vx_sa, sizeof(vx_sa), 2, "     ");
+}
+
+/*
  * Get stack address for interrupt stack using the pcpu array
  */
 static unsigned long get_int_stack_pcpu(char *stack_name, int cpu)
 {
 	unsigned long addr;
 
-	if (!MEMBER_EXISTS("pcpu", stack_name))
-		return 0;
 	addr = symbol_value("pcpu_devices") +
 		cpu * STRUCT_SIZE("pcpu") + MEMBER_OFFSET("pcpu", stack_name);
 	return readmem_ul(addr) + INT_STACK_SIZE;
@@ -936,7 +1541,8 @@ static unsigned long get_int_stack_lc(char *stack_name, char *lc)
 {
 	if (!MEMBER_EXISTS(lc_struct, stack_name))
 		return 0;
-	return ULONG(lc + MEMBER_OFFSET(lc_struct, stack_name));
+	return roundup(ULONG(lc + MEMBER_OFFSET(lc_struct, stack_name)),
+			     PAGESIZE());
 }
 
 /*
@@ -952,7 +1558,7 @@ static void get_int_stack(char *stack_name, int cpu, char *lc,
 		stack_addr = symbol_value("restart_stack");
 		stack_addr = readmem_ul(stack_addr);
 	} else {
-		if (symbol_exists("pcpu_devices"))
+		if (symbol_exists("pcpu_devices") && MEMBER_EXISTS("pcpu", stack_name))
 			stack_addr = get_int_stack_pcpu(stack_name, cpu);
 		else
 			stack_addr = get_int_stack_lc(stack_name, lc);
@@ -1165,7 +1771,7 @@ static void s390x_back_trace_cmd(struct bt_info *bt)
 		error(WARNING,
 	        "instruction pointer argument ignored on this architecture!\n");
 	}
-	if (is_task_active(bt->task) && !(kt->cpu_flags[cpu] & ONLINE)) {
+	if (is_task_active(bt->task) && !(kt->cpu_flags[cpu] & ONLINE_MAP)) {
 		fprintf(fp, " CPU offline\n");
 		return;
 	}
@@ -1180,16 +1786,21 @@ static void s390x_back_trace_cmd(struct bt_info *bt)
 		if (psw_flags & S390X_PSW_MASK_PSTATE) {
 			fprintf(fp,"Task runs in userspace\n");
 			s390x_print_lowcore(lowcore,bt,0);
+			s390x_print_vx_sa(bt, lowcore);
 			return;
 		}
 		s390x_print_lowcore(lowcore,bt,1);
+		s390x_print_vx_sa(bt, lowcore);
 		fprintf(fp,"\n");
 		if (symbol_exists("restart_stack")) {
 			get_int_stack("restart_stack",
 				      cpu, lowcore, &low, &high);
 			sp = show_trace(bt, cnt, sp, low, high);
 		}
-		get_int_stack("panic_stack", cpu, lowcore, &low, &high);
+		if (MEMBER_EXISTS("lowcore", "nodat_stack"))
+			get_int_stack("nodat_stack", cpu, lowcore, &low, &high);
+		else
+			get_int_stack("panic_stack", cpu, lowcore, &low, &high);
 		sp = show_trace(bt, cnt, sp, low, high);
 		get_int_stack("async_stack", cpu, lowcore, &low, &high);
 		sp = show_trace(bt, cnt, sp, low, high);
@@ -1198,8 +1809,7 @@ static void s390x_back_trace_cmd(struct bt_info *bt)
 	 * Print task stack
 	 */
 	if (THIS_KERNEL_VERSION >= LINUX(2, 6, 0)) {
-		readmem(bt->task + OFFSET(task_struct_thread_info), KVADDR,
-			&low, sizeof(long), "thread info", FAULT_ON_ERROR);
+		low = task_to_stackbase(bt->task);
 	} else {
 		low = bt->task;
 	}
@@ -1243,14 +1853,16 @@ s390x_print_lowcore(char* lc, struct bt_info *bt,int show_symbols)
 	fprintf(fp,"  -prefix   : %#010lx\n", tmp[0]);
 	
 	ptr = lc + MEMBER_OFFSET(lc_struct, "cpu_timer_save_area");
-	tmp[0]=UINT(ptr);
-	tmp[1]=UINT(ptr + S390X_WORD_SIZE);
-	fprintf(fp,"  -cpu timer: %#010lx %#010lx\n", tmp[0],tmp[1]);
+	tmp[0]=ULONG(ptr);
+	fprintf(fp,"  -cpu timer: %#018lx\n", tmp[0]);
 
 	ptr = lc + MEMBER_OFFSET(lc_struct, "clock_comp_save_area");
-	tmp[0]=UINT(ptr);
-	tmp[1]=UINT(ptr + S390X_WORD_SIZE);
-	fprintf(fp,"  -clock cmp: %#010lx %#010lx\n", tmp[0], tmp[1]);
+	/*
+	 * Shift clock comparator by 8 because we got bit positions 0-55
+	 * in byte 1 to 8. The first byte is always zero.
+	 */
+	tmp[0]=ULONG(ptr) << 8;
+	fprintf(fp,"  -clock cmp: %#018lx\n", tmp[0]);
 
 	fprintf(fp,"  -general registers:\n");
 	ptr = lc + MEMBER_OFFSET(lc_struct, "gpregs_save_area");
@@ -1411,15 +2023,6 @@ s390x_get_stack_frame(struct bt_info *bt, ulong *eip, ulong *esp)
 }
 
 /*
- *  cmd_irq() is not implemented for s390x.
- */
-static void 
-s390x_dump_irq(int irq)
-{
-	error(FATAL, "s390x_dump_irq: TBD\n");
-}
-
-/*
  *  Filter disassembly output if the output radix is not gdb's default 10
  */
 static int 
@@ -1456,10 +2059,11 @@ s390x_dis_filter(ulong vaddr, char *inbuf, unsigned int output_radix)
 	if ((FIRSTCHAR(argv[argc-1]) == '<') && 
 	    (LASTCHAR(argv[argc-1]) == '>')) {
 		p1 = rindex(inbuf, '<');
-		while ((p1 > inbuf) && !STRNEQ(p1, " 0x")) 
+		while ((p1 > inbuf) && 
+		    !(STRNEQ(p1, " 0x") || STRNEQ(p1, "\t0x") || STRNEQ(p1, ",0x"))) 
 			p1--;
 
-		if (!STRNEQ(p1, " 0x"))
+		if (!(STRNEQ(p1, " 0x") || STRNEQ(p1, "\t0x") || STRNEQ(p1, ",0x"))) 
 			return FALSE;
 		p1++;
 
@@ -1633,4 +2237,4 @@ s390x_get_kvaddr_ranges(struct vaddr_range *vrp)
 
 	return cnt;
 }
-#endif 
+#endif  /* S390X */

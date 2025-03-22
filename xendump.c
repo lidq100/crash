@@ -1,8 +1,8 @@
 /* 
  * xendump.c 
  * 
- * Copyright (C) 2006-2011, 2013 David Anderson
- * Copyright (C) 2006-2011, 2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2006-2011, 2013-2014 David Anderson
+ * Copyright (C) 2006-2011, 2013-2014 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@
 #include "xendump.h"
 
 static struct xendump_data xendump_data = { 0 };
-static struct xendump_data *xd = &xendump_data;
+struct xendump_data *xd = &xendump_data;
 
 static int xc_save_verify(char *);
 static int xc_core_verify(char *, char *);
@@ -126,9 +126,9 @@ xc_core_verify(char *file, char *buf)
 	xd->xc_core.header.xch_magic = xcp->xch_magic;
 	xd->xc_core.header.xch_nr_vcpus = xcp->xch_nr_vcpus;
 	xd->xc_core.header.xch_nr_pages = xcp->xch_nr_pages;
-	xd->xc_core.header.xch_ctxt_offset = (ulong)xcp->xch_ctxt_offset;
-	xd->xc_core.header.xch_index_offset = (ulong)xcp->xch_index_offset;
-	xd->xc_core.header.xch_pages_offset = (ulong)xcp->xch_pages_offset;
+	xd->xc_core.header.xch_ctxt_offset = (off_t)xcp->xch_ctxt_offset;
+	xd->xc_core.header.xch_index_offset = (off_t)xcp->xch_index_offset;
+	xd->xc_core.header.xch_pages_offset = (off_t)xcp->xch_pages_offset;
 
         xd->flags |= (XENDUMP_LOCAL | XC_CORE_ORIG | XC_CORE_P2M_CREATE);
 
@@ -187,7 +187,7 @@ xc_core_read(void *bufptr, int cnt, ulong addr, physaddr_t paddr)
 	    PFN_NOT_FOUND)
 		return READ_ERROR;
 
-	offset = (off_t)xd->xc_core.header.xch_pages_offset +
+	offset = xd->xc_core.header.xch_pages_offset +
 		((off_t)(page_index) * (off_t)xd->page_size);
 
 	if (lseek(xd->xfd, offset, SEEK_SET) == -1) 
@@ -852,7 +852,7 @@ read_xendump_hyper(int fd, void *bufptr, int cnt, ulong addr, physaddr_t paddr)
         if ((page_index = xc_core_mfn_to_page_index(pfn)) == PFN_NOT_FOUND)
                 return READ_ERROR;
 
-        offset = (off_t)xd->xc_core.header.xch_pages_offset +
+        offset = xd->xc_core.header.xch_pages_offset +
                 ((off_t)(page_index) * (off_t)xd->page_size);
 
         if (lseek(xd->xfd, offset, SEEK_SET) == -1)
@@ -1040,15 +1040,15 @@ xendump_memory_dump(FILE *fp)
 	fprintf(fp, "             xch_nr_pages: %d (0x%x)\n",
 		xd->xc_core.header.xch_nr_pages,
 		xd->xc_core.header.xch_nr_pages);
-	fprintf(fp, "          xch_ctxt_offset: %ld (0x%lx)\n", 
-		xd->xc_core.header.xch_ctxt_offset,
-		xd->xc_core.header.xch_ctxt_offset);
-	fprintf(fp, "         xch_index_offset: %ld (0x%lx)\n",
-		xd->xc_core.header.xch_index_offset,
-		xd->xc_core.header.xch_index_offset);
-	fprintf(fp, "         xch_pages_offset: %ld (0x%lx)\n",
-		xd->xc_core.header.xch_pages_offset,
-		xd->xc_core.header.xch_pages_offset);
+	fprintf(fp, "          xch_ctxt_offset: %llu (0x%llx)\n",
+		(ulonglong)xd->xc_core.header.xch_ctxt_offset,
+		(ulonglong)xd->xc_core.header.xch_ctxt_offset);
+	fprintf(fp, "         xch_index_offset: %llu (0x%llx)\n",
+		(ulonglong)xd->xc_core.header.xch_index_offset,
+		(ulonglong)xd->xc_core.header.xch_index_offset);
+	fprintf(fp, "         xch_pages_offset: %llu (0x%llx)\n",
+		(ulonglong)xd->xc_core.header.xch_pages_offset,
+		(ulonglong)xd->xc_core.header.xch_pages_offset);
 
 	fprintf(fp, "                elf_class: %s\n", xd->xc_core.elf_class == ELFCLASS64 ? "ELFCLASS64" :
 		xd->xc_core.elf_class == ELFCLASS32 ? "ELFCLASS32" : "n/a");
@@ -1260,7 +1260,7 @@ xc_core_create_pfn_tables(void)
 			    "cannot create xen pfn-to-mfn mapping\n");
 	}
 
-	if (xd->flags & XC_CORE_ELF)
+	if (xd->flags & XC_CORE_PFN_CREATE)
 		xc_core_elf_pfn_init();
 
 	xd->flags &= ~(XC_CORE_P2M_CREATE|XC_CORE_PFN_CREATE);
@@ -1285,7 +1285,7 @@ xc_core_mfn_to_page(ulong mfn, char *pgbuf)
 	if (xd->flags & XC_CORE_ELF)
 		return xc_core_elf_mfn_to_page(mfn, pgbuf);
 
-        if (lseek(xd->xfd, (off_t)xd->xc_core.header.xch_index_offset,
+        if (lseek(xd->xfd, xd->xc_core.header.xch_index_offset,
             SEEK_SET) == -1) {
                 error(INFO, "cannot lseek to page index\n");
 		return NULL;
@@ -1325,7 +1325,7 @@ xc_core_mfn_to_page(ulong mfn, char *pgbuf)
 		return NULL;
 	}
 
-        if (lseek(xd->xfd, (off_t)xd->xc_core.header.xch_pages_offset,
+        if (lseek(xd->xfd, xd->xc_core.header.xch_pages_offset,
             SEEK_SET) == -1) {
                 error(INFO, "cannot lseek to xch_pages_offset\n");
 		return NULL;
@@ -1400,7 +1400,7 @@ xc_core_elf_mfn_to_page(ulong mfn, char *pgbuf)
 		return NULL;
 	}
 
-        if (lseek(xd->xfd, (off_t)xd->xc_core.header.xch_pages_offset,
+        if (lseek(xd->xfd, xd->xc_core.header.xch_pages_offset,
             SEEK_SET) == -1)
                 error(FATAL, "cannot lseek to xch_pages_offset\n");
 
@@ -1434,7 +1434,7 @@ xc_core_mfn_to_page_index(ulong mfn)
 	if (xd->flags & XC_CORE_ELF)
 		return xc_core_elf_mfn_to_page_index(mfn);
 
-        if (lseek(xd->xfd, (off_t)xd->xc_core.header.xch_index_offset,
+        if (lseek(xd->xfd, xd->xc_core.header.xch_index_offset,
             SEEK_SET) == -1) {
                 error(INFO, "cannot lseek to page index\n");
                 return MFN_NOT_FOUND;
@@ -1527,7 +1527,7 @@ xc_core_mfns(ulong arg, FILE *ofp)
         ulonglong tmp64[MAX_BATCH_SIZE];
 	size_t size;
 
-        if (lseek(xd->xfd, (off_t)xd->xc_core.header.xch_index_offset,
+        if (lseek(xd->xfd, xd->xc_core.header.xch_index_offset,
             SEEK_SET) == -1) {
                 error(INFO, "cannot lseek to page index\n");
 		return FALSE;
@@ -1677,7 +1677,7 @@ xc_core_pfn_to_page_index(ulong pfn)
 
 	p2m_idx = xd->xc_core.p2m_frame_index_list[idx];
 
-	if (lseek(xd->xfd, (off_t)xd->xc_core.header.xch_pages_offset,
+	if (lseek(xd->xfd, xd->xc_core.header.xch_pages_offset,
             SEEK_SET) == -1) {
                 error(INFO, "cannot lseek to xch_pages_offset\n");
                 return PFN_NOT_FOUND;
@@ -1801,7 +1801,7 @@ xc_core_pfn_valid(ulong pfn)
 	if (pfn >= (ulong)xd->xc_core.header.xch_nr_pages)
 		return FALSE;
 
-        offset = (off_t)xd->xc_core.header.xch_index_offset;
+        offset = xd->xc_core.header.xch_index_offset;
 
 	if (xd->flags & XC_CORE_64BIT_HOST)
 		offset += (off_t)(pfn * sizeof(ulonglong));
@@ -2052,6 +2052,16 @@ xc_core_elf_verify(char *file, char *buf)
 
 		case EM_386:
 			if (machine_type_mismatch(file, "X86", NULL, 0))
+				goto bailout;
+			break;
+
+		case EM_ARM:
+			if (machine_type_mismatch(file, "ARM", NULL, 0))
+				goto bailout;
+			break;
+
+		case EM_AARCH64:
+			if (machine_type_mismatch(file, "ARM64", NULL, 0))
 				goto bailout;
 			break;
 
@@ -2542,25 +2552,27 @@ xc_core_dump_Elf32_Shdr(Elf32_Off offset, int store)
 		return;
 
 	if (STREQ(name, ".xen_prstatus"))
-		xd->xc_core.header.xch_ctxt_offset = 
-			(unsigned long)shdr.sh_offset;
+		xd->xc_core.header.xch_ctxt_offset =
+			(off_t)shdr.sh_offset;
 
 	if (STREQ(name, ".xen_shared_info"))
 		xd->xc_core.shared_info_offset = (off_t)shdr.sh_offset;
 
 	if (STREQ(name, ".xen_pfn")) {
-		xd->xc_core.header.xch_index_offset = shdr.sh_offset;
+		xd->xc_core.header.xch_index_offset =
+			(off_t)shdr.sh_offset;
 		xd->flags |= (XC_CORE_NO_P2M|XC_CORE_PFN_CREATE);
 	}
 
 	if (STREQ(name, ".xen_p2m")) {
-		xd->xc_core.header.xch_index_offset = shdr.sh_offset;
-		xd->flags |= XC_CORE_P2M_CREATE;
+		xd->xc_core.header.xch_index_offset =
+			(off_t)shdr.sh_offset;
+		xd->flags |= XC_CORE_PFN_CREATE;
 	}
 
 	if (STREQ(name, ".xen_pages"))
-		xd->xc_core.header.xch_pages_offset = 
-			(unsigned long)shdr.sh_offset;
+		xd->xc_core.header.xch_pages_offset =
+			(off_t)shdr.sh_offset;
 
 	if (STREQ(name, ".xen_ia64_mapped_regs"))
 		xd->xc_core.ia64_mapped_regs_offset = 
@@ -2642,25 +2654,27 @@ xc_core_dump_Elf64_Shdr(Elf64_Off offset, int store)
 		return;
 
 	if (STREQ(name, ".xen_prstatus"))
-		xd->xc_core.header.xch_ctxt_offset = 
-			(unsigned long)shdr.sh_offset;
+		xd->xc_core.header.xch_ctxt_offset =
+			(off_t)shdr.sh_offset;
 
 	if (STREQ(name, ".xen_shared_info"))
 		xd->xc_core.shared_info_offset = (off_t)shdr.sh_offset;
 
 	if (STREQ(name, ".xen_pfn")) {
-		xd->xc_core.header.xch_index_offset = shdr.sh_offset;
+		xd->xc_core.header.xch_index_offset =
+			(off_t)shdr.sh_offset;
 		xd->flags |= (XC_CORE_NO_P2M|XC_CORE_PFN_CREATE);
 	}
 
 	if (STREQ(name, ".xen_p2m")) {
-		xd->xc_core.header.xch_index_offset = shdr.sh_offset;
-		xd->flags |= XC_CORE_P2M_CREATE;
+		xd->xc_core.header.xch_index_offset =
+			(off_t)shdr.sh_offset;
+		xd->flags |= XC_CORE_PFN_CREATE;
 	}
 
 	if (STREQ(name, ".xen_pages"))
-		xd->xc_core.header.xch_pages_offset = 
-			(unsigned long)shdr.sh_offset;
+		xd->xc_core.header.xch_pages_offset =
+			(off_t)shdr.sh_offset;
 
 	if (STREQ(name, ".xen_ia64_mapped_regs"))
 		xd->xc_core.ia64_mapped_regs_offset = 
@@ -2771,8 +2785,10 @@ xc_core_dump_elfnote(off_t sh_offset, size_t sh_size, int store)
 		index += sizeof(struct elfnote) + elfnote->descsz;
 	}
 
-	if (!store)
+	if (!store) {
+		free(notes_buffer);
 		return;
+	}
 
 	if (elfnote_header) {
 		xd->xc_core.header.xch_magic = elfnote_header->xch_magic;
@@ -2794,6 +2810,7 @@ xc_core_dump_elfnote(off_t sh_offset, size_t sh_size, int store)
 		xd->xc_core.format_version = format_version->version;
 	}
 
+	free(notes_buffer);
 }
 
 /*
@@ -2814,7 +2831,7 @@ xc_core_elf_pfn_init(void)
 		chunk = xd->xc_core.header.xch_nr_pages/INDEX_PFN_COUNT;
 
 		for (i = c = 0; i < INDEX_PFN_COUNT; i++, c += chunk) {
-			offset = (off_t)xd->xc_core.header.xch_index_offset +
+			offset = xd->xc_core.header.xch_index_offset +
 				(off_t)(c * sizeof(uint64_t));
 
 	        	if (lseek(xd->xfd, offset, SEEK_SET) == -1)
@@ -2834,7 +2851,7 @@ xc_core_elf_pfn_init(void)
 		chunk = xd->xc_core.header.xch_nr_pages/INDEX_PFN_COUNT;
 	
 		for (i = c = 0; i < INDEX_PFN_COUNT; i++, c += chunk) {
-			offset = (off_t)xd->xc_core.header.xch_index_offset +
+			offset = xd->xc_core.header.xch_index_offset +
 				(off_t)(c * sizeof(struct xen_dumpcore_p2m));
 
 	        	if (lseek(xd->xfd, offset, SEEK_SET) == -1)

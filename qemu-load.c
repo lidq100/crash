@@ -208,6 +208,16 @@ get_string (FILE *fp, char *name)
 	name[sz] = 0;
 	return sz;
 }
+static int
+get_string_len (FILE *fp, char *name, uint32_t sz)
+{
+	size_t items ATTRIBUTE_UNUSED;
+	if (sz == EOF)
+		return -1;
+	items = fread (name, sz, 1, fp);
+	name[sz] = 0;
+	return sz;
+}
 
 static void
 ram_read_blocks (FILE *fp, uint64_t size)
@@ -437,6 +447,27 @@ cpu_load_seg (FILE *fp, struct qemu_x86_seg *seg, int size)
 	seg->flags = get_be32 (fp);
 }
 
+static bool
+v12_has_xsave_state(FILE *fp)
+{
+	char name[257];
+	bool ret = true;
+	long offset = ftell(fp); // save offset
+
+        /*
+	 * peek into byte stream to check for APIC vmstate
+	 */
+	if (getc(fp) == QEMU_VM_SECTION_FULL) {
+		get_be32(fp); // skip section id
+		get_string(fp, name);
+		if (strcmp(name, "apic") == 0)
+			ret = false;
+	}
+	fseek(fp, offset, SEEK_SET); // restore offset
+
+	return ret;
+}
+
 static uint32_t
 cpu_load (struct qemu_device *d, FILE *fp, int size)
 {
@@ -617,6 +648,14 @@ retry:
 		dx86->tsc_aux = get_be64 (fp);
 		dx86->kvm.system_time_msr = get_be64 (fp);
 		dx86->kvm.wall_clock_msr = get_be64 (fp);
+	}
+
+	if (version_id >= 12 && v12_has_xsave_state(fp)) {
+		dx86->xcr0 = get_be64 (fp);
+		dx86->xstate_bv = get_be64 (fp);
+
+		for (i = 0; i < nregs; i++)
+			get_qemu128 (fp, &dx86->ymmh_regs[i]);
 	}
 
 store:
@@ -855,6 +894,10 @@ device_get (const struct qemu_device_loader *devices,
 
 next_device:
 	devp = devices;
+	if (sec == QEMU_VM_SUBSECTION) {
+		get_string(fp, name);
+		goto search_device;
+	}
 	section_id = get_be32 (fp);
 	if (sec != QEMU_VM_SECTION_START &&
 	    sec != QEMU_VM_SECTION_FULL)
@@ -868,6 +911,7 @@ next_device:
 	while (devp->name && strcmp (devp->name, name))
 		devp++;
 	if (!devp->name) {
+search_device:
 		dprintf("device_get: unknown/unsupported: \"%s\"\n", name);
 		if ((next_device_offset = device_search(devices, fp))) {
 			fseek(fp, next_device_offset, SEEK_CUR);
@@ -890,6 +934,8 @@ qemu_load (const struct qemu_device_loader *devices, uint32_t required_features,
 	struct qemu_device_list *result = NULL;
 	struct qemu_device *last = NULL;;
 	size_t items ATTRIBUTE_UNUSED;
+	uint32_t footerSecId ATTRIBUTE_UNUSED;
+	char name[257];
 
 	switch (get_be32 (fp)) {
 	case QEMU_VM_FILE_MAGIC:
@@ -927,6 +973,15 @@ qemu_load (const struct qemu_device_loader *devices, uint32_t required_features,
 			break;
 		if (sec == QEMU_VM_EOF)
 			break;
+		if (sec == QEMU_VM_SECTION_FOOTER) {
+			footerSecId = get_be32 (fp);
+			continue;
+                }
+		if (sec == QEMU_VM_CONFIGURATION) {
+			uint32_t len = get_be32 (fp);
+			get_string_len (fp, name, len);
+			continue;
+                }
 
 		d = device_get (devices, result, sec, fp);
 		if (!d)

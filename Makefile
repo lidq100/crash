@@ -3,8 +3,8 @@
 # Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
 #       www.missioncriticallinux.com, info@missioncriticallinux.com
 #
-# Copyright (C) 2002-2013 David Anderson
-# Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2002-2016 David Anderson
+# Copyright (C) 2002-2016 Red Hat, Inc. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -17,18 +17,65 @@
 # GNU General Public License for more details.
 #
 
+MAKEFLAGS += --no-print-directory
 PROGRAM=crash
 
 #
-# Supported targets: X86 ALPHA PPC IA64 PPC64
+# Supported targets: X86 ALPHA PPC IA64 PPC64 SPARC64
 # TARGET and GDB_CONF_FLAGS will be configured automatically by configure
 #
 TARGET=
 GDB_CONF_FLAGS=
 
-ARCH := $(shell uname -m | sed -e s/i.86/i386/ -e s/sun4u/sparc64/ -e s/arm.*/arm/ -e s/sa110/arm/)
+# Supported arches for cross compilation: x86_64, x86, aarch64, s390x,
+# powerpc64, alpha, sparc64, mips, riscv64
+# E.g: cross compile crash-utility for aarch64 on X86_64
+# make CROSS_COMPILE=aarch64-linux-gnu- -j`nproc`
+# or
+# make CROSS_COMPILE=aarch64-linux-gnu- -j`nproc` warn
+#
+ifneq ($(CROSS_COMPILE),)
+ARCH := $(shell echo $(CROSS_COMPILE) | sed 's:^.*/::g' | cut -d- -f1)
+else
+ARCH := $(shell uname -m)
+endif
+
+ARCH := $(shell echo $(ARCH) | sed -e s/i.86/i386/ -e s/sun4u/sparc64/ -e s/arm.*/arm/ -e s/sa110/arm/)
+
+CC     = $(CROSS_COMPILE)gcc
+CXX    = $(CROSS_COMPILE)g++
+HOSTCC = gcc
+
 ifeq (${ARCH}, ppc64)
 CONF_FLAGS = -m64
+endif
+
+ifneq ($(CROSS_COMPILE),)
+ifeq (${ARCH}, x86_64)
+CONF_TARGET_ARCH := X86_64
+else ifeq (${ARCH}, aarch64)
+CONF_TARGET_ARCH := ARM64
+else ifeq (${ARCH}, s390x)
+CONF_TARGET_ARCH := S390X
+else ifeq (${ARCH}, powerpc64)
+CONF_TARGET_ARCH := PPC64
+else ifeq (${ARCH}, ppc64le)
+CONF_TARGET_ARCH := PPC64
+else ifeq (${ARCH}, alpha)
+CONF_TARGET_ARCH := ALPHA
+else ifeq (${ARCH}, i386)
+CONF_TARGET_ARCH := X86
+else ifeq (${ARCH}, mips)
+CONF_TARGET_ARCH := MIPS
+else ifeq (${ARCH}, sparc64)
+CONF_TARGET_ARCH := SPARC64
+else ifeq (${ARCH}, riscv64)
+CONF_TARGET_ARCH := RISCV64
+else
+$(error The current Arch(${ARCH}) does not support cross compilation)
+endif
+CONF_FLAGS += -DCONF_TARGET_ARCH=${CONF_TARGET_ARCH}
+CONF_FLAGS += -DGDB_TARGET_DEFAULT="\"GDB_CONF_FLAGS=--host=$(shell echo $(CROSS_COMPILE) | sed -e 's:^.*/::g' -e 's/-$$//')\""
 endif
 
 #
@@ -47,9 +94,9 @@ INSTALLDIR=${DESTDIR}/usr/bin
 # LDFLAGS will be configured automatically by configure
 LDFLAGS=
 
-GENERIC_HFILES=defs.h xen_hyper_defs.h
+GENERIC_HFILES=defs.h xen_hyper_defs.h xen_dom0.h
 MCORE_HFILES=va_server.h vas_crash.h
-REDHAT_HFILES=netdump.h diskdump.h makedumpfile.h xendump.h kvmdump.h qemu-load.h
+REDHAT_HFILES=netdump.h diskdump.h makedumpfile.h xendump.h kvmdump.h qemu-load.h vmcore.h
 LKCD_DUMP_HFILES=lkcd_vmdump_v1.h lkcd_vmdump_v2_v3.h lkcd_dump_v5.h \
         lkcd_dump_v7.h lkcd_dump_v8.h
 LKCD_OBSOLETE_HFILES=lkcd_fix_mem.h
@@ -57,35 +104,47 @@ LKCD_TRACE_HFILES=lkcd_x86_trace.h
 IBM_HFILES=ibm_common.h
 SADUMP_HFILES=sadump.h
 UNWIND_HFILES=unwind.h unwind_i.h rse.h unwind_x86.h unwind_x86_64.h
+VMWARE_HFILES=vmware_vmss.h
+MAPLE_TREE_HFILES=maple_tree.h
+LZORLE_HFILES=lzorle_decompress.h
 
 CFILES=main.c tools.c global_data.c memory.c filesys.c help.c task.c \
-	kernel.c test.c gdb_interface.c configure.c net.c dev.c \
+	kernel.c test.c gdb_interface.c configure.c net.c dev.c bpf.c \
+	printk.c \
 	alpha.c x86.c ppc.c ia64.c s390.c s390x.c s390dbf.c ppc64.c x86_64.c \
-	arm.c arm64.c \
+	arm.c arm64.c mips.c mips64.c riscv64.c loongarch64.c sparc64.c \
 	extensions.c remote.c va_server.c va_server_v1.c symbols.c cmdline.c \
 	lkcd_common.c lkcd_v1.c lkcd_v2_v3.c lkcd_v5.c lkcd_v7.c lkcd_v8.c\
 	lkcd_fix_mem.c s390_dump.c lkcd_x86_trace.c \
 	netdump.c diskdump.c makedumpfile.c xendump.c unwind.c unwind_decoder.c \
 	unwind_x86_32_64.c unwind_arm.c \
 	xen_hyper.c xen_hyper_command.c xen_hyper_global_data.c \
-	xen_hyper_dump_tables.c kvmdump.c qemu.c qemu-load.c sadump.c ipcs.c
+	xen_hyper_dump_tables.c kvmdump.c qemu.c qemu-load.c sadump.c ipcs.c \
+	ramdump.c vmware_vmss.c vmware_guestdump.c \
+	xen_dom0.c kaslr_helper.c sbitmap.c maple_tree.c \
+	lzorle_decompress.c
 
 SOURCE_FILES=${CFILES} ${GENERIC_HFILES} ${MCORE_HFILES} \
 	${REDHAT_CFILES} ${REDHAT_HFILES} ${UNWIND_HFILES} \
 	${LKCD_DUMP_HFILES} ${LKCD_TRACE_HFILES} ${LKCD_OBSOLETE_HFILES}\
-	${IBM_HFILES} ${SADUMP_HFILES}
+	${IBM_HFILES} ${SADUMP_HFILES} ${VMWARE_HFILES} ${MAPLE_TREE_HFILES} \
+	${LZORLE_HFILES}
 
 OBJECT_FILES=main.o tools.o global_data.o memory.o filesys.o help.o task.o \
-	build_data.o kernel.o test.o gdb_interface.o net.o dev.o \
+	build_data.o kernel.o test.o gdb_interface.o net.o dev.o bpf.o \
+	printk.o \
 	alpha.o x86.o ppc.o ia64.o s390.o s390x.o s390dbf.o ppc64.o x86_64.o \
-	arm.o arm64.o \
+	arm.o arm64.o mips.o mips64.o riscv64.o loongarch64.o sparc64.o \
 	extensions.o remote.o va_server.o va_server_v1.o symbols.o cmdline.o \
 	lkcd_common.o lkcd_v1.o lkcd_v2_v3.o lkcd_v5.o lkcd_v7.o lkcd_v8.o \
 	lkcd_fix_mem.o s390_dump.o netdump.o diskdump.o makedumpfile.o xendump.o \
 	lkcd_x86_trace.o unwind_v1.o unwind_v2.o unwind_v3.o \
 	unwind_x86_32_64.o unwind_arm.o \
 	xen_hyper.o xen_hyper_command.o xen_hyper_global_data.o \
-	xen_hyper_dump_tables.o kvmdump.o qemu.o qemu-load.o sadump.o ipcs.o
+	xen_hyper_dump_tables.o kvmdump.o qemu.o qemu-load.o sadump.o ipcs.o \
+	ramdump.o vmware_vmss.o vmware_guestdump.o \
+	xen_dom0.o kaslr_helper.o sbitmap.o maple_tree.o \
+	lzorle_decompress.o
 
 MEMORY_DRIVER_FILES=memory_driver/Makefile memory_driver/crash.c memory_driver/README
 
@@ -175,6 +234,12 @@ GDB_7.3.1_OFILES=${GDB}/gdb/symtab.o
 GDB_7.6_FILES=
 GDB_7.6_OFILES=${GDB}/gdb/symtab.o
 
+GDB_10.2_FILES=
+GDB_10.2_OFILES=${GDB}/gdb/symtab.o crash_target.o
+
+GDB_16.2_FILES=
+GDB_16.2_OFILES=${GDB}/gdb/symtab.o crash_target.o
+
 # 
 # GDB_FLAGS is passed up from the gdb Makefile.
 #
@@ -200,7 +265,7 @@ TAR_FILES=${SOURCE_FILES} Makefile ${GPL_FILES} README .rh_rpm_package crash.8 \
 	${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES}
 CSCOPE_FILES=${SOURCE_FILES}
 
-READLINE_DIRECTORY=./${GDB}/readline
+READLINE_DIRECTORY=./${GDB}/readline/readline
 BFD_DIRECTORY=./${GDB}/bfd
 GDB_INCLUDE_DIRECTORY=./${GDB}/include
 
@@ -212,94 +277,112 @@ ifneq ($(target),)
 CONF_TARGET_FLAG="-t$(target)"
 endif
 
+ifeq ($(findstring warn,$(MAKECMDGOALS)),warn)
+CONF_TARGET_FLAG += -w
+endif
+ifeq ($(findstring Warn,$(MAKECMDGOALS)),Warn)
+CONF_TARGET_FLAG += -W
+endif
+ifeq ($(findstring nowarn,$(MAKECMDGOALS)),nowarn)
+CONF_TARGET_FLAG += -n
+endif
+ifeq ($(findstring lzo,$(MAKECMDGOALS)),lzo)
+CONF_TARGET_FLAG += -x lzo
+endif
+ifeq ($(findstring snappy,$(MAKECMDGOALS)),snappy)
+CONF_TARGET_FLAG += -x snappy
+endif
+ifeq ($(findstring zstd,$(MAKECMDGOALS)),zstd)
+CONF_TARGET_FLAG += -x zstd
+endif
+ifeq ($(findstring valgrind,$(MAKECMDGOALS)),valgrind)
+CONF_TARGET_FLAG += -x valgrind
+endif
+
 # To build the extensions library by default, uncomment the third command
 # line below.  Otherwise they can be built by entering "make extensions".
 
 all: make_configure
 	@./configure ${CONF_TARGET_FLAG} -p "RPMPKG=${RPMPKG}" -b
-	@make --no-print-directory gdb_merge
-#	@make --no-print-directory extensions
+	@$(MAKE) gdb_merge
+#	@$(MAKE) extensions
 
 gdb_merge: force
 	@if [ ! -f ${GDB}/README ]; then \
-	  make --no-print-directory gdb_unzip; fi
+	  $(MAKE) gdb_unzip; fi
 	@echo "${LDFLAGS} -lz -ldl -rdynamic" > ${GDB}/gdb/mergelibs
 	@echo "../../${PROGRAM} ../../${PROGRAM}lib.a" > ${GDB}/gdb/mergeobj
 	@rm -f ${PROGRAM}
 	@if [ ! -f ${GDB}/config.status ]; then \
 	  (cd ${GDB}; ./configure ${GDB_CONF_FLAGS} --with-separate-debug-dir=/usr/lib/debug \
-	    --with-bugurl="" --with-expat=no --with-python=no; \
-	  make --no-print-directory CRASH_TARGET=${TARGET}; echo ${TARGET} > crash.target) \
-	else (cd ${GDB}/gdb; make --no-print-directory CRASH_TARGET=${TARGET};); fi
+	    --with-bugurl="" --with-expat=no --with-python=no --disable-sim; \
+	  $(MAKE) CRASH_TARGET=${TARGET}; echo ${TARGET} > crash.target) \
+	else $(MAKE) rebuild; fi
 	@if [ ! -f ${PROGRAM} ]; then \
 	  echo; echo "${PROGRAM} build failed"; \
 	  echo; exit 1; fi
+
+rebuild:
+	@if [ ! -f ${GDB}/${GDB}.patch ]; then \
+	  touch ${GDB}/${GDB}.patch; fi
+	@if [ -f ${GDB}.patch ] && [ -s ${GDB}.patch ] && \
+	  [ "`md5sum < ${GDB}.patch`" != "`md5sum < ${GDB}/${GDB}.patch`" ]; then \
+	  (sh -x ${GDB}.patch ${TARGET}; patch -N -p0 -r- --fuzz=0 < ${GDB}.patch; cp ${GDB}.patch ${GDB}; cd ${GDB}; \
+	  $(MAKE) CRASH_TARGET=${TARGET}) \
+	else (cd ${GDB}/gdb; $(MAKE) CRASH_TARGET=${TARGET}); fi
 
 gdb_unzip:
 	@rm -f gdb.files
 	@for FILE in ${GDB_FILES} dummy; do\
 	  echo $$FILE >> gdb.files; done
+	@if [ ! -f ${GDB}.tar.gz ] && [ ! -f /usr/bin/wget ]; then \
+	  echo /usr/bin/wget is required to download ${GDB}.tar.gz; echo; exit 1; fi
 	@if [ ! -f ${GDB}.tar.gz ] && [ -f /usr/bin/wget ]; then \
-	  wget http://ftp.gnu.org/gnu/gdb/${GDB}.tar.gz; fi
-	@tar --exclude-from gdb.files -xvzmf ${GDB}.tar.gz
-	@make --no-print-directory gdb_patch
+	  [ ! -t 2 ] && WGET_OPTS="--progress=dot:mega"; \
+	  wget $$WGET_OPTS http://ftp.gnu.org/gnu/gdb/${GDB}.tar.gz; fi
+	@tar --exclude-from gdb.files -xzmf ${GDB}.tar.gz
+	@$(MAKE) gdb_patch
 
 gdb_patch:
 	if [ -f ${GDB}.patch ] && [ -s ${GDB}.patch ]; then \
-		patch -p0 < ${GDB}.patch; fi
+		patch -p0 < ${GDB}.patch; cp ${GDB}.patch ${GDB}; fi
 
-library: make_build_data ${OBJECT_FILES}
+library: ${OBJECT_FILES}
 	ar -rs ${PROGRAM}lib.a ${OBJECT_FILES}
 
 gdb: force
 	rm -f ${GDB_OFILES}
-	@make --no-print-directory all
+	@$(MAKE) all
 
 force:
 	
 
 make_configure: force
 	@rm -f configure
-	@${CC} ${CONF_FLAGS} -o configure configure.c ${WARNING_ERROR} ${WARNING_OPTIONS}
+	@${HOSTCC} ${CONF_FLAGS} -o configure configure.c ${WARNING_ERROR} ${WARNING_OPTIONS}
 
 clean: make_configure
 	@./configure ${CONF_TARGET_FLAG} -q -b
-	@make --no-print-directory do_clean
+	@$(MAKE) do_clean
 
 do_clean:
 	rm -f ${OBJECT_FILES} ${DAEMON_OBJECT_FILES} ${PROGRAM} ${PROGRAM}lib.a ${GDB_OFILES}
-	@(cd extensions; make --no-print-directory -i clean)
-	@(cd memory_driver; make --no-print-directory -i clean)
+	@$(MAKE) -C extensions -i clean
+	@$(MAKE) -C memory_driver -i clean
 
-make_build_data: force
+build_data.o: force
 	${CC} -c ${CRASH_CFLAGS} build_data.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 install:
+	/usr/bin/install -d ${INSTALLDIR}
 	/usr/bin/install ${PROGRAM} ${INSTALLDIR}
 #	/usr/bin/install ${PROGRAM}d ${INSTALLDIR}
 
 unconfig: make_configure
 	@./configure -u
 
-warn: make_configure
-	@./configure ${CONF_TARGET_FLAG} -w -b
-	@make --no-print-directory gdb_merge
-
-Warn: make_configure
-	@./configure ${CONF_TARGET_FLAG} -W -b
-	@make --no-print-directory gdb_merge
-
-nowarn: make_configure
-	@./configure ${CONF_TARGET_FLAG} -n -b
-	@make --no-print-directory gdb_merge
-
-lzo: make_configure
-	@./configure -x lzo ${CONF_TARGET_FLAG} -w -b
-	@make --no-print-directory gdb_merge
-
-snappy: make_configure
-	@./configure -x snappy ${CONF_TARGET_FLAG} -w -b
-	@make --no-print-directory gdb_merge
+warn Warn nowarn lzo snappy zstd valgrind: all
+	@true  #dummy
 
 main.o: ${GENERIC_HFILES} main.c
 	${CC} -c ${CRASH_CFLAGS} main.c ${WARNING_OPTIONS} ${WARNING_ERROR} 
@@ -309,6 +392,9 @@ cmdline.o: ${GENERIC_HFILES} cmdline.c
 
 tools.o: ${GENERIC_HFILES} tools.c
 	${CC} -c ${CRASH_CFLAGS} tools.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+sbitmap.o: ${GENERIC_HFILES} sbitmap.c
+	${CC} -c ${CRASH_CFLAGS} sbitmap.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 global_data.o: ${GENERIC_HFILES} global_data.c
 	${CC} -c ${CRASH_CFLAGS} global_data.c ${WARNING_OPTIONS} ${WARNING_ERROR}
@@ -322,7 +408,7 @@ filesys.o: ${GENERIC_HFILES} filesys.c
 help.o: ${GENERIC_HFILES} help.c
 	${CC} -c ${CRASH_CFLAGS} help.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
-memory.o: ${GENERIC_HFILES} memory.c
+memory.o: ${GENERIC_HFILES} ${MAPLE_TREE_HFILES} memory.c
 	${CC} -c ${CRASH_CFLAGS} memory.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 test.o: ${GENERIC_HFILES} test.c
@@ -332,7 +418,10 @@ task.o: ${GENERIC_HFILES} task.c
 	${CC} -c ${CRASH_CFLAGS} task.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 kernel.o: ${GENERIC_HFILES} kernel.c
-	${CC} -c ${CRASH_CFLAGS} kernel.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+	${CC} -c ${CRASH_CFLAGS} kernel.c -I${BFD_DIRECTORY} -I${GDB_INCLUDE_DIRECTORY} ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+printk.o: ${GENERIC_HFILES} printk.c
+	${CC} -c ${CRASH_CFLAGS} printk.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 gdb_interface.o: ${GENERIC_HFILES} gdb_interface.c
 	${CC} -c ${CRASH_CFLAGS} gdb_interface.c ${WARNING_OPTIONS} ${WARNING_ERROR}
@@ -364,7 +453,7 @@ lkcd_v8.o: ${GENERIC_HFILES} ${LKCD_DUMP_HFILES} lkcd_v8.c
 net.o: ${GENERIC_HFILES} net.c
 	${CC} -c ${CRASH_CFLAGS} net.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
-dev.o: ${GENERIC_HFILES} dev.c
+dev.o: ${GENERIC_HFILES} ${REDHAT_HFILES} dev.c
 	${CC} -c ${CRASH_CFLAGS} dev.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 # remote.c functionality has been deprecated
@@ -396,6 +485,21 @@ arm.o: ${GENERIC_HFILES} ${REDHAT_HFILES} arm.c
 
 arm64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} arm64.c
 	${CC} -c ${CRASH_CFLAGS} arm64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+mips.o: ${GENERIC_HFILES} ${REDHAT_HFILES} mips.c
+	${CC} -c ${CRASH_CFLAGS} mips.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+mips64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} mips64.c
+	${CC} -c ${CRASH_CFLAGS} mips64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+riscv64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} riscv64.c
+	${CC} -c ${CRASH_CFLAGS} riscv64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+sparc64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} sparc64.c
+	${CC} -c ${CRASH_CFLAGS} sparc64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+loongarch64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} loongarch64.c
+	${CC} -c ${CRASH_CFLAGS} loongarch64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 s390.o: ${GENERIC_HFILES} ${IBM_HFILES} s390.c
 	${CC} -c ${CRASH_CFLAGS} s390.c ${WARNING_OPTIONS} ${WARNING_ERROR}
@@ -474,8 +578,32 @@ xen_hyper_global_data.o: ${GENERIC_HFILES} xen_hyper_global_data.c
 xen_hyper_dump_tables.o: ${GENERIC_HFILES} xen_hyper_dump_tables.c
 	${CC} -c ${CRASH_CFLAGS} xen_hyper_dump_tables.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
+xen_dom0.o: ${GENERIC_HFILES} xen_dom0.c
+	${CC} -c ${CRASH_CFLAGS} xen_dom0.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+ramdump.o: ${GENERIC_HFILES} ${REDHAT_HFILES} ramdump.c
+	${CC} -c ${CRASH_CFLAGS} ramdump.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+vmware_vmss.o: ${GENERIC_HFILES} ${VMWARE_HFILES} vmware_vmss.c
+	${CC} -c ${CRASH_CFLAGS} vmware_vmss.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+vmware_guestdump.o: ${GENERIC_HFILES} ${VMWARE_HFILES} vmware_guestdump.c
+	${CC} -c ${CRASH_CFLAGS} vmware_guestdump.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+kaslr_helper.o: ${GENERIC_HFILES} kaslr_helper.c
+	${CC} -c ${CRASH_CFLAGS} kaslr_helper.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+bpf.o: ${GENERIC_HFILES} bpf.c
+	${CC} -c ${CRASH_CFLAGS} bpf.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+maple_tree.o: ${GENERIC_HFILES} ${MAPLE_TREE_HFILES} maple_tree.c
+	${CC} -c ${CRASH_CFLAGS} maple_tree.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+lzorle_decompress.o: lzorle_decompress.c
+	${CC} -c ${CRASH_CFLAGS} lzorle_decompress.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
 ${PROGRAM}: force
-	@make --no-print-directory all
+	@$(MAKE) all
 
 # Remote daemon functionality has been deprecated.
 daemon_deprecated: force
@@ -484,15 +612,15 @@ daemon_deprecated: force
 
 ${PROGRAM}d: daemon_deprecated make_configure
 	@./configure -d
-	@make --no-print-directory make_build_data
-	@make --no-print-directory daemon 
+	@$(MAKE) build_data.o
+	@$(MAKE) daemon
 
 daemon: ${DAEMON_OBJECT_FILES}
 	${CC} ${LDFLAGS} -o ${PROGRAM}d ${DAEMON_OBJECT_FILES} build_data.o -lz 
 
 files: make_configure
 	@./configure -q -b
-	@make --no-print-directory show_files
+	@$(MAKE) show_files
 
 gdb_files: make_configure
 	@./configure -q -b
@@ -509,7 +637,7 @@ ctags:
 
 tar: make_configure
 	@./configure -q -b
-	@make --no-print-directory do_tar
+	@$(MAKE) do_tar
 
 do_tar:
 	@if [ -f ${PROGRAM}  ]; then \
@@ -524,7 +652,7 @@ release: make_configure
 	@if [ "`id --user`" != "0" ]; then \
 		echo "make release: must be super-user"; exit 1; fi
 	@./configure -P "RPMPKG=${RPMPKG}" -u -g
-	@make --no-print-directory release_configure
+	@$(MAKE) release_configure
 	@echo 
 	@echo "cvs tag this release if necessary"
 
@@ -532,7 +660,7 @@ release_configure: make_configure
 	@if [ "${GDB}" = "" ] ; then \
 		echo "make release: GDB not defined: append GDB=gdb-x.x to make command line"; echo; exit 1; fi 
 	@./configure -r ${GDB}
-	@make --no-print-directory do_release
+	@$(MAKE) do_release
 
 do_release:
 	@echo "CRASH VERSION: ${VERSION}  GDB VERSION: ${GDB}"
@@ -547,7 +675,8 @@ do_release:
 	.rh_rpm_package crash.8 ${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES} | \
 	(cd ./RELDIR/${PROGRAM}-${VERSION}; tar xf -)
 	@cp ${GDB}.tar.gz ./RELDIR/${PROGRAM}-${VERSION}
-	@./${PROGRAM} --no_scroll --no_crashrc -h README > ./RELDIR/${PROGRAM}-${VERSION}/README
+	@./${PROGRAM} --no_scroll --no_crashrc -h README > README
+	@cp README ./RELDIR/${PROGRAM}-${VERSION}/README
 	@(cd ./RELDIR; find . -exec chown root {} ";")
 	@(cd ./RELDIR; find . -exec chgrp root {} ";")
 	@(cd ./RELDIR; find . -exec touch {} ";")
@@ -573,13 +702,13 @@ do_release:
 	fi
 
 ref:
-	make ctags cscope
+	$(MAKE) ctags cscope
 
 cscope:
-	rm -f cscope.files cscope_out
+	rm -f cscope.files cscope.out
 	for FILE in ${SOURCE_FILES}; do \
 	echo $$FILE >> cscope.files; done
-	cscope
+	cscope -b -f cscope.out
 
 glink: make_configure
 	@./configure -q -b
@@ -595,10 +724,10 @@ dis:
 
 extensions: make_configure
 	@./configure ${CONF_TARGET_FLAG} -q -b
-	@make --no-print-directory do_extensions
+	@$(MAKE) do_extensions
 
 do_extensions:
-	@(cd extensions; make -i TARGET=$(TARGET) TARGET_CFLAGS="$(TARGET_CFLAGS)" GDB=$(GDB) GDB_FLAGS=$(GDB_FLAGS))
+	@$(MAKE) -C extensions -i TARGET=$(TARGET) TARGET_CFLAGS="$(TARGET_CFLAGS)" GDB=$(GDB) GDB_FLAGS=$(GDB_FLAGS)
 
 memory_driver: make_configure 
-	@(cd memory_driver; make --no-print-directory -i)
+	@$(MAKE) -C memory_driver -i

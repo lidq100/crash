@@ -32,13 +32,13 @@
   A whitepaper with complete documentation concerning the use of this utility
   can be found here:
  
-         http://people.redhat.com/anderson/crash_whitepaper
+         https://crash-utility.github.io/crash_whitepaper.html
  
   These are the current prerequisites: 
 
-  o  At this point, x86, ia64, x86_64, ppc64, ppc, arm, arm64, alpha, s390
-     and s390x-based kernels are supported.  Other architectures may be
-     addressed in the future.
+  o  At this point, x86, ia64, x86_64, ppc64, ppc, arm, arm64, alpha, mips,
+     mips64, loongarch64, riscv64, s390 and s390x-based kernels are supported.
+     Other architectures may be addressed in the future.
 
   o  One size fits all -- the utility can be run on any Linux kernel version
      version dating back to 2.2.5-15.  A primary design goal is to always
@@ -72,14 +72,25 @@
      After the kernel is re-compiled, the uncompressed "vmlinux" kernel
      that is created in the top-level kernel build directory must be saved.
 
+  o  Requirements for building:
+      Fedora: make gcc gcc-c++ ncurses-devel zlib-devel lzo-devel snappy-devel bison wget patch texinfo libzstd-devel
+      Ubuntu/Debian: make gcc g++ libncurses-dev zlib1g-dev liblzo2-dev libsnappy-dev bison wget patch texinfo libzstd-dev
+      Arch Linux: make gcc ncurses zlib lzo snappy bison wget patch texinfo zstd
+      openSUSE: make gcc gcc-c++ ncurses-devel zlib-devel lzo-devel snappy-devel bison wget patch texinfo libzstd-devel
+
   To build the crash utility: 
 
-    $ tar -xf crash-7.0.4.tar.gz
-    $ cd crash-7.0.4
+    $ tar -xf crash-8.0.6.tar.gz
+    $ cd crash-8.0.6
     $ make
 
+  To cross compile the crash utility for aarch64 on x86_64:
+    $ make CROSS_COMPILE=aarch64-linux-gnu- -j`nproc`
+
+  Supported arches for cross compilation: x86_64, x86, aarch64, s390x, powerpc64, alpha, sparc64, mips, riscv64
+
   The initial build will take several minutes  because the embedded gdb module
-  must be configured and and built.  Alternatively, the crash source RPM file
+  must be configured and built.  Alternatively, the crash source RPM file
   may be installed and built, and the resultant crash binary RPM file installed.
 
   The crash binary can only be used on systems of the same architecture as
@@ -90,16 +101,28 @@
      32-bit x86 dumpfiles may be built by typing "make target=X86".
   o  On an x86 or x86_64 host, a 32-bit x86 binary that can be used to analyze
      32-bit arm dumpfiles may be built by typing "make target=ARM".
+  o  On an x86 or x86_64 host, a 32-bit x86 binary that can be used to analyze
+     32-bit mips dumpfiles may be built by typing "make target=MIPS".
   o  On an ppc64 host, a 32-bit ppc binary that can be used to analyze
      32-bit ppc dumpfiles may be built by typing "make target=PPC".
   o  On an x86_64 host, an x86_64 binary that can be used to analyze
      arm64 dumpfiles may be built by typing "make target=ARM64".
+  o  On an x86_64 host, an x86_64 binary that can be used to analyze
+     ppc64le dumpfiles may be built by typing "make target=PPC64".
+  o  On an x86_64 host, an x86_64 binary that can be used to analyze
+     riscv64 dumpfiles may be built by typing "make target=RISCV64".
+  o  On an x86_64 host, an x86_64 binary that can be used to analyze
+     loongarch64 dumpfiles may be built by typing "make target=LOONGARCH64".
 
   Traditionally when vmcores are compressed via the makedumpfile(8) facility
   the libz compression library is used, and by default the crash utility
   only supports libz.  Recently makedumpfile has been enhanced to optionally
-  use either the LZO or snappy compression libraries.  To build crash with
-  either or both of those libraries, type "make lzo" or "make snappy".
+  use the LZO, snappy or zstd compression libraries.  To build crash with any
+  or all of those libraries, type "make lzo", "make snappy" or "make zstd".
+
+  crash supports valgrind Memcheck tool on the crash's custom memory allocator.
+  To build crash with this feature enabled, type "make valgrind" and then run
+  crash with valgrind as "valgrind crash vmlinux vmcore".
 
   All of the alternate build commands above are "sticky" in that the
   special "make" targets only have to be entered one time; all subsequent
@@ -114,7 +137,7 @@
   If neither /dev/mem or /dev/crash are available, then /proc/kcore will be
   be used as the live memory source.  If /proc/kcore is also restricted, then
   the Red Hat /dev/crash driver may be compiled and installed; its source
-  is included in the crash-7.0.4/memory_driver subdirectory.
+  is included in the crash-8.0.6/memory_driver subdirectory.
 
   If the kernel file is stored in /boot, /, /boot/efi, or in any /usr/src
   or /usr/lib/debug/lib/modules subdirectory, then no command line arguments
@@ -125,21 +148,22 @@
 
     $ crash
     
-    crash 7.0.4
-    Copyright (C) 2002-2013  Red Hat, Inc.
+    crash 8.0.6
+    Copyright (C) 2002-2022  Red Hat, Inc.
     Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
     Copyright (C) 1999-2006  Hewlett-Packard Co
     Copyright (C) 2005, 2006, 2011, 2012  Fujitsu Limited
     Copyright (C) 2006, 2007  VA Linux Systems Japan K.K.
-    Copyright (C) 2005, 2011  NEC Corporation
+    Copyright (C) 2005, 2011, 2020-2022  NEC Corporation
     Copyright (C) 1999, 2002, 2007  Silicon Graphics, Inc.
     Copyright (C) 1999, 2000, 2001, 2002  Mission Critical Linux, Inc.
+    Copyright (C) 2015, 2021  VMware, Inc.
     This program is free software, covered by the GNU General Public License,
     and you are welcome to change it and/or distribute copies of it under
     certain conditions.  Enter "help copying" to see the conditions.
     This program has absolutely no warranty.  Enter "help warranty" for details.
      
-    GNU gdb 7.6
+    GNU gdb 10.2
     Copyright 2013 Free Software Foundation, Inc.
     License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
     This is free software: you are free to change and redistribute it.
@@ -150,7 +174,7 @@
           KERNEL: /boot/vmlinux
         DUMPFILE: /dev/mem
             CPUS: 1
-            DATE: Wed Dec 11 15:57:58 2013
+            DATE: Tue Nov 12 09:25:55 CST 2024
           UPTIME: 10 days, 22:55:18
     LOAD AVERAGE: 0.08, 0.03, 0.01
            TASKS: 42
@@ -167,18 +191,19 @@
 
     crash> help
 
-    *              files          mach           repeat         timer          
-    alias          foreach        mod            runq           tree           
-    ascii          fuser          mount          search         union          
-    bt             gdb            net            set            vm             
-    btop           help           p              sig            vtop           
-    dev            ipcs           ps             struct         waitq          
-    dis            irq            pte            swap           whatis         
-    eval           kmem           ptob           sym            wr             
-    exit           list           ptov           sys            q              
-    extend         log            rd             task           
+    *              files          mod            sbitmapq       union          
+    alias          foreach        mount          search         vm             
+    ascii          fuser          net            set            vtop           
+    bpf            gdb            p              sig            waitq          
+    bt             help           ps             struct         whatis         
+    btop           ipcs           pte            swap           wr             
+    dev            irq            ptob           sym            q              
+    dis            kmem           ptov           sys            
+    eval           list           rd             task           
+    exit           log            repeat         timer          
+    extend         mach           runq           tree           
     
-    crash version: 7.0.4    gdb version: 7.6
+    crash version: 8.0.6    gdb version: 10.2
     For help on any command above, enter "help <command>".
     For help on input options, enter "help input".
     For help on output options, enter "help output".
@@ -191,21 +216,22 @@
 
     $ crash vmlinux vmcore
  
-    crash 7.0.4
-    Copyright (C) 2002-2013  Red Hat, Inc.
+    crash 8.0.6
+    Copyright (C) 2002-2022  Red Hat, Inc.
     Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
     Copyright (C) 1999-2006  Hewlett-Packard Co
     Copyright (C) 2005, 2006, 2011, 2012  Fujitsu Limited
     Copyright (C) 2006, 2007  VA Linux Systems Japan K.K.
-    Copyright (C) 2005, 2011  NEC Corporation
+    Copyright (C) 2005, 2011, 2020-2022  NEC Corporation
     Copyright (C) 1999, 2002, 2007  Silicon Graphics, Inc.
     Copyright (C) 1999, 2000, 2001, 2002  Mission Critical Linux, Inc.
+    Copyright (C) 2015, 2021  VMware, Inc.
     This program is free software, covered by the GNU General Public License,
     and you are welcome to change it and/or distribute copies of it under
     certain conditions.  Enter "help copying" to see the conditions.
     This program has absolutely no warranty.  Enter "help warranty" for details.
      
-    GNU gdb 7.6
+    GNU gdb 10.2
     Copyright 2013 Free Software Foundation, Inc.
     License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
     This is free software: you are free to change and redistribute it.
@@ -342,7 +368,7 @@
 
   Alternatively, you can create shared object library files consisting of
   crash command extensions, that can be dynamically linked into the crash
-  executable during runtime or during initialization.  This will allow the
+  executable during runtime or during initialization.  This will allow
   the same shared object to be used with subsequent crash releases without
   having to re-merge the command's code into each new set of crash sources.
   The dynamically linked-in commands will automatically show up in the crash
