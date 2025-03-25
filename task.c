@@ -666,7 +666,8 @@ task_init(void)
 	if (tt->flags & ACTIVE_ONLY)
 		tt->refresh_task_table = refresh_active_task_table;
 
-	tt->refresh_task_table(); 
+	if (!pc->no_refresh)
+		tt->refresh_task_table();
 
 	if (tt->flags & TASK_REFRESH_OFF) 
 		tt->flags &= ~(TASK_REFRESH|TASK_REFRESH_OFF);

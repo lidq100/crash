@@ -53,6 +53,7 @@ static struct option long_options[] = {
 	{"xen_phys_start", required_argument, 0, 0},
 	{"zero_excluded", 0, 0, 0},
 	{"no_panic", 0, 0, 0},
+	{"no_refresh", 0, 0, 0},
         {"more", 0, 0, 0},
         {"less", 0, 0, 0},
         {"CRASHPAGER", 0, 0, 0},
@@ -191,6 +192,9 @@ main(int argc, char **argv)
 
 		        else if (STREQ(long_options[option_index].name, "no_panic")) 
 				tt->flags |= PANIC_TASK_NOT_FOUND;
+
+		        else if (STREQ(long_options[option_index].name, "no_refresh"))
+				pc->no_refresh = 1;
 
 		        else if (STREQ(long_options[option_index].name, "no_strip")) 
 				st->flags |= NO_STRIP;

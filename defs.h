@@ -458,6 +458,7 @@ struct program_context {
 	ushort port;                    /* network daemon port */
 	int rmfd;                       /* remote server memory source fd */
 	int rkfd;                       /* remote server /dev/kmem fd */
+	int no_refresh;                 /* refresh task table */
 	ulong program_pid;              /* program pid */
 	ulong server_pid;               /* server pid */
 	ulong rcvbufsize;               /* client-side receive buffer size */
