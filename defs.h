@@ -452,6 +452,7 @@ struct program_context {
 	int mfd;			/* /dev/mem fd */
 	int kfd;			/* /dev/kmem fd */
 	int dfd;			/* dumpfile fd */
+	int vmap;			/* kernel stack is vmapped */
 	int confd;			/* console fd */
 	int sockfd;                     /* network daemon socket */
 	ushort port;                    /* network daemon port */
@@ -3166,6 +3167,7 @@ typedef struct QEMUCPUState QEMUCPUState;
 #define IS_VMALLOC_ADDR(X) 	arm_is_vmalloc_addr((ulong)(X))
 
 #define DEFAULT_MODULES_VADDR	(machdep->kvbase - 16 * 1024 * 1024)
+#define VMAP_MODULES_VADDR	(machdep->kvbase - 64 * 1024 * 1024)
 #define MODULES_VADDR   	(machdep->machspec->modules_vaddr)
 #define MODULES_END     	(machdep->machspec->modules_end)
 #define VMALLOC_START   	(machdep->machspec->vmalloc_start_addr)
@@ -3268,6 +3270,9 @@ typedef u64 pte_t;
 		machdep->machspec->last_ptbl_read_lpae \
 						= (ulonglong)(PTBL); 	    \
 	}
+#define PAGE_SHIFT	(12)
+#define PAGE_SIZE	(1UL << PAGE_SHIFT)
+#define THREAD_SIZE	(2 * PAGE_SIZE)
 #endif  /* ARM */
 
 #ifndef EM_AARCH64

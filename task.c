@@ -3172,6 +3172,10 @@ fill_task_struct(ulong task)
 char *
 fill_thread_info(ulong thread_info)
 {
+#ifdef ARM
+		if (pc->vmap)
+			thread_info += THREAD_SIZE - SIZE(thread_info);
+#endif
         if (!IS_LAST_THREAD_INFO_READ(thread_info)) {
                 if (!readmem(thread_info, KVADDR, tt->thread_info,
                         SIZE(thread_info), "fill_thread_info",

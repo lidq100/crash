@@ -702,7 +702,10 @@ arm_is_module_addr(ulong vaddr)
 		 * called, we use defaults here which is 16MB below kernel start
 		 * address.
 		 */
-		modules_start = DEFAULT_MODULES_VADDR;
+		if (pc->vmap)
+			modules_start = VMAP_MODULES_VADDR;
+		else
+			modules_start = DEFAULT_MODULES_VADDR;
 	} else {
 		modules_start = MODULES_VADDR;
 	}

@@ -2361,6 +2361,7 @@ readmem(ulonglong addr, int memtype, void *buffer, long size,
 	physaddr_t paddr;
 	ulonglong pseudo;
 	char *bufptr;
+	int not_mapped;
 
 	if (CRASHDEBUG(4))
 		fprintf(fp, "<readmem: %llx, %s, \"%s\", %ld, %s, %lx>\n", 
@@ -2417,6 +2418,7 @@ readmem(ulonglong addr, int memtype, void *buffer, long size,
         }
 
         while (size > 0) {
+		not_mapped = 0;
 		switch (memtype)
 		{
 		case UVADDR:
@@ -2442,6 +2444,10 @@ readmem(ulonglong addr, int memtype, void *buffer, long size,
 
 		case KVADDR:
                 	if (!kvtop(CURRENT_CONTEXT(), addr, &paddr, 0)) {
+				if (pc->vmap) { /* fill 0 for out buffer if vmap enabled */
+					not_mapped = 1;
+					break;
+				}
                         	if (PRINT_ERROR_MESSAGE)
                                 	error(INFO, INVALID_KVADDR, addr, type);
                         	goto readmem_error;
@@ -2482,6 +2488,13 @@ readmem(ulonglong addr, int memtype, void *buffer, long size,
 		else
 			pc->curcmd_flags &= ~MEMTYPE_KVADDR;
 
+		if (pc->vmap && not_mapped) { /* fill 0 for out buffer if vmap enabled */
+			memset(bufptr, 0, cnt);
+			addr += cnt;
+			bufptr += cnt;
+			size -= cnt;
+			continue;
+		}
 		switch (READMEM(fd, bufptr, cnt, 
 		    (memtype == PHYSADDR) || (memtype == XENMACHADDR) ? 0 : addr, paddr))
 		{

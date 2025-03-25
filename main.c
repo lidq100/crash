@@ -35,6 +35,7 @@ static struct option long_options[] = {
         {"memory_device", required_argument, 0, 0},
         {"no_kallsyms", 0, 0, 0},
         {"no_modules", 0, 0, 0},
+        {"vmap", 0, 0, 0},
         {"help", optional_argument, 0, 'h'},
 	{"no_data_debug", 0, 0, 0},
 	{"no_crashrc", 0, 0, 0},
@@ -108,6 +109,10 @@ main(int argc, char **argv)
 		        else if (STREQ(long_options[option_index].name, 
 			    "no_modules")) 
 				kt->flags |= NO_MODULE_ACCESS;
+
+		        else if (STREQ(long_options[option_index].name,
+			    "vmap"))
+				pc->vmap = 1;
 
 		        else if (STREQ(long_options[option_index].name, 
 			    "no_ikconfig")) 

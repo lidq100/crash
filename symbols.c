@@ -2290,7 +2290,7 @@ store_module_symbols_v2(ulong total, int mods_installed)
 	char buf4[BUFSIZE];
 	char *strbuf, *modbuf, *modsymbuf;
 	struct syment *sp;
-	ulong first, last;
+	ulong first, last, modname;
 
 	st->mods_installed = mods_installed;
 
@@ -2462,11 +2462,13 @@ store_module_symbols_v2(ulong total, int mods_installed)
 
 			BZERO(buf1, BUFSIZE);
 
+			modname = modsym_name(syms, modsym, i);
 			if (strbuf) 
-				strcpy(buf1,
-					&strbuf[modsym_name(syms, modsym, i) - first]);
+				if (modname)
+					strcpy(buf1,
+						&strbuf[modname - first]);
 			else 
-				read_string(modsym_name(syms, modsym, i), buf1,
+				read_string(modname, buf1,
                             		BUFSIZE-1);
 
                 	if (strlen(buf1)) {
@@ -2535,11 +2537,13 @@ store_module_symbols_v2(ulong total, int mods_installed)
 
 			BZERO(buf1, BUFSIZE);
 
+			modname = modsym_name(syms, modsym, i);
 			if (strbuf) 
-				strcpy(buf1,
-					&strbuf[modsym_name(gpl_syms, modsym, i) - first]);
+				if (modname)
+					strcpy(buf1,
+						&strbuf[modname - first]);
 			else 
-				read_string(modsym_name(gpl_syms, modsym, i), buf1,
+				read_string(modname, buf1,
                             		BUFSIZE-1);
 
                 	if (strlen(buf1)) {
