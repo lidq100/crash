@@ -2079,6 +2079,8 @@ store_module_symbols_6_4(ulong total, int mods_installed)
 				strbuf = NULL;
 			}
 		}
+		else
+			strbuf = NULL;
 
 
 		for (i = 0; i < nsyms; i++) {
@@ -5466,8 +5468,14 @@ old_module:
 int
 in_ksymbol_range(ulong value)
 {
+	int i;
+	for (i = st->symcnt-1; i >= 0; i--) {
+		if (!strstr(st->symtable[i].name, "xen_elfnote"))
+			break;
+	}
+
         if ((value >= st->symtable[0].value) && 
-	    (value <= st->symtable[st->symcnt-1].value)) {
+	    (value <= st->symtable[i].value)) {
 		if ((st->flags & PERCPU_SYMS) && (value < st->first_ksymbol))
 			return FALSE;
 		else
