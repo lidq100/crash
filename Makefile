@@ -117,7 +117,7 @@ CFILES=main.c tools.c global_data.c memory.c filesys.c help.c task.c \
 	lkcd_common.c lkcd_v1.c lkcd_v2_v3.c lkcd_v5.c lkcd_v7.c lkcd_v8.c\
 	lkcd_fix_mem.c s390_dump.c lkcd_x86_trace.c \
 	netdump.c diskdump.c makedumpfile.c xendump.c unwind.c unwind_decoder.c \
-	unwind_x86_32_64.c unwind_arm.c \
+	unwind_x86_32_64.c unwind_arm.c uncompress.c\
 	xen_hyper.c xen_hyper_command.c xen_hyper_global_data.c \
 	xen_hyper_dump_tables.c kvmdump.c qemu.c qemu-load.c sadump.c ipcs.c \
 	ramdump.c vmware_vmss.c vmware_guestdump.c \
@@ -139,7 +139,7 @@ OBJECT_FILES=main.o tools.o global_data.o memory.o filesys.o help.o task.o \
 	lkcd_common.o lkcd_v1.o lkcd_v2_v3.o lkcd_v5.o lkcd_v7.o lkcd_v8.o \
 	lkcd_fix_mem.o s390_dump.o netdump.o diskdump.o makedumpfile.o xendump.o \
 	lkcd_x86_trace.o unwind_v1.o unwind_v2.o unwind_v3.o \
-	unwind_x86_32_64.o unwind_arm.o \
+	unwind_x86_32_64.o unwind_arm.o uncompress.o\
 	xen_hyper.o xen_hyper_command.o xen_hyper_global_data.o \
 	xen_hyper_dump_tables.o kvmdump.o qemu.o qemu-load.o sadump.o ipcs.o \
 	ramdump.o vmware_vmss.o vmware_guestdump.o \
@@ -553,6 +553,9 @@ unwind_x86_32_64.o: ${GENERIC_HFILES} ${UNWIND_HFILES} unwind_x86_32_64.c
 
 unwind_arm.o: ${GENERIC_HFILES} ${UNWIND_HFILES} unwind_arm.c
 	${CC} -c ${CRASH_CFLAGS} unwind_arm.c -o unwind_arm.o ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+uncompress.o: ${GENERIC_HFILES} ${UNWIND_HFILES} uncompress.c
+	${CC} -c ${CRASH_CFLAGS} uncompress.c -o uncompress.o ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 unwind_v1.o: ${GENERIC_HFILES} ${UNWIND_HFILES} unwind.c unwind_decoder.c
 	${CC} -c ${CRASH_CFLAGS} unwind.c -DREDHAT -DUNWIND_V1 -o unwind_v1.o ${WARNING_OPTIONS} ${WARNING_ERROR}

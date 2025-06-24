@@ -8,6 +8,7 @@
 ## v1.1 (2025-06-12)
 ### fix ubuntu22 float error
 - build on ubuntu22 (glibc v2.35), fix for glibc float error:
+```c
 	Fatal signal: Floating point exception
 	----- Backtrace -----
 	0x51c4f6 ???
@@ -34,6 +35,19 @@
 	debugging is not possible.  GDB will now terminate.
 	
 	This is a bug, please report it.
+```
+## v1.2 2025.06.20  add tools uncompress with parameter --umcompress.
+```
+    Usage: 
+        --uncompress [-b|-s] -i [in_file] -o [out_file]
+        eg: crash --uncompress -b -i ./crashdump-1.bin -o ./DUMP
 
-
-
+    Parameter:
+        --uncompress: Use uncompress. All following parameters apply to this feature.
+         -s: for old ramdump(bl2z), can only uncompress small ddr.
+         -b: for new ramdump(bl33z), can also uncompress big ddr(2G/4G/8G)
+         -i: input compress DUMP file. eg: ./crash-dump-1.bin
+         -o: output uncompress DUMP file. eg: ./DUMP
+         -d: set debug level. Default 0, and set to 1 to output more logs.
+         -h: show this help info.
+```

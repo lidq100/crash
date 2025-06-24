@@ -20,6 +20,7 @@
 #include <curses.h>
 #include <getopt.h>
 #include <sys/prctl.h>
+#include "lz4defs.h"
 
 static void setup_environment(int, char **);
 static int is_external_command(void);
@@ -42,6 +43,7 @@ static struct option long_options[] = {
 	{"no_kmem_cache", 0, 0, 0},
 	{"kmem_cache_delay", 0, 0, 0},
 	{"readnow", 0, 0, 0},
+	{"uncompress", 0, 0, 0},
 	{"smp", 0, 0, 0},
 	{"machdep", required_argument, 0, 0},
 	{"version", 0, 0, 0},
@@ -82,6 +84,11 @@ main(int argc, char **argv)
 {
 	int i, c, option_index;
 	char *tmpname;
+	int uncompress_en = 0;
+	int uncompress_version = RAMDUMP_NEW_BL33Z_VER;
+	int debug_level = 0;
+    char *in_file = NULL;
+    char *out_file = NULL;
 
 	setup_environment(argc, argv);
 
@@ -90,7 +97,7 @@ main(int argc, char **argv)
 	 */
 	opterr = 0;
 	optind = 0;
-	while((c = getopt_long(argc, argv, "Lkgh::e:i:sSvc:d:tfp:m:xo:",
+	while((c = getopt_long(argc, argv, "Lkgh::e:i:bsSvc:d:tfp:m:xo:",
        		long_options, &option_index)) != -1) {
 		switch (c)
 		{
@@ -134,6 +141,10 @@ main(int argc, char **argv)
 		        else if (STREQ(long_options[option_index].name, 
 			    "readnow")) 
 				pc->flags |= READNOW;
+
+				else if (STREQ(long_options[option_index].name,
+					"uncompress"))
+					uncompress_en = 1;
 
 		        else if (STREQ(long_options[option_index].name, 
 			    "smp")) 
@@ -331,6 +342,10 @@ main(int argc, char **argv)
 			 * We want to accept "--help commands" or "-h commands".
 			 * So we must do that part ourselves.
 			 */
+			if (uncompress_en == 1) {
+				show_uncompress_usage();
+				return 0;
+			}
 			if (optarg != NULL)
 				cmd_usage(optarg, COMPLETE_HELP|PIPE_TO_SCROLL|MUST_HELP);
 			else if (argv[optind] != NULL && argv[optind][0] != '-')
@@ -357,8 +372,12 @@ main(int argc, char **argv)
 			break;
 
 		case 'i':
-			pc->input_file = optarg;
-			pc->flags |= CMDLINE_IFILE;
+			if (uncompress_en == 1) {
+				in_file = optarg;
+			} else {
+				pc->input_file = optarg;
+				pc->flags |= CMDLINE_IFILE;
+			}
 			break;
 
 		case 'v':
@@ -367,10 +386,26 @@ main(int argc, char **argv)
 			display_gdb_banner();
 			clean_exit(0);
 
+		case 'b':
+			if (uncompress_en == 1) {
+				uncompress_version = RAMDUMP_NEW_BL33Z_VER;
+				printf("uncompress: use new version head.\n");
+				break;
+			} else {
+				pc->flags |= VERSION_QUERY;
+				display_version();
+				display_gdb_banner();
+				clean_exit(0);
+			}
+
 		case 's':
-			pc->flags |= SILENT;
-			pc->flags &= ~SCROLL;
-//   			pc->scroll_command = SCROLL_NONE;   (why?)
+			if (uncompress_en == 1) {
+				uncompress_version = RAMDUMP_OLD_BL2Z_VER;
+			} else {
+				pc->flags |= SILENT;
+				pc->flags &= ~SCROLL;
+	//   			pc->scroll_command = SCROLL_NONE;   (why?)
+			}
 			break;
 
 		case 'L':
@@ -390,9 +425,14 @@ main(int argc, char **argv)
 			break;
 
 		case 'd': 
-			pc->debug = atol(optarg);
-			set_lkcd_debug(pc->debug);
-			set_vas_debug(pc->debug);
+			if (uncompress_en == 1) {
+				debug_level = atol(optarg);
+				printf("uncompress: set debug enable = %d\n", debug_level);
+			} else {
+				pc->debug = atol(optarg);
+				set_lkcd_debug(pc->debug);
+				set_vas_debug(pc->debug);
+			}
 			break;
 
 		case 'p':
@@ -416,7 +456,11 @@ main(int argc, char **argv)
 			break;
 
 		case 'o':
-			ramdump_elf_output_file(optarg);
+			if (uncompress_en == 1) {
+				out_file = optarg;
+			} else {
+				ramdump_elf_output_file(optarg);
+			}
 			break;
 
 		default:
@@ -429,6 +473,10 @@ main(int argc, char **argv)
 
 	display_version();
 
+	if (uncompress_en == 1) {
+		uncompress_fulldump_file(in_file, out_file, uncompress_version, debug_level);
+		return 0;
+	}
 	/*
 	 *  Take the kernel and dumpfile arguments in either order.
 	 */

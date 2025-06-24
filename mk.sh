@@ -7,6 +7,12 @@
 #       * add --vmap args to support vmap stack
 #       * add --no_refresh args to fix ARM32 parsing errors.
 #       * Add build script mk.sh
+# v1.1: 2025.06.12
+#       build on ubuntu22, fix for glibc float error
+#       * error info: Fatal signal: Floating point exception...__libc_early_init...
+# v1.2: 2025.06.20
+#       add tools uncompress with parameter --umcompress.
+#       * cmd example: --uncompress -b -i ./crashdump-1.bin -o dump
 #=================================================================
 
 #============================= env setup =========================
@@ -43,7 +49,7 @@
 # Manually apply the a.patch to the corresponding files in gdb-16.2.patch
 #=================================================================
 
-LAST_VER="v1.1"
+LAST_VER="v1.2"
 
 show_help() {
 	echo ""
@@ -53,8 +59,9 @@ show_help() {
 	echo "  32 64  Compile both 32-bit and 64-bit targets"
 	echo ""
 	echo "Version: ${LAST_VER}"
-	echo "  v10: 2025.03.25 crash8.0.6+, gdb-16.2, static, strip. support --vmap."
-	echo "  v11: 2025.06.12 build on ubuntu22, fix for glibc float error."
+	echo "  v1.0: 2025.03.25 crash8.0.6+, gdb-16.2, static, strip. support --vmap."
+	echo "  v1.1: 2025.06.12 build on ubuntu22, fix for glibc float error."
+	echo "  v1.2: 2025.06.20 add tools uncompress. with parameter --umcompress."
 	echo ""
 	exit 1
 }
