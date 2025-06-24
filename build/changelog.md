@@ -1,13 +1,15 @@
 # Amlogic Crash-Tools Changelog
 
 
-## v1.0 (2025-03-25)
-### init repo for crash static
-- crash8.0.6+, gdb-16.2, static, strip, support --vmap
-
-## v1.1 (2025-06-12)
-### fix ubuntu22 float error
-- build on ubuntu22 (glibc v2.35), fix for glibc float error:
+## v1.0 2025-03-25 init repo for crash static
+```
+    crash8.0.6+, gdb-16.2, static, strip, support --vmap
+    * Build crash tool statically linked and stripped.
+    * add --vmap args to support vmap stack
+    * add --no_refresh args to fix ARM32 parsing errors.
+    * Add build script mk.sh
+```
+## v1.1 2025-06-12 build on ubuntu22 (glibc v2.35), fix for glibc float error
 ```c
 	Fatal signal: Floating point exception
 	----- Backtrace -----
