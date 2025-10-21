@@ -421,7 +421,7 @@ kernel.o: ${GENERIC_HFILES} kernel.c
 	${CC} -c ${CRASH_CFLAGS} kernel.c -I${BFD_DIRECTORY} -I${GDB_INCLUDE_DIRECTORY} ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 printk.o: ${GENERIC_HFILES} printk.c
-	${CC} -c ${CRASH_CFLAGS} printk.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+	${CC} -c ${CRASH_CFLAGS} printk.c -I${GDB_INCLUDE_DIRECTORY} ${WARNING_OPTIONS} ${WARNING_ERROR}
 
 gdb_interface.o: ${GENERIC_HFILES} gdb_interface.c
 	${CC} -c ${CRASH_CFLAGS} gdb_interface.c ${WARNING_OPTIONS} ${WARNING_ERROR}
@@ -730,7 +730,7 @@ extensions: make_configure
 	@$(MAKE) do_extensions
 
 do_extensions:
-	@$(MAKE) -C extensions -i TARGET=$(TARGET) TARGET_CFLAGS="$(CFLAGS) $(TARGET_CFLAGS)" GDB=$(GDB) GDB_FLAGS=$(GDB_FLAGS)
+	@$(MAKE) -C extensions -i CC=$(CC) TARGET=$(TARGET) TARGET_CFLAGS="$(CFLAGS) $(TARGET_CFLAGS)" GDB=$(GDB) GDB_FLAGS=$(GDB_FLAGS)
 
 memory_driver: make_configure 
 	@$(MAKE) -C memory_driver -i

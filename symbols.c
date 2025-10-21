@@ -22,6 +22,7 @@
 #include "config.h"
 #endif
 #include "bfd.h"
+#include "demangle.h"
 
 static void store_symbols(bfd *, int, void *, long, unsigned int);
 static void store_sysmap_symbols(void);
@@ -3280,6 +3281,46 @@ load_module_filter(char *s, int type)
 
 #define AVERAGE_SYMBOL_SIZE (16)
 
+static size_t rust_demangle_symbol(const char *symbol, char *out, size_t out_size)
+{
+	int i;
+	size_t loc = 0;
+	size_t len = strlen(symbol);
+	char *buf = NULL;
+	/*
+	 * Rust symbols always start with _R (v0) or _ZN (legacy)
+	 */
+	const char *mangled_rust[] = {
+		"_R",
+		"_ZN",
+		NULL
+	};
+
+	if (!out || out_size < len)
+		return 0;
+
+	for (i = 0; mangled_rust[i]; i++) {
+		size_t sz = strlen(mangled_rust[i]);
+		char *p = memmem(symbol, len, mangled_rust[i], sz);
+		if (p) {
+			loc = p - symbol;
+			if (loc)
+				memcpy(out, symbol, loc);
+			break;
+		}
+	}
+
+	buf = rust_demangle(symbol + loc, DMGL_RUST);
+	if (buf) {
+		memcpy(out + loc, buf, strlen(buf));
+		free(buf);
+		return 1;
+	} else if (loc != 0)
+		memset(out, 0, loc);
+
+	return 0;
+}
+
 static int
 namespace_ctl(int cmd, struct symbol_namespace *ns, void *nsarg1, void *nsarg2)
 {
@@ -3288,6 +3329,7 @@ namespace_ctl(int cmd, struct symbol_namespace *ns, void *nsarg1, void *nsarg2)
 	char *name;
 	long cnt;
 	int len;
+	char demangled[BUFSIZE] = {0};
 
 	switch (cmd)
 	{
@@ -3321,6 +3363,10 @@ namespace_ctl(int cmd, struct symbol_namespace *ns, void *nsarg1, void *nsarg2)
 		sp = (struct syment *)nsarg1;
 		name = (char *)nsarg2;
 		len = strlen(name)+1;
+		if (rust_demangle_symbol(name, demangled, sizeof(demangled))) {
+			len = strlen(demangled) + 1;
+			name = demangled;
+		}
 		if ((ns->index + len) >= ns->size) { 
                         if (!(addr = realloc(ns->address, ns->size*2))) 
 				error(FATAL, "symbol name space malloc: %s\n",
@@ -4543,7 +4589,7 @@ is_shared_object(char *file)
 
 		case EM_X86_64:
 			if (machine_type("X86_64") || machine_type("ARM64") ||
-			    machine_type("PPC64"))
+			    machine_type("PPC64") || machine_type("RISCV64"))
 				return TRUE;
 			break;
 
@@ -4888,6 +4934,38 @@ do_multiples:
                 } while(args[optind]);
         }
         else if (!others) 
+		cmd_usage(pc->curcmd, SYNOPSIS);
+}
+
+/*
+ * Demangle a mangled Rust symbol to human readable symbol
+ */
+void cmd_rustfilt(void)
+{
+	int c;
+
+	while ((c = getopt(argcnt, args, "")) != EOF) {
+		switch(c)
+		{
+		default:
+			argerrs++;
+			break;
+		}
+	}
+
+	if (argerrs)
+		cmd_usage(pc->curcmd, SYNOPSIS);
+
+	if (args[optind]) {
+		char *buf;
+
+		buf = rust_demangle(args[optind], DMGL_RUST);
+		if (buf) {
+			fprintf(fp, "%s", buf);
+			free(buf);
+		} else
+			fprintf(fp, "Not a rust symbol: \n%s", args[optind]);
+	} else
 		cmd_usage(pc->curcmd, SYNOPSIS);
 }
 
@@ -10617,6 +10695,10 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(vfsmount_mnt_mountpoint));
         fprintf(fp, "           vfsmount_mnt_parent: %ld\n", 
 		OFFSET(vfsmount_mnt_parent));
+	fprintf(fp, "            vfsmount_mnt_flags: %ld\n",
+		OFFSET(vfsmount_mnt_flags));
+	fprintf(fp, "            proc_mounts_cursor: %ld\n",
+		OFFSET(proc_mounts_cursor));
 	fprintf(fp, "              mount_mnt_parent: %ld\n",
 		OFFSET(mount_mnt_parent));
 	fprintf(fp, "          mount_mnt_mountpoint: %ld\n",
@@ -11491,6 +11573,12 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(blk_mq_tags_nr_reserved_tags));
 	fprintf(fp, "               blk_mq_tags_rqs: %ld\n",
 		OFFSET(blk_mq_tags_rqs));
+	fprintf(fp, "         request_queue_tag_set: %ld\n",
+		OFFSET(request_queue_tag_set));
+	fprintf(fp, "          blk_mq_tag_set_flags: %ld\n",
+		OFFSET(blk_mq_tag_set_flags));
+	fprintf(fp, "    blk_mq_tag_set_shared_tags: %ld\n",
+		OFFSET(blk_mq_tag_set_shared_tags));
 
 	fprintf(fp, "         subsys_private_subsys: %ld\n", OFFSET(subsys_private_subsys));
 	fprintf(fp, "  subsys_private_klist_devices: %ld\n",
@@ -12812,6 +12900,7 @@ calculate_load_order_6_4(struct load_module *lm, bfd *bfd, int dynamic,
 	asymbol *store;
 	asymbol *sym;
 	symbol_info syminfo;
+	bfd_vma secaddr;
 	char *secname;
 	int i, t;
 
@@ -12864,6 +12953,7 @@ calculate_load_order_6_4(struct load_module *lm, bfd *bfd, int dynamic,
 				}
 				if (strcmp(syminfo.name, s1->name) == 0) {
 					secname = (char *)bfd_section_name(sym->section);
+					secaddr = bfd_section_vma(sym->section);
 					break;
 				}
 
@@ -12894,14 +12984,14 @@ calculate_load_order_6_4(struct load_module *lm, bfd *bfd, int dynamic,
 			}
 
 			/* Update the offset information for the section */
-			sec_start = s1->value - syminfo.value;
+			sec_start = s1->value - syminfo.value + secaddr;
 			/* keep the address instead of offset */
 			lm->mod_section_data[i].addr = sec_start;
 			lm->mod_section_data[i].flags |= SEC_FOUND;
 
 			if (CRASHDEBUG(2))
-				fprintf(fp, "update sec offset sym %s @ %lx  val %lx  section %s\n",
-					s1->name, s1->value, (ulong)syminfo.value, secname);
+				fprintf(fp, "update sec offset sym %s @ %lx  val %lx  section %s @ %lx\n",
+					s1->name, s1->value, (ulong)syminfo.value, secname, secaddr);
 
 			if (strcmp(secname, ".text") == 0)
 				lm->mod_text_start = sec_start;

@@ -1083,7 +1083,7 @@ struct machdep_table {
         void (*get_irq_affinity)(int);
         void (*show_interrupts)(int, ulong *);
 	int (*is_page_ptr)(ulong, physaddr_t *);
-	int (*get_current_task_reg)(int, const char *, int, void *);
+	int (*get_current_task_reg)(int, const char *, int, void *, int);
 	int (*is_cpu_prstatus_valid)(int cpu);
 };
 
@@ -2273,6 +2273,11 @@ struct offset_table {                    /* stash of commonly-used offsets */
 	long task_struct_thread_context_x28;
 	long neigh_table_hash_heads;
 	long neighbour_hash;
+	long request_queue_tag_set;
+	long blk_mq_tag_set_flags;
+	long blk_mq_tag_set_shared_tags;
+	long vfsmount_mnt_flags;
+	long proc_mounts_cursor;
 };
 
 struct size_table {         /* stash of commonly-used sizes */
@@ -2450,6 +2455,7 @@ struct size_table {         /* stash of commonly-used sizes */
 	long fred_frame;
 	long vmap_node;
 	long cpumask_t;
+	long task_struct_exit_state;
 };
 
 struct array_table {
@@ -5510,6 +5516,7 @@ void cmd_s390dbf(void);
 #endif
 void cmd_map(void);          /* kvmdump.c */
 void cmd_ipcs(void);         /* ipcs.c */
+void cmd_rustfilt(void);     /* symbols.c */
 
 /*
  *  main.c
@@ -6117,6 +6124,7 @@ extern char *help_wr[];
 extern char *help_s390dbf[];
 #endif
 extern char *help_map[];
+extern char *help_rustfilt[];
 
 /*
  *  task.c
@@ -8329,5 +8337,6 @@ enum ppc64_regnum {
 
 /* crash_target.c */
 extern int gdb_change_thread_context (void);
+extern int gdb_add_substack (int);
 
 #endif /* !GDB_COMMON */
