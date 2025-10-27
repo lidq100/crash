@@ -24,6 +24,7 @@
 # sudo apt install autopoint autoconf automake libtool-bin build-essential bison zlib1g-dev flex
 # sudo apt install libgmp-dev libmpfr-dev m4 libtool gettext texinfo gperf groff
 # sudo apt install libncurses5-dev libncursesw5-dev
+# sudo apt install build-essential libzstd-dev libzstd1 liblzma-dev zlib1g-dev
 #
 # i386_32bit lib-dev:
 # sudo dpkg --add-architecture i386
@@ -32,6 +33,7 @@
 # sudo apt install libc6-dev-i386 libstdc++-12-dev:i386 libgcc-12-dev:i386 zlib1g-dev:i386
 # sudo apt install libgmp-dev:i386 libmpfr-dev:i386 m4:i386 libtool:i386
 # sudo apt install libncurses5-dev:i386 libncursesw5-dev:i386 libtinfo5:i386
+# sudo apt install libzstd-dev:i386 liblzma-dev:i386 zlib1g-dev:i386 libelf-dev:i386
 #=================================================================
 
 #========================== libs version =========================
