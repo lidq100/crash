@@ -49,7 +49,7 @@
 # Manually apply the a.patch to the corresponding files in gdb-16.2.patch
 #=================================================================
 
-LAST_VER="v1.2"
+LAST_VER="v1.3"
 
 show_help() {
 	echo ""
@@ -62,6 +62,7 @@ show_help() {
 	echo "  v1.0: 2025.03.25 crash8.0.6+, gdb-16.2, static, strip. support --vmap."
 	echo "  v1.1: 2025.06.12 build on ubuntu22, fix for glibc float error."
 	echo "  v1.2: 2025.06.20 add tools uncompress. with parameter --umcompress."
+	echo "  v1.3: 2025.10.20 update src code from crash master. crash v9.0.0"
 	echo ""
 	exit 1
 }
@@ -74,7 +75,7 @@ build_32bit() {
 	make target=ARM clean
 	make target=ARM -j$(nproc)
 	mkdir -p ./build
-	cp ./crash ./build/crash8_a32_${LAST_VER}
+	cp ./crash ./build/crash9_a32_${LAST_VER}
 }
 
 build_64bit() {
@@ -85,7 +86,7 @@ build_64bit() {
 	make target=ARM64 clean
 	make target=ARM64 -j$(nproc)
 	mkdir -p ./build
-	cp ./crash ./build/crash8_a64_${LAST_VER}
+	cp ./crash ./build/crash9_a64_${LAST_VER}
 }
 
 if [ $# -eq 0 ]; then
@@ -108,8 +109,8 @@ done
 
 echo ""
 echo "==================================== output =========================================="
-ls -lh ./build/crash8_a*
+ls -lh ./build/crash9_a*
 echo ""
-file ./build/crash8_a*
+file ./build/crash9_a*
 echo "======================================================================================"
 echo ""
