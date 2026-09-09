@@ -80,8 +80,8 @@
 
   To build the crash utility: 
 
-    $ tar -xf crash-9.0.2.tar.gz
-    $ cd crash-9.0.2
+    $ tar -xf crash-9.0.x.tar.gz
+    $ cd crash-9.0.x
     $ make
 
   To cross compile the crash utility for aarch64 on x86_64:
@@ -137,7 +137,7 @@
   If neither /dev/mem or /dev/crash are available, then /proc/kcore will be
   be used as the live memory source.  If /proc/kcore is also restricted, then
   the Red Hat /dev/crash driver may be compiled and installed; its source
-  is included in the crash-9.0.2/memory_driver subdirectory.
+  is included in the crash-9.0.x/memory_driver subdirectory.
 
   If the kernel file is stored in /boot, /, /boot/efi, or in any /usr/src
   or /usr/lib/debug/lib/modules subdirectory, then no command line arguments
@@ -148,7 +148,7 @@
 
     $ crash
     
-    crash 9.0.2
+    crash 9.0.x
     Copyright (C) 2002-2026  Red Hat, Inc.
     Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
     Copyright (C) 1999-2006  Hewlett-Packard Co
@@ -216,7 +216,7 @@
 
     $ crash vmlinux vmcore
  
-    crash 9.0.2
+    crash 9.0.x
     Copyright (C) 2002-2026  Red Hat, Inc.
     Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
     Copyright (C) 1999-2006  Hewlett-Packard Co
