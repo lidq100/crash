@@ -41,7 +41,7 @@
  *
  *   -g  define: GDB
  *
- *   -p  Create or remove .rh_rpm_package file 
+ *   -p  Create or remove crash-release file
  *
  *   -q  Don't print configuration
  *
@@ -60,7 +60,7 @@
 struct supported_gdb_version;
 void build_configure(struct supported_gdb_version *);
 void release_configure(char *, struct supported_gdb_version *);
-void make_rh_rpm_package(char *, int);
+void make_crash_release(char *, int);
 void unconfigure(void);
 void set_warnings(int);
 void show_configuration(void);
@@ -328,10 +328,10 @@ main(int argc, char **argv)
 			release_configure(optarg, sp);
 			break;
 		case 'p':
-			make_rh_rpm_package(optarg, 0);
+			make_crash_release(optarg, 0);
 			break;
 		case 'P':
-			make_rh_rpm_package(optarg, 1);
+			make_crash_release(optarg, 1);
 			break;
 		case 'W':
 		case 'w':
@@ -630,9 +630,9 @@ get_release:
 
 	target_data.release[0] = '\0';
 
-	if (file_exists(".rh_rpm_package")) {
-        	if ((fp = fopen(".rh_rpm_package", "r")) == NULL) {
-			perror(".rh_rpm_package");
+	if (file_exists("crash-release")) {
+		if ((fp = fopen("crash-release", "r")) == NULL) {
+			perror("crash-release");
 		} else {
 			if (fgets(buf, 512, fp)) {
 				strip_linefeeds(buf);
@@ -641,10 +641,10 @@ get_release:
 					strcpy(target_data.release, buf);
 				} else 
 					fprintf(stderr, 
-				   "WARNING: .rh_rpm_package file is empty!\n");
+				   "WARNING: crash-release file is empty!\n");
 			} else
 				fprintf(stderr, 
-				   "WARNING: .rh_rpm_package file is empty!\n");
+				   "WARNING: crash-release file is empty!\n");
 			fclose(fp);
 
 			if (strlen(target_data.release))
@@ -652,7 +652,7 @@ get_release:
 		} 
 	} else 
 		fprintf(stderr, 
-			"WARNING: .rh_rpm_package file does not exist!\n");
+			"WARNING: crash-release file does not exist!\n");
 }
 
 void 
@@ -935,21 +935,21 @@ release_configure(char *gdb_version, struct supported_gdb_version *sp)
 }
 
 /*
- *  Create an .rh_rpm_package file if the passed-in variable is set.
+ *  Create an crash-release file if the passed-in variable is set.
  */
 void 
-make_rh_rpm_package(char *package, int release)
+make_crash_release(char *package, int release)
 {
 	char *p, *cur;
 	FILE *fp;
 	char buf[256];
 
 	if ((strcmp(package, "remove") == 0)) {
-		if (file_exists(".rh_rpm_package")) {
-			if (unlink(".rh_rpm_package")) {
+		if (file_exists("crash-release")) {
+			if (unlink("crash-release")) {
 				perror("unlink");
                 		fprintf(stderr, 
-					"cannot remove .rh_rpm_package\n");
+					"cannot remove crash-release\n");
 				exit(1);
 			}
 		}
@@ -989,9 +989,9 @@ make_rh_rpm_package(char *package, int release)
 		}
 	}
 
-        if ((fp = fopen(".rh_rpm_package", "w")) == NULL) {
+        if ((fp = fopen("crash-release", "w")) == NULL) {
                 perror("fopen");
-                fprintf(stderr, "cannot open .rh_rpm_package\n");
+                fprintf(stderr, "cannot open crash-release\n");
                 exit(1);
         }
 
