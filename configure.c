@@ -653,24 +653,6 @@ get_release:
 	} else 
 		fprintf(stderr, 
 			"WARNING: .rh_rpm_package file does not exist!\n");
-
-        if ((fp = fopen("defs.h", "r")) == NULL) {
-                perror("defs.h");
-		return;
-        }
-
-        while (fgets(buf, 512, fp)) {
-                if (strncmp(buf, "#define BASELEVEL_REVISION", 
-		    strlen("#define BASELEVEL_REVISION")) == 0) {
-			p = strstr(buf, "\"") + 1;
-			strip_linefeeds(p);
-			p[strlen(p)-1] = '\0';
-			strcpy(target_data.release, p);
-			break;
-		}
-	}
-
-	fclose(fp);
 }
 
 void 
