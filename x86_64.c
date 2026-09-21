@@ -999,6 +999,8 @@ x86_64_dump_machdep_table(ulong arg)
 		fprintf(fp, "                    module_ORC: %s\n", ms->orc.module_ORC ? "TRUE" : "FALSE");
 		fprintf(fp, "                    has_signal: %s\n", ms->orc.has_signal ? "TRUE" : "FALSE");
 		fprintf(fp, "                       has_end: %s\n", ms->orc.has_end    ? "TRUE" : "FALSE");
+		fprintf(fp, "                        reg_sp: %d\n", ms->orc.reg_sp);
+		fprintf(fp, "                   reg_prev_sp: %d\n", ms->orc.reg_prev_sp);
 		fprintf(fp, "             lookup_num_blocks: %d\n", ms->orc.lookup_num_blocks);
 		fprintf(fp, "         __start_orc_unwind_ip: %lx\n", ms->orc.__start_orc_unwind_ip);
 		fprintf(fp, "          __stop_orc_unwind_ip: %lx\n", ms->orc.__stop_orc_unwind_ip);
@@ -3229,14 +3231,23 @@ x86_64_print_stack_entry(struct bt_info *bt, FILE *ofp, int level,
 	if (!(bt->flags & BT_SAVE_EFRAME_IP))
 		bt->eframe_ip = 0;
 	offset = 0;
-	sp = value_search(text, &offset);
+	if (bt->flags & BT_SAVE_EFRAME_IP)
+		sp = value_search(text, &offset);
+	else {
+		sp = value_search(text-1, &offset);
+		offset++;
+	}
 	if (!sp)
 		return BACKTRACE_ENTRY_IGNORED;
 
 	name = sp->name;
 
 	if (offset && (bt->flags & BT_SYMBOL_OFFSET))
-		name_plus_offset = value_to_symstr(text, buf2, bt->radix);
+		if (bt->flags & BT_SAVE_EFRAME_IP)
+			name_plus_offset = value_to_symstr(text, buf2, bt->radix);
+		else
+			/* text-1 is used in the function */
+			name_plus_offset = value_to_symstr_trace(text, buf2, bt->radix);
 	else
 		name_plus_offset = NULL;
 
@@ -3337,7 +3348,10 @@ x86_64_print_stack_entry(struct bt_info *bt, FILE *ofp, int level,
 	fprintf(ofp, "\n");
 
         if (bt->flags & BT_LINE_NUMBERS) {
-                get_line_number(text, buf1, FALSE);
+		if (bt->flags & BT_SAVE_EFRAME_IP)
+			get_line_number(text, buf1, FALSE);
+		else
+			get_line_number(text-1, buf1, FALSE);
                 if (strlen(buf1))
                         fprintf(ofp, "    %s\n", buf1);
 	}
@@ -3864,8 +3878,10 @@ in_exception_stack:
 			}
 
 			level++;
+			bt->flags |= BT_SAVE_EFRAME_IP;
 			if ((framesize = x86_64_get_framesize(bt, bt->instptr, rsp, NULL)) >= 0)
 				rsp += framesize;
+			bt->flags &= ~BT_SAVE_EFRAME_IP;
 		}
 	}
 
@@ -6720,6 +6736,30 @@ x86_64_ORC_init(void)
 	if (orc->has_signal && !orc->has_end)
 		machdep->flags |= ORC_6_4;
 
+	/* Try get ORC_REG_(PREV)_SP */
+	ORC_REG_SP = 5;
+	ORC_REG_PREV_SP = 1;
+
+	if (kernel_symbol_exists("orc_fp_entry")) {
+		/*
+		 * kernel_orc_entry_6_4 & kernel_orc_entry have the same
+		 * offset of bp_reg.
+		 */
+		kernel_orc_entry_6_4 entry = {0};
+		if (try_get_symbol_data("orc_fp_entry", sizeof(entry), &entry)) {
+			/*
+			 * orc_fp_entry.bp_reg = ORC_REG_PREV_SP
+			 * See kernel commit 1735858caa4b. Use ORC_REG_PREV_SP
+			 * as the indicator of the commit.
+			 */
+			if (entry.bp_reg == 8) {
+				ORC_REG_SP = 3;
+				ORC_REG_PREV_SP = 8;
+			}
+		} else
+			error(WARNING, "Cannot get orc_fp_entry.bp_reg info");
+	}
+
 	machdep->flags |= ORC;
 }
 
@@ -8811,7 +8851,13 @@ x86_64_get_framesize(struct bt_info *bt, ulong textaddr, ulong rsp, char *stack_
 			return 0;
 	}
 
-        if (!(sp = value_search(textaddr, &offset))) {
+	if (bt->flags & BT_SAVE_EFRAME_IP)
+		sp = value_search(textaddr, &offset);
+	else {
+		sp = value_search(textaddr-1, &offset);
+		offset++;
+	}
+	if (!sp) {
 		if (!(bt->flags & BT_FRAMESIZE_DEBUG))
 			bt->flags |= BT_FRAMESIZE_DISABLE;
                 return 0;
@@ -8887,7 +8933,8 @@ x86_64_get_framesize(struct bt_info *bt, ulong textaddr, ulong rsp, char *stack_
 	if ((sp->value >= kt->init_begin) && (sp->value < kt->init_end))
 		return 0;
 
-	if ((machdep->flags & ORC) && (korc = orc_find(textaddr))) {
+	if ((machdep->flags & ORC) &&
+	    (korc = orc_find(bt->flags & BT_SAVE_EFRAME_IP ? textaddr : textaddr-1))) {
 		if (CRASHDEBUG(1)) {
 			struct ORC_data *orc = &machdep->machspec->orc;
 			fprintf(fp, 
@@ -9383,6 +9430,8 @@ x86_64_get_current_task_reg(int regno, const char *name,
 
 	BZERO(&bt_setup, sizeof(struct bt_info));
 	clone_bt_info(&bt_setup, &bt_info, tc);
+	if (bt_info.stackbase == 0)
+		return FALSE;
 	fill_stackbuf(&bt_info);
 
 	// reusing the get_dumpfile_regs function to get pt regs structure

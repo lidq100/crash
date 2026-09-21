@@ -107,8 +107,8 @@ static void foreach_cleanup(void *);
 static void ps_cleanup(void *);
 static char *task_pointer_string(struct task_context *, ulong, char *);
 static int panic_context_adjusted(struct task_context *tc);
-static void show_last_run(struct task_context *, struct psinfo *);
-static void show_milliseconds(struct task_context *, struct psinfo *);
+static void show_last_run(ulong, struct task_context *, struct psinfo *);
+static void show_milliseconds(ulong, struct task_context *, struct psinfo *);
 static char *translate_nanoseconds(ulonglong, char *);
 static int sort_by_last_run(const void *arg1, const void *arg2);
 static void sort_context_array_by_last_run(void);
@@ -118,6 +118,8 @@ static void parse_task_thread(int argcnt, char *arglist[], struct task_context *
 static void stack_overflow_check_init(void);
 static int has_sched_policy(ulong, ulong);
 static ulong task_policy(ulong);
+static const char *task_policy_name(ulong);
+static int task_prio(ulong);
 static ulong sched_policy_bit_from_str(const char *);
 static ulong make_sched_policy(const char *);
 void crash_get_current_task_info(unsigned long *, char **);
@@ -739,6 +741,18 @@ irqstacks_init(void)
 		error(FATAL, "cannot malloc softirq_ctx space.");
 	if (!(tt->softirq_tasks = (ulong *)calloc(NR_CPUS, sizeof(ulong))))
 		error(FATAL, "cannot malloc softirq_tasks space.");
+
+	/*
+	 *  With the stack size adjusted from 16k to 32k for ppc64le,
+	 *  such as rhel-9.4.z. We need to ensure that SIZE(irq_ctx) is
+	 *  correctly set so the unwinder doesn't prematurely bail
+	 *  when switching between the kernel stack and irq stacks.
+	 *  The stack size is updated in task_init(), which calls
+	 *  this routine, irqstacks_init() after checking for the
+	 *  existence of irq_ctx.
+	 */
+	if (STACKSIZE() > SIZE(irq_ctx))
+		ASSIGN_SIZE(irq_ctx) = STACKSIZE();
 
 	thread_info_buf = GETBUF(SIZE(irq_ctx));
 
@@ -3527,7 +3541,7 @@ cmd_ps(void)
 	cpuspec = NULL;
 	flag = 0;
 
-        while ((c = getopt(argcnt, args, "HASgstcpkuGlmarC:y:")) != EOF) {
+        while ((c = getopt(argcnt, args, "HAISgstcpkuGlmarC:y:Y")) != EOF) {
                 switch(c)
 		{
 		case 'k':
@@ -3636,6 +3650,15 @@ cmd_ps(void)
 		case 'A':
 			check_ps_exclusive(flag, PS_ACTIVE);
 			flag |= PS_ACTIVE;
+			break;
+
+		case 'I':
+			flag |= PS_EXCLUDE_IDLE;
+			break;
+
+		case 'Y':
+			check_ps_exclusive(flag, PS_POLICY_DATA);
+			flag |= PS_POLICY_DATA;
 			break;
 
 		case 'H':
@@ -3787,6 +3810,8 @@ show_ps_data(ulong flag, struct task_context *tc, struct psinfo *psi)
 		return;
 	if ((flag & PS_POLICY) && !has_sched_policy(tc->task, psi->policy))
 		return;
+    if (tc && (flag & PS_EXCLUDE_IDLE) && is_idle_thread(tc->task))
+		return;
 	if (flag & PS_GROUP) {
 		if (flag & (PS_LAST_RUN|PS_MSECS))
 			error(FATAL, "-G not supported with -%c option\n",
@@ -3809,6 +3834,31 @@ show_ps_data(ulong flag, struct task_context *tc, struct psinfo *psi)
 		}
 	}
 
+	if (flag & PS_POLICY_DATA) {
+		task_active = is_task_active(tc->task);
+
+		if (task_active) {
+			if (hide_offline_cpu(tc->processor))
+				fprintf(fp, "- ");
+			else
+				fprintf(fp, "> ");
+		} else
+			fprintf(fp, "  ");
+
+		fprintf(fp, "%7ld %7ld %3s  %s  %-12s %4d  ",
+			tc->pid, task_to_pid(tc->ptask),
+			task_cpu(tc->processor, buf2, !VERBOSE),
+			task_pointer_string(tc, flag & PS_KSTACKP, buf3),
+			task_policy_name(tc->task),
+			task_prio(tc->task));
+
+		if (is_kernel_thread(tc->task))
+			fprintf(fp, "[%s]\n", tc->comm);
+		else
+			fprintf(fp, "%s\n", tc->comm);
+		return;
+	}
+
 	if (flag & PS_PPID_LIST) {
 		parent_list(tc->task);
 		fprintf(fp, "\n");
@@ -3820,11 +3870,11 @@ show_ps_data(ulong flag, struct task_context *tc, struct psinfo *psi)
 		return;
 	}
 	if (flag & (PS_LAST_RUN)) {
-		show_last_run(tc, psi);
+		show_last_run(flag, tc, psi);
 		return;
 	}
 	if (flag & (PS_MSECS)) {
-		show_milliseconds(tc, psi);
+		show_milliseconds(flag, tc, psi);
 		return;
 	}
 	if (flag & PS_ARGV_ENVP) {
@@ -3884,10 +3934,18 @@ show_ps(ulong flag, struct psinfo *psi)
 
 	if (!(flag & ((PS_EXCLUSIVE & ~PS_ACTIVE)|PS_NO_HEADER))) 
 		fprintf(fp, 
-		    "      PID    PPID  CPU %s  ST  %%MEM      VSZ      RSS  COMM\n",
+		    "      PID    PPID  CPU/NUMA %s  ST  %%MEM      VSZ      RSS  COMM\n",
 			flag & PS_KSTACKP ?
 			mkstring(buf, VADDR_PRLEN, CENTER|RJUST, "KSTACKP") :
 			mkstring(buf, VADDR_PRLEN, CENTER, "TASK"));
+
+	if ((flag & PS_POLICY_DATA) && !(flag & PS_NO_HEADER)) {
+		fprintf(fp,
+		    "      PID    PPID  CPU/NUMA %s  POLICY       PRIO  COMM\n",
+			flag & PS_KSTACKP ?
+			mkstring(buf, VADDR_PRLEN, CENTER|RJUST, "KSTACKP") :
+			mkstring(buf, VADDR_PRLEN, CENTER, "TASK"));
+	}
 
 	if (flag & PS_SHOW_ALL) {
 
@@ -3981,7 +4039,7 @@ show_ps_summary(ulong flag)
 		char string[3];
 	} ps_state[MAX_STATES];
 
-	if (flag & (PS_USER|PS_KERNEL|PS_GROUP))
+	if (flag & (PS_USER|PS_KERNEL|PS_GROUP|PS_EXCLUDE_IDLE|PS_POLICY_DATA))
 		error(FATAL, "-S option cannot be used with other options\n");
 
 	for (s = 0; s < MAX_STATES; s++)
@@ -4016,7 +4074,7 @@ show_ps_summary(ulong flag)
  *  current state.
  */
 static void
-show_last_run(struct task_context *tc, struct psinfo *psi)
+show_last_run(ulong flag, struct task_context *tc, struct psinfo *psi)
 {
 	int i, c, others;
 	struct task_context *tcp;
@@ -4046,6 +4104,8 @@ show_last_run(struct task_context *tc, struct psinfo *psi)
 			for (i = 0; i < RUNNING_TASKS(); i++, tcp++) {
 				if (tcp->processor != c)
 					continue;
+				if ((flag & PS_EXCLUDE_IDLE) && is_idle_thread(tcp->task))
+					continue;
 				fprintf(fp, format, task_last_run(tcp->task));
 				fprintf(fp, "[%s]  ", 
 					task_state_string(tcp->task, buf, !VERBOSE));
@@ -4059,6 +4119,8 @@ show_last_run(struct task_context *tc, struct psinfo *psi)
 	} else {
 		tcp = FIRST_CONTEXT();
 		for (i = 0; i < RUNNING_TASKS(); i++, tcp++) {
+			if ((flag & PS_EXCLUDE_IDLE) && is_idle_thread(tcp->task))
+				continue;
 			fprintf(fp, format, task_last_run(tcp->task));
 			fprintf(fp, "[%s]  ", task_state_string(tcp->task, buf, !VERBOSE));
 			print_task_header(fp, tcp, FALSE);
@@ -4097,7 +4159,7 @@ translate_nanoseconds(ulonglong value, char *buf)
  *  sched_info.last_arrival and its current state.
  */
 static void
-show_milliseconds(struct task_context *tc, struct psinfo *psi)
+show_milliseconds(ulong flag, struct task_context *tc, struct psinfo *psi)
 {
 	int i, c, others, days, max_days;
 	struct task_context *tcp;
@@ -4147,6 +4209,8 @@ show_milliseconds(struct task_context *tc, struct psinfo *psi)
 			for (i = 0; i < RUNNING_TASKS(); i++, tcp++) {
 				if (tcp->processor != c)
 					continue;
+				if ((flag & PS_EXCLUDE_IDLE) && is_idle_thread(tcp->task))
+					continue;
 				delta = rq_clock - task_last_run(tcp->task);
 				if (delta < 0)
 					delta = 0;
@@ -4181,6 +4245,8 @@ show_milliseconds(struct task_context *tc, struct psinfo *psi)
 	} else {
 		tcp = FIRST_CONTEXT();
 		for (i = 0; i < RUNNING_TASKS(); i++, tcp++) {
+			if ((flag & PS_EXCLUDE_IDLE) && is_idle_thread(tcp->task))
+				continue;
 			if ((kt->flags & SMP) && (kt->flags & PER_CPU_OFF))
 				runq = rq_sp->value + 
 					kt->__per_cpu_offset[tcp->processor];
@@ -4554,6 +4620,8 @@ show_task_times(struct task_context *tcp, ulong flags)
                 if ((flags & PS_USER) && is_kernel_thread(tc->task))
                         continue;
                 if ((flags & PS_KERNEL) && !is_kernel_thread(tc->task))
+                        continue;
+                if ((flags & PS_EXCLUDE_IDLE) && is_idle_thread(tc->task))
                         continue;
 		if (flags & PS_GROUP) {
 			tgid = task_tgid(tc->task);
@@ -5401,8 +5469,7 @@ show_context(struct task_context *tc)
 	if (tt->flags & THREAD_INFO)
 		fprintf(fp, "[THREAD_INFO: %lx]", tc->thread_info);
 	fprintf(fp, "\n");
-	INDENT(indent);
-	fprintf(fp, "    CPU: %s\n", task_cpu(tc->processor, buf, VERBOSE));
+	fprintf(fp, "    CPU/NUMA: %s\n", task_cpu(tc->processor, buf, VERBOSE));
 	INDENT(indent);
 	fprintf(fp, "  STATE: %s ", 
 		task_state_string(tc->task, buf, VERBOSE));
@@ -6027,6 +6094,28 @@ task_policy(ulong task)
 	return policy;
 }
 
+static const char *
+task_policy_name(ulong task)
+{
+	ulong policy_bit = task_policy(task);
+	struct sched_policy_info *info;
+
+	for (info = sched_policy_info; info->name; info++) {
+		if (policy_bit == (1UL << info->value))
+			return info->name;
+	}
+	return "UNKNOWN";
+}
+
+static int
+task_prio(ulong task)
+{
+	fill_task_struct(task);
+	if (!tt->last_task_read || INVALID_MEMBER(task_struct_prio))
+		return 0;
+	return INT(tt->task_struct + OFFSET(task_struct_prio));
+}
+
 /*
  *  Return a task's tgid.
  */
@@ -6095,8 +6184,9 @@ task_mm(ulong task, int fill)
 char *
 task_cpu(int processor, char *buf, int verbose)
 {
+	int nid = cpu_to_nid(processor);
 	if (processor < NR_CPUS)
-		sprintf(buf, "%d", processor);
+		sprintf(buf, "%4d/%-3d", processor, nid);
 	else
 		sprintf(buf, verbose ? "(unknown)" : "?");
 
@@ -7723,7 +7813,7 @@ print_task_header(FILE *out, struct task_context *tc, int newline)
 	char buf[BUFSIZE];
 	char buf1[BUFSIZE];
 
-        fprintf(out, "%sPID: %-7ld  TASK: %s  CPU: %-3s  COMMAND: \"%s\"\n",
+        fprintf(out, "%sPID: %-7ld  TASK: %s  CPU/NUMA: %-8s  COMMAND: \"%s\"\n",
 		newline ? "\n" : "", tc->pid, 
 		mkstring(buf1, VADDR_PRLEN, LJUST|LONG_HEX, MKSTR(tc->task)),
 		task_cpu(tc->processor, buf, !VERBOSE), tc->comm);
@@ -9457,8 +9547,12 @@ print_parent_task_group_fair(void *t, int cpu)
 	readmem(tgi->task_group + OFFSET(task_group_cfs_rq),
 		KVADDR, &cfs_rq_c, sizeof(ulong),
 		"task_group cfs_rq", FAULT_ON_ERROR);
-	readmem(cfs_rq_c + cpu * sizeof(ulong), KVADDR, &cfs_rq_p,
-		sizeof(ulong), "task_group cfs_rq", FAULT_ON_ERROR);
+
+	if (kt->flags2 & PER_CPU_CFS_RQ)
+		cfs_rq_p = cfs_rq_c + kt->__per_cpu_offset[cpu];
+	else
+		readmem(cfs_rq_c + cpu * sizeof(ulong), KVADDR, &cfs_rq_p,
+			sizeof(ulong), "task_group cfs_rq", FAULT_ON_ERROR);
 
 	print_group_header_fair(tgi->depth, cfs_rq_p, tgi);
 	tgi->use = 0;
@@ -9484,8 +9578,13 @@ dump_tasks_in_lower_dequeued_cfs_rq(int depth, ulong cfs_rq, int cpu,
 		readmem(tgi_array[i]->task_group + OFFSET(task_group_cfs_rq),
 			KVADDR, &cfs_rq_c, sizeof(ulong), "task_group cfs_rq",
 			FAULT_ON_ERROR);
-		readmem(cfs_rq_c + cpu * sizeof(ulong), KVADDR, &cfs_rq_p,
-			sizeof(ulong), "task_group cfs_rq", FAULT_ON_ERROR);
+
+		if (kt->flags2 & PER_CPU_CFS_RQ)
+			cfs_rq_p = cfs_rq_c + kt->__per_cpu_offset[cpu];
+		else
+			readmem(cfs_rq_c + cpu * sizeof(ulong), KVADDR, &cfs_rq_p,
+				sizeof(ulong), "task_group cfs_rq", FAULT_ON_ERROR);
+
 		if (cfs_rq == cfs_rq_p)
 			continue;
 
@@ -9785,6 +9884,8 @@ task_group_offset_init(void)
 		MEMBER_OFFSET_INIT(cgroup_kn, "cgroup", "kn");
 		MEMBER_OFFSET_INIT(kernfs_node_name, "kernfs_node", "name");
 		MEMBER_OFFSET_INIT(kernfs_node_parent, "kernfs_node", "parent");
+		if (INVALID_MEMBER(kernfs_node_parent))
+			MEMBER_OFFSET_INIT(kernfs_node_parent, "kernfs_node", "__parent");
 
 		MEMBER_OFFSET_INIT(task_group_siblings, "task_group", "siblings");
 		MEMBER_OFFSET_INIT(task_group_children, "task_group", "children");
@@ -10348,10 +10449,15 @@ dump_tasks_by_task_group(void)
 			readmem(rt_rq + cpu * sizeof(ulong), KVADDR,
 				&rt_rq_p, sizeof(ulong), "task_group rt_rq",
 				FAULT_ON_ERROR);
-		if (cfs_rq)
-			readmem(cfs_rq + cpu * sizeof(ulong), KVADDR,
-				&cfs_rq_p, sizeof(ulong), "task_group cfs_rq",
-				FAULT_ON_ERROR);
+		if (cfs_rq) {
+			if (kt->flags2 & PER_CPU_CFS_RQ)
+				cfs_rq_p = cfs_rq + kt->__per_cpu_offset[cpu];
+			else
+				readmem(cfs_rq + cpu * sizeof(ulong), KVADDR,
+					&cfs_rq_p, sizeof(ulong),
+					"task_group cfs_rq", FAULT_ON_ERROR);
+		}
+
 		fprintf(fp, "%sCPU %d", displayed++ ? "\n" : "", cpu);
 
 		if (hide_offline_cpu(cpu)) {

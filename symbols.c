@@ -104,6 +104,7 @@ static void free_structure(struct struct_elem *);
 static unsigned char is_right_brace(const char *);
 static struct struct_elem *find_node(struct struct_elem *, char *);
 static void dump_node(struct struct_elem *, char *, unsigned char, unsigned char);
+static char *_value_to_symstr(ulong value, char *buf, ulong radix, int trace);
 
 static int module_mem_type(ulong, struct load_module *);
 static ulong module_mem_end(ulong, struct load_module *);
@@ -443,6 +444,7 @@ check_gnu_debuglink(bfd *bfd)
 	return FALSE;
 
 reset_bfd:
+	st->bfd_orig = st->bfd;
 
         if ((st->bfd = bfd_openr(pc->debuginfo_file, NULL)) == NULL)
                 error(FATAL, "cannot open object file: %s\n", 
@@ -1084,12 +1086,16 @@ symbol_value_from_proc_kallsyms(char *symname)
 
 /*
  *  Install all static kernel symbol values into the symval_hash.
+ *  Uses a dynamically-allocated tails[] array for O(1) tail insertion.
  */
 static void
 symval_hash_init(void)
 {
 	int index;
-	struct syment *sp, *sph;
+	struct syment *sp, **tails;
+
+	tails = (struct syment **)GETBUF(SYMVAL_HASH * sizeof(struct syment *));
+	BZERO(tails, SYMVAL_HASH * sizeof(struct syment *));
 
         for (sp = st->symtable; sp < st->symend; sp++) {
 		index = SYMVAL_HASH_INDEX(sp->value);
@@ -1097,15 +1103,12 @@ symval_hash_init(void)
 		if (st->symval_hash[index].val_hash_head == NULL) {
 			st->symval_hash[index].val_hash_head = sp;
 			st->symval_hash[index].val_hash_last = sp;
-			continue;
-		}
-
-		sph = st->symval_hash[index].val_hash_head; 
-		while (sph->val_hash_next)
-			sph = sph->val_hash_next;
-				
-		sph->val_hash_next = sp;
+		} else
+			tails[index]->val_hash_next = sp;
+		tails[index] = sp;
 	}
+
+	FREEBUF(tails);
 }
 
 /*
@@ -1170,16 +1173,19 @@ symname_hash_init(void)
 static unsigned int
 symname_hash_index(char *name)
 {
-	unsigned int len, value;
-	unsigned char *array = (unsigned char *)name;
+	unsigned int hash = 2166136261U;
+	unsigned char *p = (unsigned char *)name;
 
-	len = strlen(name);
-	if (!len)
+	if (!*p)
 		error(FATAL, "The length of the symbol name is zero!\n");
 
-	value = array[len - 1] * array[len / 2];
+	/* FNV-1a hash algorithm for better distribution */
+	while (*p) {
+		hash ^= *p++;
+		hash *= 16777619;
+	}
 
-	return (array[0] ^ value) % SYMNAME_HASH;
+	return hash % SYMNAME_HASH;
 }
 
 /*
@@ -1976,9 +1982,14 @@ store_module_symbols_6_4(ulong total, int mods_installed)
 			"module buffer", FAULT_ON_ERROR);
 
 		syms = ULONG(modbuf + OFFSET(module_syms));
-		gpl_syms = ULONG(modbuf + OFFSET(module_gpl_syms));
 		nsyms = UINT(modbuf + OFFSET(module_num_syms));
-		ngplsyms = UINT(modbuf + OFFSET(module_num_gpl_syms));
+		if (VALID_MEMBER(module_gpl_syms)) {
+			gpl_syms = ULONG(modbuf + OFFSET(module_gpl_syms));
+			ngplsyms = UINT(modbuf + OFFSET(module_num_gpl_syms));
+		} else {
+			gpl_syms = 0;
+			ngplsyms = 0;
+		}
 
 		nksyms = UINT(modbuf + OFFSET(module_num_symtab));
 
@@ -2991,9 +3002,12 @@ store_module_kallsyms_v2(struct load_module *lm, int start, int curr,
 		 * or '$x' for ARM64, and '$d'.
 		 * On LoongArch we have linker mapping symbols like '.L'
 		 * or 'L0'.
+		 * On RISCV64 we have linker mapping symbols like '.L',
+		 * 'L0' or '$'.
 		 * Make sure that these don't end up into our symbol list.
 		 */
-		if ((machine_type("ARM") || machine_type("ARM64") || machine_type("LOONGARCH64")) &&
+		if ((machine_type("ARM") || machine_type("ARM64") || machine_type("LOONGARCH64") ||
+		     machine_type("RISCV64")) &&
 		    !machdep->verify_symbol(nameptr, ec->st_value, ec->st_info))
 			continue;
 
@@ -4485,8 +4499,9 @@ is_compressed_kernel(char *file, char **tmp)
 	}
 	if (system(command) < 0) {
 		please_wait_done();
-		error(INFO, "%s of %s failed\n", 
-			type == GZIP ? "gunzip" : "bunzip2", file);
+		error(INFO, "%s of %s failed\n",
+			type == GZIP ? "gunzip" :
+				(type == BZIP2 ? "bunzip2" : "unxz"), file);
 		free(tempname);
 		return FALSE;
 	}
@@ -5682,7 +5697,7 @@ value_search_module_6_4(ulong value, ulong *offset)
 
 			splast = NULL;
 			for ( ; sp <= sp_end; sp++) {
-				if (machine_type("ARM64") &&
+				if ((machine_type("ARM64") || machine_type("PPC64")) &&
 				    IN_MODULE_PERCPU(sp->value, lm) &&
 				    !IN_MODULE_PERCPU(value, lm))
 					continue;
@@ -5772,10 +5787,10 @@ retry:
 		*/
 		splast = NULL;
                 for ( ; sp <= sp_end; sp++) {
-			if (machine_type("ARM64") &&
+			if ((machine_type("ARM64") || machine_type("PPC64")) &&
 			    IN_MODULE_PERCPU(sp->value, lm) &&
-			    !IN_MODULE_PERCPU(value, lm)) 
-				continue;       
+			    !IN_MODULE_PERCPU(value, lm))
+				continue;
 
 			if (value == sp->value) {
 				if (MODULE_END(sp) || MODULE_INIT_END(sp))
@@ -5965,14 +5980,25 @@ generic_machdep_value_to_symbol(ulong value, ulong *offset)
 	return NULL;
 }	
 
+char *
+value_to_symstr(ulong value, char *buf, ulong radix)
+{
+	return _value_to_symstr(value, buf, radix, 0);
+}
+
+char *
+value_to_symstr_trace(ulong value, char *buf, ulong radix)
+{
+	return _value_to_symstr(value, buf, radix, 1);
+}
 
 /*
  *  For a given value, format a string containing the nearest symbol name
  *  plus the offset if appropriate.  Display the offset in the specified
  *  radix (10 or 16) -- if it's 0, set it to the current pc->output_radix.
  */
-char *
-value_to_symstr(ulong value, char *buf, ulong radix)
+static char *
+_value_to_symstr(ulong value, char *buf, ulong radix, int trace)
 {
         struct syment *sp;
         ulong offset;
@@ -5988,7 +6014,13 @@ value_to_symstr(ulong value, char *buf, ulong radix)
 	if ((radix != 10) && (radix != 16))
 		radix = 16;
 
-        if ((sp = value_search(value, &offset))) {
+	if (trace) {
+		sp = value_search(value-1, &offset);
+		offset++;
+	} else
+		sp = value_search(value, &offset);
+
+	if (sp) {
                 if (offset)
                         sprintf(buf, radix == 16 ? "%s+0x%lx" : "%s+%ld",
 				sp->name, offset);
@@ -7907,6 +7939,33 @@ is_string(char *structure, char *member)
         return retval;
 }
 
+int
+is_ptrptr(char *structure, char *member)
+{
+	int retval;
+	char *t;
+	char buf[BUFSIZE];
+
+	retval = FALSE;
+	open_tmpfile();
+	whatis_datatype(structure, STRUCT_REQUEST, pc->tmpfile);
+	rewind(pc->tmpfile);
+	while (fgets(buf, BUFSIZE, pc->tmpfile)) {
+		if (!(t = strstr(buf, "**")))
+			continue;
+		t += 2;
+		if (t != strstr(t, member))
+			continue;
+		t += strlen(member);
+		if (*t == ';') {
+			retval = TRUE;
+			break;
+		}
+	}
+	close_tmpfile();
+
+	return retval;
+}
 
 /*
  *  Generic function for dumping data structure declarations, with a small
@@ -10451,9 +10510,13 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(page_active));
         fprintf(fp, "            page_compound_head: %ld\n",
                 OFFSET(page_compound_head));
+	fprintf(fp, "            page_compound_info: %ld\n", OFFSET(page_compound_info));
         fprintf(fp, "                  page_private: %ld\n", OFFSET(page_private));
 	fprintf(fp, "                page_page_type: %ld\n",
 		OFFSET(page_page_type));
+	fprintf(fp, "                page_compound_order: %ld\n", OFFSET(page_compound_order));
+	fprintf(fp, "                folio__folio_order: %ld\n", OFFSET(folio__folio_order));
+	fprintf(fp, "                folio__flags_1: %ld\n", OFFSET(folio__flags_1));
 
 	fprintf(fp, "        trace_print_flags_mask: %ld\n",
 		OFFSET(trace_print_flags_mask));
@@ -10875,6 +10938,9 @@ dump_offset_table(char *spec, ulong makestruct)
                 OFFSET(kmem_cache_oo));
         fprintf(fp, "             kmem_cache_random: %ld\n",
                 OFFSET(kmem_cache_random));
+	fprintf(fp, "           kmem_cache_per_node: %ld\n", OFFSET(kmem_cache_per_node));
+
+	fprintf(fp, " kmem_cache_per_node_ptrs_node: %ld\n", OFFSET(kmem_cache_per_node_ptrs_node));
 
         fprintf(fp, "    kmem_cache_node_nr_partial: %ld\n",
                 OFFSET(kmem_cache_node_nr_partial));
@@ -11763,6 +11829,8 @@ dump_offset_table(char *spec, ulong makestruct)
 		OFFSET(hrtimer_clock_base_first));
 	fprintf(fp, "   hrtimer_clock_base_get_time: %ld\n",
 		OFFSET(hrtimer_clock_base_get_time));
+	fprintf(fp, "      hrtimer_clock_base_index: %ld\n",
+		OFFSET(hrtimer_clock_base_index));
 	fprintf(fp, "            hrtimer_base_first: %ld\n",
 		OFFSET(hrtimer_base_first));
 	fprintf(fp, "          hrtimer_base_pending: %ld\n",
@@ -11954,10 +12022,17 @@ dump_offset_table(char *spec, ulong makestruct)
 	fprintf(fp, "          thread_struct_gsbase: %ld\n", OFFSET(thread_struct_gsbase));
 	fprintf(fp, "              thread_struct_fs: %ld\n", OFFSET(thread_struct_fs));
 	fprintf(fp, "              thread_struct_gs: %ld\n", OFFSET(thread_struct_gs));
+	fprintf(fp, "           bpf_ringbuf_map_map: %ld\n", OFFSET(bpf_ringbuf_map_map));
+	fprintf(fp, "            bpf_ringbuf_map_rb: %ld\n", OFFSET(bpf_ringbuf_map_rb));
+	fprintf(fp, "      bpf_ringbuf_consumer_pos: %ld\n", OFFSET(bpf_ringbuf_consumer_pos));
+	fprintf(fp, "          bpf_ringbuf_nr_pages: %ld\n", OFFSET(bpf_ringbuf_nr_pages));
 
 	fprintf(fp, "\n                    size_table:\n");
 	fprintf(fp, "                          page: %ld\n", SIZE(page));
 	fprintf(fp, "                    page_flags: %ld\n", SIZE(page_flags));
+	fprintf(fp, "           page_compound_order: %ld\n", SIZE(page_compound_order));
+	fprintf(fp, "            folio__folio_order: %ld\n", SIZE(folio__folio_order));
+	fprintf(fp, "                folio__flags_1: %ld\n", SIZE(folio__flags_1));
 	fprintf(fp, "             trace_print_flags: %ld\n", SIZE(trace_print_flags));
         fprintf(fp, "              free_area_struct: %ld\n", 
 		SIZE(free_area_struct));
@@ -11977,6 +12052,7 @@ dump_offset_table(char *spec, ulong makestruct)
         fprintf(fp, "                    kmem_cache: %ld\n", SIZE(kmem_cache));
         fprintf(fp, "               kmem_cache_node: %ld\n", SIZE(kmem_cache_node));
         fprintf(fp, "                kmem_cache_cpu: %ld\n", SIZE(kmem_cache_cpu));
+	fprintf(fp, "      kmem_cache_per_node_ptrs: %ld\n", SIZE(kmem_cache_per_node_ptrs));
 
         fprintf(fp, "              swap_info_struct: %ld\n", 
 		SIZE(swap_info_struct));
@@ -12234,6 +12310,7 @@ dump_offset_table(char *spec, ulong makestruct)
 
 	fprintf(fp, "                percpu_counter: %ld\n", SIZE(percpu_counter));
 	fprintf(fp, "                     cpumask_t: %ld\n", SIZE(cpumask_t));
+	fprintf(fp, "               bpf_ringbuf_map: %ld\n", SIZE(bpf_ringbuf_map));
 
         fprintf(fp, "\n                   array_table:\n");
 	/*

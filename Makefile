@@ -261,7 +261,7 @@ TARGET_CFLAGS=
 CRASH_CFLAGS=-g -D${TARGET} ${TARGET_CFLAGS} ${GDB_FLAGS} ${CFLAGS}
 
 GPL_FILES=
-TAR_FILES=${SOURCE_FILES} Makefile ${GPL_FILES} README .rh_rpm_package crash.8 \
+TAR_FILES=${SOURCE_FILES} Makefile ${GPL_FILES} README crash-release crash.8 \
 	${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES}
 CSCOPE_FILES=${SOURCE_FILES}
 
@@ -633,7 +633,7 @@ show_files:
 	@if [ -f ${PROGRAM}  ]; then \
 		./${PROGRAM} --no_scroll --no_crashrc -h README > README; fi
 	@echo ${SOURCE_FILES} Makefile ${GDB_FILES} ${GDB_PATCH_FILES} ${GPL_FILES} README \
-	.rh_rpm_package crash.8 ${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES}
+	crash-release crash.8 ${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES}
 
 ctags:
 	ctags ${SOURCE_FILES}
@@ -667,15 +667,15 @@ release_configure: make_configure
 
 do_release:
 	@echo "CRASH VERSION: ${VERSION}  GDB VERSION: ${GDB}"
-	@if [ ! -f .rh_rpm_package  ]; then \
-		echo "no .rh_rpm_package exists!"; exit 1; fi
-	@chmod 666 .rh_rpm_package
+	@if [ ! -f crash-release  ]; then \
+		echo "no crash-release exists!"; exit 1; fi
+	@chmod 666 crash-release
 	@rm -rf ./RELDIR; mkdir ./RELDIR; mkdir ./RELDIR/${PROGRAM}-${VERSION}
 	@rm -f ${PROGRAM}-${VERSION}.tar.gz 
 	@rm -f ${PROGRAM}-${VERSION}-${RELEASE}.src.rpm
 	@chown root ./RELDIR/${PROGRAM}-${VERSION}
 	@tar cf - ${SOURCE_FILES} Makefile ${GDB_FILES} ${GDB_PATCH_FILES} ${GPL_FILES} \
-	.rh_rpm_package crash.8 ${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES} | \
+	crash-release crash.8 ${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES} | \
 	(cd ./RELDIR/${PROGRAM}-${VERSION}; tar xf -)
 	@cp ${GDB}.tar.gz ./RELDIR/${PROGRAM}-${VERSION}
 	@./${PROGRAM} --no_scroll --no_crashrc -h README > README

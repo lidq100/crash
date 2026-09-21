@@ -169,7 +169,7 @@
 #define NR_CPUS  (256)
 #endif
 #ifdef LOONGARCH64
-#define NR_CPUS  (256)
+#define NR_CPUS  (2048)
 #endif
 
 #define NR_DEVICE_DUMPS (64)
@@ -188,6 +188,13 @@
 #define HIST_BLKSIZE  (4096)
 
 static inline int string_exists(char *s) { return (s ? TRUE : FALSE); }
+
+static inline int max(int a, int b) {
+	if (a > b)
+		return a;
+	return b;
+}
+
 #define STREQ(A, B)      (string_exists((char *)A) && string_exists((char *)B) && \
 	(strcmp((char *)(A), (char *)(B)) == 0))
 #define STRNEQ(A, B)     (string_exists((char *)A) && string_exists((char *)B) && \
@@ -572,6 +579,7 @@ struct program_context {
 #define MEMSRC_LOCAL         (0x80000ULL)
 #define REDZONE             (0x100000ULL)
 #define VMWARE_VMSS_GUESTDUMP (0x200000ULL)
+#define GET_BUILD_ID (0x400000ULL)
 	char *cleanup;
 	char *namelist_orig;
 	char *namelist_debug_orig;
@@ -685,6 +693,7 @@ struct new_utsname {
 #define KMOD_PAX                  (0x100ULL)
 #define KMOD_MEMORY               (0x200ULL)
 #define IRQ_DESC_TREE_MAPLE       (0x400ULL)
+#define PER_CPU_CFS_RQ            (0x800ULL)
 
 #define XEN()       (kt->flags & ARCH_XEN)
 #define OPENVZ()    (kt->flags & ARCH_OPENVZ)
@@ -2278,6 +2287,19 @@ struct offset_table {                    /* stash of commonly-used offsets */
 	long blk_mq_tag_set_shared_tags;
 	long vfsmount_mnt_flags;
 	long proc_mounts_cursor;
+	long bpf_ringbuf_map_map;
+	long bpf_ringbuf_map_rb;
+	long bpf_ringbuf_consumer_pos;
+	long bpf_ringbuf_nr_pages;
+	long hrtimer_clock_base_index;
+	long klp_patch_list;
+	long tk_data_timekeeper;
+	long page_compound_order;
+	long folio__folio_order;
+	long folio__flags_1;
+	long page_compound_info;
+	long kmem_cache_per_node;
+	long kmem_cache_per_node_ptrs_node;
 };
 
 struct size_table {         /* stash of commonly-used sizes */
@@ -2456,6 +2478,11 @@ struct size_table {         /* stash of commonly-used sizes */
 	long vmap_node;
 	long cpumask_t;
 	long task_struct_exit_state;
+	long bpf_ringbuf_map;
+	long page_compound_order;
+	long folio__folio_order;
+	long folio__flags_1;
+	long kmem_cache_per_node_ptrs;
 };
 
 struct array_table {
@@ -2887,7 +2914,7 @@ struct downsized {
 #define SYMVAL_HASH_INDEX(vaddr) \
         (((vaddr) >> machdep->pageshift) % SYMVAL_HASH)
 
-#define SYMNAME_HASH (512)
+#define SYMNAME_HASH (16384)
 
 #define PATCH_KERNEL_SYMBOLS_START  ((char *)(1))
 #define PATCH_KERNEL_SYMBOLS_STOP   ((char *)(2))
@@ -2899,6 +2926,7 @@ struct symbol_table_data {
 #ifdef GDB_5_3
 	struct _bfd *bfd;
 #else
+	struct bfd *bfd_orig;
 	struct bfd *bfd;
 #endif
 	struct sec *sections;
@@ -3784,6 +3812,8 @@ typedef signed int s32;
 #define VM_L5_1G	(0x200)
 #define IRQ_STACKS	(0x400)
 #define OVERFLOW_STACKS     (0x800)
+#define RISCV64_PTE_LEAF(pte) \
+	((pte) & (_PAGE_READ | _PAGE_WRITE | _PAGE_EXEC))
 
 #define RISCV64_OVERFLOW_STACK_SIZE (1 << 12)
 
@@ -3794,16 +3824,8 @@ typedef signed int s32;
 /*
  * Direct memory mapping
  */
-#define PTOV(X) 									\
-	(((unsigned long)(X)+(machdep->kvbase)) - machdep->machspec->phys_base)
-#define VTOP(X) ({									\
-	ulong _X = X;									\
-	(THIS_KERNEL_VERSION >= LINUX(5,13,0) &&					\
-		(_X) >= machdep->machspec->kernel_link_addr) ?				\
-		((unsigned long)(_X)-(machdep->machspec->va_kernel_pa_offset)): 	\
-		(((unsigned long)(_X)-(machdep->kvbase)) +				\
-		 machdep->machspec->phys_base);						\
-	})
+#define PTOV(X) riscv64_PTOV((ulong)(X))
+#define VTOP(X)	riscv64_VTOP((ulong)(X))
 #define PAGEBASE(X)		(((ulong)(X)) & (ulong)machdep->pagemask)
 
 /*
@@ -3889,7 +3911,7 @@ typedef signed int s32;
 
 #define TIF_SIGPENDING		(1)
 
-#define _SECTION_SIZE_BITS	28
+#define _SECTION_SIZE_BITS	29
 #define _MAX_PHYSMEM_BITS	48
 #endif  /* LOONGARCH64 */
 
@@ -5395,8 +5417,10 @@ extern long _ZOMBIE_;
 #define PS_SUMMARY    (0x40000)
 #define PS_POLICY     (0x80000)
 #define PS_ACTIVE    (0x100000)
+#define PS_EXCLUDE_IDLE    (0x200000)
+#define PS_POLICY_DATA     (0x400000)
 
-#define PS_EXCLUSIVE (PS_TGID_LIST|PS_ARGV_ENVP|PS_TIMES|PS_CHILD_LIST|PS_PPID_LIST|PS_LAST_RUN|PS_RLIMIT|PS_MSECS|PS_SUMMARY|PS_ACTIVE)
+#define PS_EXCLUSIVE (PS_TGID_LIST|PS_ARGV_ENVP|PS_TIMES|PS_CHILD_LIST|PS_PPID_LIST|PS_LAST_RUN|PS_RLIMIT|PS_MSECS|PS_SUMMARY|PS_ACTIVE|PS_POLICY_DATA)
 
 #define MAX_PS_ARGS    (100)   /* maximum command-line specific requests */
 
@@ -5609,6 +5633,7 @@ void exec_args_input_file(struct command_table_entry *, struct args_input_file *
 /*
  *  tools.c
  */
+extern int MAX_MALLOC_BUFS;
 FILE *set_error(char *);
 int __error(int, char *, ...);
 #define error __error               /* avoid conflict with gdb error() */
@@ -5680,6 +5705,9 @@ int do_radix_tree_traverse(ulong ptr, int is_root, struct radix_tree_ops *ops);
 struct xarray_ops {
 	void (*entry)(ulong node, ulong slot, const char *path,
 		      ulong index, void *private);
+	uint (*update_off)(ulong node, uint height, char *path, ulong index,
+                      ulong slot, uint off, ulong shift, struct xarray_ops *ops,
+		      bool *should_continue);
 	uint radix;
 	void *private;
 };
@@ -5795,6 +5823,7 @@ struct syment *prev_symbol(char *, struct syment *);
 void get_symbol_data(char *, long, void *);
 int try_get_symbol_data(char *, long, void *);
 char *value_to_symstr(ulong, char *, ulong);
+char *value_to_symstr_trace(ulong, char *, ulong);
 char *value_symbol(ulong);
 ulong symbol_value(char *);
 ulong symbol_value_module(char *, char *);
@@ -5871,6 +5900,7 @@ void parse_for_member_extended(struct datatype_member *, ulong);
 void add_to_downsized(char *);
 int is_downsized(char *);
 int is_string(char *, char *);
+int is_ptrptr(char *, char *);
 struct syment *symbol_complete_match(const char *, struct syment *);
 
 /*  
@@ -5936,6 +5966,7 @@ int dump_inode_page(ulong);
 ulong valid_section_nr(ulong);
 void display_memory_from_file_offset(ulonglong, long, void *);
 void swap_info_init(void);
+int page_to_nid(ulong);
 
 /*
  *  filesys.c 
@@ -5994,6 +6025,10 @@ ulong do_xarray(ulong, int, struct list_pair *);
 #define XARRAY_DUMP_CB (5)
 #define XARRAY_TAG_MASK      (3UL)
 #define XARRAY_TAG_INTERNAL  (2UL)
+#define XARRAY_TYPE_PAGE_CACHE	0x8
+extern ulong XA_CHUNK_SHIFT;
+
+int folio_order(ulong folio);
 
 int file_dump(ulong, ulong, ulong, int, int);
 #define DUMP_FULL_NAME      0x1
@@ -6022,6 +6057,8 @@ ulong do_maple_tree(ulong, int, struct list_pair *);
 void help_init(void);
 void cmd_usage(char *, int);
 void display_version(void);
+int cpu_to_nid(int cpu);
+void numa_init(void);
 void display_help_screen(char *);
 #ifdef ARM
 #define dump_machdep_table(X) arm_dump_machdep_table(X)
@@ -6226,6 +6263,7 @@ void dump_kernel_table(int);
 void dump_bt_info(struct bt_info *, char *where);
 void dump_log(int);
 void parse_kernel_version(char *);
+char *vmcoreinfo_read_from_memory(const char *);
 
 #define LOG_LEVEL(v) ((v) & 0x07)
 #define SHOW_LOG_LEVEL    (0x1)
@@ -6235,6 +6273,7 @@ void parse_kernel_version(char *);
 #define SHOW_LOG_CTIME   (0x10)
 #define SHOW_LOG_SAFE    (0x20)
 #define SHOW_LOG_CALLER  (0x40)
+#define SHOW_LOG_RUST    (0x80)
 void set_cpu(int);
 void clear_machdep_cache(void);
 struct stack_hook *gather_text_list(struct bt_info *);
@@ -6630,6 +6669,8 @@ struct ORC_data {
 	orc_entry orc_entry_data;
 	int has_signal;
 	int has_end;
+	int reg_sp;
+	int reg_prev_sp;
 };
 
 #define ORC_TYPE_CALL                   ((machdep->flags & ORC_6_4) ? 2 : 0)
@@ -6640,11 +6681,11 @@ struct ORC_data {
 #define UNWIND_HINT_TYPE_RESTORE        4
 
 #define ORC_REG_UNDEFINED               0
-#define ORC_REG_PREV_SP                 1
+#define ORC_REG_PREV_SP                 (machdep->machspec->orc.reg_prev_sp)
 #define ORC_REG_DX                      2
 #define ORC_REG_DI                      3
 #define ORC_REG_BP                      4
-#define ORC_REG_SP                      5
+#define ORC_REG_SP                      (machdep->machspec->orc.reg_sp)
 #define ORC_REG_R10                     6
 #define ORC_REG_R13                     7
 #define ORC_REG_BP_INDIRECT             8
@@ -7199,6 +7240,8 @@ void riscv64_display_regs_from_elf_notes(int, FILE *);
 void riscv64_init(int);
 void riscv64_dump_machdep_table(ulong);
 int riscv64_IS_VMALLOC_ADDR(ulong);
+ulong riscv64_PTOV(ulong);
+ulong riscv64_VTOP(ulong);
 
 #define display_idt_table() \
 	error(FATAL, "-d option is not applicable to RISCV64 architecture\n")
@@ -7309,13 +7352,40 @@ void loongarch64_dump_machdep_table(ulong);
 
 #define KSYMS_START     (0x1)
 
+struct loongarch64_orc_entry {
+	short sp_offset;
+	short fp_offset;
+	short ra_offset;
+	uint sp_reg;
+	uint fp_reg;
+	uint ra_reg;
+	uint type;
+	uint signal;
+};
+
+struct loongarch64_ORC_data {
+	int enabled;
+	uint lookup_num_blocks;
+	ulong __start_orc_unwind_ip;
+	ulong __stop_orc_unwind_ip;
+	ulong __start_orc_unwind;
+	ulong __stop_orc_unwind;
+	ulong orc_lookup;
+	ulong ip_entry;
+	ulong orc_entry;
+	struct loongarch64_orc_entry orc_entry_data;
+};
+
 struct machine_specific {
 	ulong phys_base;
 	ulong vmalloc_start_addr;
 	ulong modules_vaddr;
 	ulong modules_end;
 
+	ulong irq_stack_size;
+	ulong *irq_stacks;
 	struct loongarch64_pt_regs *crash_task_regs;
+	struct loongarch64_ORC_data orc;
 };
 
 /*

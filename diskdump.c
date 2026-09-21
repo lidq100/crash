@@ -91,6 +91,7 @@ static void dump_vmcoreinfo(FILE *);
 static void dump_note_offsets(FILE *);
 static char *vmcoreinfo_read_string(const char *);
 static void diskdump_get_osrelease(void);
+static void diskdump_get_build_id(void);
 static int valid_note_address(unsigned char *);
 
 /* For split dumpfile */
@@ -180,12 +181,12 @@ map_cpus_to_prstatus_kdump_cmprs(void)
 	BZERO(dd->nt_prstatus_percpu, size);
 
 	/*
-	 *  Re-populate the array with the notes mapping to online cpus
+	 *  Re-populate the array with the notes mapping to present cpus
 	 */
 	nrcpus = (kt->kernel_NR_CPUS ? kt->kernel_NR_CPUS : NR_CPUS);
 
 	for (i = 0, j = 0; i < nrcpus; i++) {
-		if (in_cpu_map(ONLINE_MAP, i) && machdep->is_cpu_prstatus_valid(i)) {
+		if (in_cpu_map(PRESENT_MAP, i) && machdep->is_cpu_prstatus_valid(i)) {
 			dd->nt_prstatus_percpu[i] = nt_ptr[j++];
 			dd->num_prstatus_notes = 
 				MAX(dd->num_prstatus_notes, i+1);
@@ -337,16 +338,20 @@ process_elf32_notes(void *note_buf, unsigned long size_note)
 	int num = 0;
 	int vmcoredd_num = 0;
 	int qemu_num = 0;
+	unsigned long left;
 
 	for (index = 0; index < size_note; index += len) {
 		nt = note_buf + index;
+		left = size_note - index;
 
-		if (nt->n_type == NT_PRSTATUS) {
+		if (nt->n_type == NT_PRSTATUS && num < NR_CPUS) {
 			dd->nt_prstatus_percpu[num] = nt;
 			num++;
 		}
 		len = sizeof(Elf32_Nhdr);
-		if (STRNEQ((char *)nt + len, "QEMU")) {
+		if ((left >= sizeof(Elf32_Nhdr) + MAX(nt->n_namesz + sizeof(ulong), 4)) &&
+		    STRNEQ((char *)nt + len, "QEMU") &&
+		    qemu_num < NR_CPUS) {
 			ulong *ptr =
 			    (ulong *)((char *)nt + sizeof(Elf32_Nhdr) + nt->n_namesz);
 			dd->nt_qemucs_percpu[qemu_num] =
@@ -394,22 +399,27 @@ process_elf64_notes(void *note_buf, unsigned long size_note)
 	int num = 0;
 	int vmcoredd_num = 0;
 	int qemu_num = 0;
+	unsigned long left;
 
 	for (index = 0; index < size_note; index += len) {
 		nt = note_buf + index;
+		left = size_note - index;
 
-		if (nt->n_type == NT_PRSTATUS) {
+		if (nt->n_type == NT_PRSTATUS && num < NR_CPUS) {
 			dd->nt_prstatus_percpu[num] = nt;
 			num++;
 		}
-		if ((nt->n_type == NT_TASKSTRUCT) && 
+		if ((nt->n_type == NT_TASKSTRUCT) &&
+		    (left >= sizeof(Elf64_Nhdr) + MAX(nt->n_namesz + sizeof(ulong), 4)) &&
 		    (STRNEQ((char *)nt + sizeof(Elf64_Nhdr), "SNAP"))) {
 			pc->flags2 |= (LIVE_DUMP|SNAP);
 			dd->snapshot_task = 
 			    *((ulong *)((char *)nt + sizeof(Elf64_Nhdr) + nt->n_namesz));
 		}
 		len = sizeof(Elf64_Nhdr);
-		if (STRNEQ((char *)nt + len, "QEMU")) {
+		if ((left >= sizeof(Elf64_Nhdr) + MAX(nt->n_namesz + sizeof(ulong), 4)) &&
+		    STRNEQ((char *)nt + len, "QEMU") &&
+		    qemu_num < NR_CPUS) {
 			ulong *ptr =
 			    (ulong *)((char *)nt + sizeof(Elf64_Nhdr) + nt->n_namesz);
 			dd->nt_qemucs_percpu[qemu_num] =
@@ -1074,6 +1084,9 @@ is_diskdump(char *file)
 	if (pc->flags2 & GET_OSRELEASE) 
 		diskdump_get_osrelease();
 
+	if (pc->flags2 & GET_BUILD_ID)
+		diskdump_get_build_id();
+
 #ifdef LZO
 	if (lzo_init() == LZO_E_OK)
 		dd->flags |= LZO_SUPPORTED;
@@ -1350,7 +1363,7 @@ cache_page(physaddr_t paddr)
 	} else if (pd.flags & DUMP_DH_COMPRESSED_ZSTD) {
 
 		if (!(dd->flags & ZSTD_SUPPORTED)) {
-			error(INFO, "%s: uncompess failed: no zstd compression support\n",
+			error(INFO, "%s: uncompress failed: no zstd compression support\n",
 				DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
 			return READ_ERROR;
 		}
@@ -1358,7 +1371,7 @@ cache_page(physaddr_t paddr)
 		if (!dctx) {
 			dctx = ZSTD_createDCtx();
 			if (!dctx) {
-				error(INFO, "%s: uncompess failed: cannot create ZSTD_DCtx\n",
+				error(INFO, "%s: uncompress failed: cannot create ZSTD_DCtx\n",
 					DISKDUMP_VALID() ? "diskdump" : "compressed kdump");
 				return READ_ERROR;
 			}
@@ -2385,6 +2398,7 @@ vmcoreinfo_read_string(const char *key)
 	off_t offset;
 	char keybuf[BUFSIZE];
 	const off_t failed = (off_t)-1;
+	bool info_found = false;
 
 	if (dd->header->header_version < 3)
 		return NULL;
@@ -2417,6 +2431,7 @@ vmcoreinfo_read_string(const char *key)
 	}
 
 	buf[size_vmcoreinfo] = '\n';
+	info_found = true;
 
 	if ((p1 = strstr(buf, keybuf))) {
 		p2 = p1 + strlen(keybuf);
@@ -2429,6 +2444,9 @@ vmcoreinfo_read_string(const char *key)
 err:
 	if (buf)
 		free(buf);
+
+	if (!info_found && value_string == NULL)
+		return vmcoreinfo_read_from_memory(key);
 
 	return value_string;
 }
@@ -2444,6 +2462,19 @@ diskdump_get_osrelease(void)
 	}
 	else
 		pc->flags2 &= ~GET_OSRELEASE;
+}
+
+static void
+diskdump_get_build_id(void)
+{
+	char *string;
+
+	if ((string = vmcoreinfo_read_string("BUILD-ID"))) {
+		fprintf(fp, "%s\n", string);
+		free(string);
+	}
+	else
+		pc->flags2 &= ~GET_BUILD_ID;
 }
 
 static int
