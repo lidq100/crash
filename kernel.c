@@ -29,6 +29,9 @@
 #endif
 #include "bfd.h"
 
+#define KERNEL_VERSION_MIN '2'
+#define KERNEL_VERSION_MAX '7'  /* latest linux mainline kernel major number */
+
 static void do_module_cmd(ulong, char *, ulong, char *, char *);
 static void show_module_taint(void);
 static char *find_module_objfile(char *, char *, char *);
@@ -43,6 +46,7 @@ static void display_bh_1(void);
 static void display_bh_2(void);
 static void display_bh_3(void);
 static void display_bh_4(void);
+static int hrtimer_base_type_init(void);
 static void dump_hrtimer_data(const ulong *cpus);
 static void dump_hrtimer_clock_base(const void *, const int);
 static void dump_hrtimer_base(const void *, const int);
@@ -99,10 +103,33 @@ static ulong dump_audit_skb_queue(ulong);
 static ulong __dump_audit(char *);
 static void dump_audit(void);
 static void dump_printk_safe_seq_buf(int);
-static char *vmcoreinfo_read_string(const char *);
 static void check_vmcoreinfo(void);
 static int is_pvops_xen(void);
 static int get_linux_banner_from_vmlinux(char *, size_t);
+
+static bool kernel_version_str_sanity_check(char *buf)
+{
+	int n;
+	char *p;
+
+	if (!buf)
+		return FALSE;
+
+	p = strstr(buf, "Linux version ");
+	if (!p)
+		return FALSE;
+
+	n = strlen(p);
+
+	if (n < 17) /* "Linux version " (14) + "x.y" (3) = 17 */
+		return FALSE;
+
+	if (p[14] >= KERNEL_VERSION_MIN && p[14] <= KERNEL_VERSION_MAX
+			&& p[15] == '.'	&& p[16] >= '0' && p[16] <= '9')
+		return TRUE;
+
+	return FALSE;
+}
 
 /*
  * popuplate the global kernel table (kt) with kernel version
@@ -258,6 +285,7 @@ kernel_init()
 	
 	MEMBER_OFFSET_INIT(timekeeper_xtime, "timekeeper", "xtime");
 	MEMBER_OFFSET_INIT(timekeeper_xtime_sec, "timekeeper", "xtime_sec");
+	MEMBER_OFFSET_INIT(tk_data_timekeeper, "tk_data", "timekeeper");
 	get_xtime(&kt->date);
 	if (CRASHDEBUG(1))
 		fprintf(fp, "xtime timespec.tv_sec: %lx: %s\n", 
@@ -399,6 +427,18 @@ kernel_init()
 	MEMBER_OFFSET_INIT(task_group_rt_rq, "task_group", "rt_rq");
 	MEMBER_OFFSET_INIT(task_group_parent, "task_group", "parent");
 
+	/*
+	 * task_group.cfs_rq was changed from a pointer array to a per-cpu
+	 * variable at Linux 7.2 (b8fea7af0e40).  Since there is no way to
+	 * determine it, we check whether it is a pointer array or not.
+	 *   -       struct cfs_rq           **cfs_rq;
+	 *   +       struct cfs_rq __percpu  *cfs_rq;
+	 */
+	if (VALID_MEMBER(task_group_cfs_rq)) {
+		if (!is_ptrptr("task_group", "cfs_rq"))
+			kt->flags2 |= PER_CPU_CFS_RQ;
+	}
+
        /*
         *  In 2.4, smp_send_stop() sets smp_num_cpus back to 1
         *  in some, but not all, architectures.  So if a count
@@ -462,6 +502,11 @@ kernel_init()
 	    	error(WARNING, 
 		    "list_head.next offset: %ld: list command may fail\n",
 			OFFSET(list_head_next));
+
+	if (STRUCT_EXISTS("klp_patch")) {
+		if (MEMBER_EXISTS("klp_patch", "list"))
+			MEMBER_OFFSET_INIT(klp_patch_list, "klp_patch", "list");
+	}
 
         MEMBER_OFFSET_INIT(hlist_node_next, "hlist_node", "next");
         MEMBER_OFFSET_INIT(hlist_node_pprev, "hlist_node", "pprev");
@@ -797,6 +842,12 @@ kernel_init()
 			"hrtimer_clock_base", "first");
 		MEMBER_OFFSET_INIT(hrtimer_clock_base_get_time, 
 			"hrtimer_clock_base", "get_time");
+		if (INVALID_MEMBER(hrtimer_clock_base_get_time)) {
+			/* Linux 6.18: 009eb5da29a9 */
+			MEMBER_OFFSET_INIT(hrtimer_clock_base_index, "hrtimer_clock_base", "index");
+			if (!hrtimer_base_type_init())
+				error(WARNING, "cannot get enum hrtimer_base_type\n");
+		}
 	}
 
 	STRUCT_SIZE_INIT(hrtimer_base, "hrtimer_base");
@@ -1372,11 +1423,7 @@ verify_namelist()
 	found = FALSE;
 	sprintf(buffer3, "(unknown)");
         while (fgets(buffer, (BUFSIZE/2)-1, pipe)) {
-		if (!strstr(buffer, "Linux version 2.") &&
-		    !strstr(buffer, "Linux version 3.") &&
-		    !strstr(buffer, "Linux version 4.") &&
-		    !strstr(buffer, "Linux version 5.") &&
-		    !strstr(buffer, "Linux version 6."))
+		if (!kernel_version_str_sanity_check(buffer))
 			continue;
 
                 if (strstr(buffer, kt->proc_version)) {
@@ -3623,9 +3670,11 @@ module_init(void)
 	case KMOD_V2: 
 		MEMBER_OFFSET_INIT(module_num_syms, "module", "num_syms");
 		MEMBER_OFFSET_INIT(module_list, "module", "list");
-        	MEMBER_OFFSET_INIT(module_gpl_syms, "module", "gpl_syms");
-        	MEMBER_OFFSET_INIT(module_num_gpl_syms, "module", 
-			"num_gpl_syms");
+		if (MEMBER_EXISTS("module", "gpl_syms")) {
+			MEMBER_OFFSET_INIT(module_gpl_syms, "module", "gpl_syms");
+			MEMBER_OFFSET_INIT(module_num_gpl_syms, "module",
+				"num_gpl_syms");
+		}
 
 		if (MEMBER_EXISTS("module", "mem")) {	/* 6.4 and later */
 			kt->flags2 |= KMOD_MEMORY;	/* MODULE_MEMORY() can be used. */
@@ -3819,8 +3868,9 @@ module_init(void)
                 	nsyms = UINT(modbuf + OFFSET(module_nsyms));
 			break;
 		case KMOD_V2: 
-                	nsyms = UINT(modbuf + OFFSET(module_num_syms)) +
-				UINT(modbuf + OFFSET(module_num_gpl_syms));
+			nsyms = UINT(modbuf + OFFSET(module_num_syms));
+			if (VALID_MEMBER(module_num_gpl_syms))
+				nsyms += UINT(modbuf + OFFSET(module_num_gpl_syms));
 			break;
 		}
 
@@ -5136,7 +5186,7 @@ cmd_log(void)
 
 	msg_flags = 0;
 
-        while ((c = getopt(argcnt, args, "Ttdmasc")) != EOF) {
+        while ((c = getopt(argcnt, args, "TtdmascR")) != EOF) {
                 switch(c)
                 {
 		case 'T':
@@ -5159,6 +5209,9 @@ cmd_log(void)
 			break;
 		case 'c':
 			msg_flags |= SHOW_LOG_CALLER;
+			break;
+		case 'R':
+			msg_flags |= SHOW_LOG_RUST;
 			break;
                 default:
                         argerrs++;
@@ -5664,7 +5717,7 @@ is_livepatch(void)
 {
 	int i;
 	struct load_module *lm;
-	char buf[BUFSIZE];
+	char buf[BUFSIZE] = {0};
 
 	show_kernel_taints(buf, !VERBOSE);
 	if (strstr(buf, "K"))  /* TAINT_LIVEPATCH */
@@ -5677,6 +5730,70 @@ is_livepatch(void)
 	}
 
 	return FALSE;
+}
+
+struct klp_transition_ctx {
+	ulong transition_patch;
+	int found;
+};
+
+static int
+klp_transition_match(void *entry, void *data)
+{
+	struct klp_transition_ctx *ctx = data;
+
+	if ((ulong)entry == ctx->transition_patch) {
+		ctx->found = TRUE;
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+static int
+is_livepatch_transition(void)
+{
+	struct kernel_list_head head;
+	struct list_data ld;
+	struct klp_transition_ctx ctx;
+	ulong transition_patch;
+	ulong list_addr;
+	int ret;
+
+	if (!try_get_symbol_data("klp_transition_patch",
+	    sizeof(ulong), &transition_patch) || !transition_patch)
+		return FALSE;
+
+	if (!STRUCT_EXISTS("klp_patch") || !VALID_MEMBER(klp_patch_list) ||
+	    !kernel_symbol_exists("klp_patches"))
+		return TRUE;
+
+	list_addr = symbol_value("klp_patches");
+	if (!readmem(list_addr, KVADDR, &head, sizeof(head), "klp_patches",
+	    RETURN_ON_ERROR | QUIET))
+		return TRUE;
+
+	if (!head.next || head.next == (void *)list_addr)
+		return TRUE;
+
+	BZERO(&ctx, sizeof(ctx));
+	ctx.transition_patch = transition_patch;
+
+	BZERO(&ld, sizeof(ld));
+	ld.flags = LIST_CALLBACK|CALLBACK_RETURN|RETURN_ON_LIST_ERROR|
+	    RETURN_ON_DUPLICATE|LIST_ALLOCATE;
+	ld.start = (ulong)head.next;
+	ld.end = list_addr;
+	ld.member_offset = OFFSET(list_head_next);
+	ld.list_head_offset = OFFSET(klp_patch_list);
+	ld.callback_func = klp_transition_match;
+	ld.callback_data = &ctx;
+
+	ret = do_list(&ld);
+	if (ret < 0)
+		return FALSE;
+
+	return ctx.found;
 }
 
 /*
@@ -5722,17 +5839,19 @@ display_sys_stats(void)
 		}
 	} else {
         	if (pc->system_map) {
-			fprintf(fp, "  SYSTEM MAP: %s%s%s\n", pc->system_map,
+			fprintf(fp, "  SYSTEM MAP: %s%s%s%s\n", pc->system_map,
 				is_livepatch() ? "  [LIVEPATCH]" : "",
+				is_livepatch_transition() ? "  [TRANSITION]" : "",
 				is_kernel_tainted() ? "  [TAINTED]" : "");
 			fprintf(fp, "DEBUG KERNEL: %s %s\n", 
 					pc->namelist_orig ?
 					pc->namelist_orig : pc->namelist,
 					debug_kernel_version(pc->namelist));
 		} else
-			fprintf(fp, "      KERNEL: %s%s%s\n", pc->namelist_orig ?
+			fprintf(fp, "      KERNEL: %s%s%s%s\n", pc->namelist_orig ?
 				pc->namelist_orig : pc->namelist,
 				is_livepatch() ? "  [LIVEPATCH]" : "",
+				is_livepatch_transition() ? "  [TRANSITION]" : "",
 				is_kernel_tainted() ? "  [TAINTED]" : "");
 	}
 
@@ -5891,11 +6010,7 @@ debug_kernel_version(char *namelist)
 
 	argc = 0;
         while (fgets(buf, BUFSIZE-1, pipe)) {
-                if (!strstr(buf, "Linux version 2.") &&
-		    !strstr(buf, "Linux version 3.") &&
-		    !strstr(buf, "Linux version 4.") &&
-		    !strstr(buf, "Linux version 5.") &&
-		    !strstr(buf, "Linux version 6."))
+		if (!kernel_version_str_sanity_check(buf))
                         continue;
 
 		argc = parse_line(buf, arglist); 
@@ -6278,6 +6393,8 @@ dump_kernel_table(int verbose)
 		fprintf(fp, "%sKMOD_PAX", others++ ? "|" : "");
 	if (kt->flags2 & KMOD_MEMORY)
 		fprintf(fp, "%sKMOD_MEMORY", others++ ? "|" : "");
+	if (kt->flags2 & PER_CPU_CFS_RQ)
+		fprintf(fp, "%sPER_CPU_CFS_RQ", others++ ? "|" : "");
 	fprintf(fp, ")\n");
 
         fprintf(fp, "         stext: %lx\n", kt->stext);
@@ -7936,6 +8053,52 @@ static int expires_len = -1;
 static int softexpires_len = -1;
 static int tte_len = -1;
 
+static char **hrtimer_base_type = NULL;
+static int
+hrtimer_base_type_init(void)
+{
+	long max_bases;
+	int i, c ATTRIBUTE_UNUSED;
+	char buf[BUFSIZE];
+	char *arglist[MAXARGS];
+
+	if (!enumerator_value("HRTIMER_MAX_CLOCK_BASES", &max_bases))
+		return FALSE;
+
+	hrtimer_base_type = (char **)calloc(max_bases, sizeof(char *));
+	if (!hrtimer_base_type)
+		return FALSE;
+
+	pc->flags2 |= ALLOW_FP; /* Required during initialization */
+	open_tmpfile();
+	if (dump_enumerator_list("hrtimer_base_type")) {
+		rewind(pc->tmpfile);
+		while (fgets(buf, BUFSIZE, pc->tmpfile)) {
+			if (!strstr(buf, " = "))
+				continue;
+			c = parse_line(buf, arglist);
+			i = atoi(arglist[2]);
+			if (0 <= i && i < max_bases)
+				hrtimer_base_type[i] = strdup(arglist[0]);
+		}
+		close_tmpfile();
+		pc->flags2 &= ~ALLOW_FP;
+	} else {
+		close_tmpfile();
+		pc->flags2 &= ~ALLOW_FP;
+		free(hrtimer_base_type);
+		hrtimer_base_type = NULL;
+		return FALSE;
+	}
+
+	if (CRASHDEBUG(1)) {
+		for (i = 0; i < max_bases; i++)
+			fprintf(fp, "hrtimer_base_type[%d] = %s\n", i, hrtimer_base_type[i]);
+	}
+
+	return TRUE;
+}
+
 static void
 dump_hrtimer_clock_base(const void *hrtimer_bases, const int num)
 {
@@ -7947,11 +8110,23 @@ dump_hrtimer_clock_base(const void *hrtimer_bases, const int num)
 
 	base = (void *)hrtimer_bases + OFFSET(hrtimer_cpu_base_clock_base) +
 		SIZE(hrtimer_clock_base) * num;
-	readmem((ulong)(base + OFFSET(hrtimer_clock_base_get_time)), KVADDR,
-		&get_time, sizeof(get_time), "hrtimer_clock_base get_time",
-		FAULT_ON_ERROR);
-	fprintf(fp, "  CLOCK: %d  HRTIMER_CLOCK_BASE: %lx  [%s]\n", num, 
-		(ulong)base, value_to_symstr(get_time, buf, 0));
+
+	if (INVALID_MEMBER(hrtimer_clock_base_get_time)) {
+		/* Linux 6.18: 009eb5da29a9 */
+		if (hrtimer_base_type) {
+			uint index;
+			readmem((ulong)(base + OFFSET(hrtimer_clock_base_index)), KVADDR, &index,
+				sizeof(index), "hrtimer_clock_base index", FAULT_ON_ERROR);
+			fprintf(fp, "  CLOCK: %d  HRTIMER_CLOCK_BASE: %lx  [%s]\n", num,
+				(ulong)base, hrtimer_base_type[index]);
+		} else
+			fprintf(fp, "  CLOCK: %d  HRTIMER_CLOCK_BASE: %lx\n", num, (ulong)base);
+	} else {
+		readmem((ulong)(base + OFFSET(hrtimer_clock_base_get_time)), KVADDR, &get_time,
+			sizeof(get_time), "hrtimer_clock_base get_time", FAULT_ON_ERROR);
+		fprintf(fp, "  CLOCK: %d  HRTIMER_CLOCK_BASE: %lx  [%s]\n", num,
+			(ulong)base, value_to_symstr(get_time, buf, 0));
+	}
 
 	/* get current time(uptime) */
 	get_uptime(NULL, &current_time);
@@ -10996,7 +11171,18 @@ get_xtime(struct timespec *date)
 	struct syment *sp;
 	uint64_t xtime_sec;
 
-	if (VALID_MEMBER(timekeeper_xtime) &&
+	if (VALID_MEMBER(tk_data_timekeeper) &&
+	    VALID_MEMBER(timekeeper_xtime_sec)) {
+		long offset = OFFSET(tk_data_timekeeper) +
+			OFFSET(timekeeper_xtime_sec);
+		if ((sp = kernel_symbol_search("timekeeper_data")) ||
+		    (sp = kernel_symbol_search("tk_core"))) {
+			readmem(sp->value + offset, KVADDR,
+				&xtime_sec, sizeof(uint64_t),
+				"tk_data timekeeper xtime_sec", RETURN_ON_ERROR);
+			date->tv_sec = (__time_t)xtime_sec;
+		}
+	} else if (VALID_MEMBER(timekeeper_xtime) &&
 	    (sp = kernel_symbol_search("timekeeper"))) {
                 readmem(sp->value + OFFSET(timekeeper_xtime), KVADDR, 
 			date, sizeof(struct timespec),
@@ -11892,8 +12078,8 @@ dump_printk_safe_seq_buf(int msg_flags)
  * Returns a string (that has to be freed by the caller) that contains the
  * value for key or NULL if the key has not been found.
  */
-static char *
-vmcoreinfo_read_string(const char *key)
+char *
+vmcoreinfo_read_from_memory(const char *key)
 {
 	char *buf, *value_string, *p1, *p2;
 	size_t value_length;
@@ -11902,6 +12088,14 @@ vmcoreinfo_read_string(const char *key)
 	char keybuf[BUFSIZE];
 
 	buf = value_string = NULL;
+
+	if (!(pc->flags & GDB_INIT)) {
+		/*
+		 * GDB interface hasn't been initialised yet, so can't
+		 * access vmcoreinfo_data
+		 */
+		return NULL;
+	}
 
 	switch (get_symbol_type("vmcoreinfo_data", NULL, NULL))
 	{
@@ -11958,10 +12152,10 @@ check_vmcoreinfo(void)
 		switch (get_symbol_type("vmcoreinfo_data", NULL, NULL))
 		{
 		case TYPE_CODE_PTR:
-			pc->read_vmcoreinfo = vmcoreinfo_read_string;
+			pc->read_vmcoreinfo = vmcoreinfo_read_from_memory;
 			break;
 		case TYPE_CODE_ARRAY:
-			pc->read_vmcoreinfo = vmcoreinfo_read_string;
+			pc->read_vmcoreinfo = vmcoreinfo_read_from_memory;
 			break;
 		}
 	}
@@ -11970,6 +12164,7 @@ check_vmcoreinfo(void)
 static
 int get_linux_banner_from_vmlinux(char *buf, size_t size)
 {
+	struct bfd *bfd = st->bfd_orig ? : st->bfd;
 	struct bfd_section *sect;
 	long offset;
 	ulong start_rodata;
@@ -11981,7 +12176,7 @@ int get_linux_banner_from_vmlinux(char *buf, size_t size)
 	else
 		return FALSE;
 
-	sect = bfd_get_section_by_name(st->bfd, ".rodata");
+	sect = bfd_get_section_by_name(bfd, ".rodata");
 	if (!sect)
 		return FALSE;
 
@@ -11993,7 +12188,7 @@ int get_linux_banner_from_vmlinux(char *buf, size_t size)
 	 */
 	offset = symbol_value("linux_banner") - start_rodata;
 
-	if (!bfd_get_section_contents(st->bfd,
+	if (!bfd_get_section_contents(bfd,
 				      sect,
 				      buf,
 				      offset,
@@ -12046,3 +12241,69 @@ out:
 	pc->error_fp = error_fp_save;
 }
 #endif
+
+static int *cpu_to_nid_map;
+
+int
+cpu_to_nid(int cpu)
+{
+	if (!cpu_to_nid_map || cpu < 0 || cpu >= kt->cpus)
+		return -1;
+	if (vt->numnodes == 1)
+		return 0;
+	return cpu_to_nid_map[cpu];
+}
+
+static void
+cpu_to_nid_init(void)
+{
+	int i, j;
+	int fd;
+	char buf[64];
+
+	cpu_to_nid_map = malloc(kt->cpus * sizeof(int));
+	if (vt->numnodes == 1)
+		return;
+
+	memset(cpu_to_nid_map, -1, kt->cpus * sizeof(int));
+
+	if (ACTIVE()) {
+		for (i = 0; i < kt->cpus; i++) {
+			for (j = 0; j < vt->numnodes; j++) {
+				memset(buf, 0, sizeof(buf));
+				sprintf(buf, "/sys/devices/system/cpu/cpu%d/node%d", i, j);
+
+				fd = open(buf, O_RDONLY);
+				if (fd > 0) {
+					cpu_to_nid_map[i] = j;
+					close(fd);
+					break;
+				}
+			}
+		}
+	} else {
+		int cpu;
+
+		if (symbol_exists("numa_node")) {
+			ulong base = symbol_value("numa_node");
+
+			for (cpu = 0; cpu < kt->cpus; cpu++) {
+				ulong addr = base + kt->__per_cpu_offset[cpu];
+				int nid;
+
+				if (readmem(addr, KVADDR, &nid, sizeof(int),
+				    "numa_node", RETURN_ON_ERROR|QUIET))
+					cpu_to_nid_map[cpu] = nid;
+			}
+		} else {
+			error(WARNING,
+			    "numa_node symbol not found in vmcore\n");
+		}
+	}
+}
+
+void
+numa_init(void)
+{
+	cpu_to_nid_init();
+}

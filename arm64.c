@@ -228,12 +228,14 @@ arm64_get_current_task_reg(int regno, const char *name,
 		return FALSE;
 
 	if (sid && sid <= extra_stacks_idx) {
-		ur_bitmap = extra_stacks_regs[extra_stacks_idx - 1];
+		ur_bitmap = extra_stacks_regs[sid - 1];
 		goto get_sub;
 	}
 
 	BZERO(&bt_setup, sizeof(struct bt_info));
 	clone_bt_info(&bt_setup, &bt_info, tc);
+	if (bt_info.stackbase == 0)
+		return FALSE;
 	fill_stackbuf(&bt_info);
 
 	get_dumpfile_regs(&bt_info, &sp, &ip);
@@ -710,7 +712,16 @@ arm64_init(int when)
 			}
 		}
 
-		if (THIS_KERNEL_VERSION >= LINUX(5,19,0)) {
+		if (THIS_KERNEL_VERSION >= LINUX(6,10,0)) {
+			ms->__SWP_TYPE_BITS = 5;
+			ms->__SWP_TYPE_SHIFT = 6;
+			ms->__SWP_TYPE_MASK = ((1UL << ms->__SWP_TYPE_BITS) - 1);
+			ms->__SWP_OFFSET_SHIFT = 12;
+			ms->__SWP_OFFSET_BITS = 50;
+			ms->__SWP_OFFSET_MASK = ((1UL << ms->__SWP_OFFSET_BITS) - 1);
+			ms->PTE_PROT_NONE = 0; /* unused */
+			ms->PTE_FILE = 0;  /* unused */
+		} else if (THIS_KERNEL_VERSION >= LINUX(5,19,0)) {
 			ms->__SWP_TYPE_BITS = 5;
 			ms->__SWP_TYPE_SHIFT = 3;
 			ms->__SWP_TYPE_MASK = ((1UL << ms->__SWP_TYPE_BITS) - 1);
@@ -776,7 +787,9 @@ arm64_init(int when)
 		 */
 		if(!machdep->machspec->CONFIG_ARM64_KERNELPACMASK)
 			arm64_recalc_KERNELPACMASK();
+		break;
 
+	case POST_VM:
 		arm64_irq_stack_init();
 		arm64_overflow_stack_init();
 		arm64_stackframe_init();
@@ -3015,6 +3028,9 @@ static char *arm64_exception_functions[] = {
         "do_el0_irq_bp_hardening",
         "do_sp_pc_abort",
         "handle_bad_stack",
+        "el1h_64_sync",
+        "el1h_64_irq",
+        "el1h_64_error",
         NULL
 };
 
@@ -3111,6 +3127,11 @@ arm64_print_stackframe_entry(struct bt_info *bt, int level, struct arm64_stackfr
 		fprintf(ofp, " [%s]", lm->mod_name);
 
 	fprintf(ofp, "\n");
+
+	if (STREQ(name, "el1h_64_irq") || STREQ(name, "el1h_64_sync")) {
+		if (arm64_is_kernel_exception_frame(bt, frame->sp))
+			arm64_print_exception_frame(bt, frame->sp, KERNEL_MODE, ofp);
+	}
 
 	if (bt->flags & BT_LINE_NUMBERS) {
 		get_line_number(branch_pc, buf, FALSE);
@@ -3764,11 +3785,13 @@ arm64_back_trace_cmd(struct bt_info *bt)
 			REG_SEQ(arm64_pt_regs, pc));
 		SET_BIT(extra_stacks_regs[extra_stacks_idx]->bitmap,
 			REG_SEQ(arm64_pt_regs, sp));
-		if (!bt->machdep ||
+		if (extra_stacks_regs[extra_stacks_idx]->ur.pc &&
+		    (bt->task != tt->panic_task) &&
+		    (!bt->machdep ||
 		     (extra_stacks_regs[extra_stacks_idx]->ur.sp !=
 		      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.sp &&
 		      extra_stacks_regs[extra_stacks_idx]->ur.pc !=
-		      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.pc)) {
+		      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.pc))) {
 			gdb_add_substack (extra_stacks_idx++);
 		}
 	}
@@ -3914,11 +3937,13 @@ arm64_back_trace_cmd_v2(struct bt_info *bt)
 			REG_SEQ(arm64_pt_regs, pc));
 		SET_BIT(extra_stacks_regs[extra_stacks_idx]->bitmap,
 			REG_SEQ(arm64_pt_regs, sp));
-		if (!bt->machdep ||
+		if (extra_stacks_regs[extra_stacks_idx]->ur.pc &&
+		    (bt->task != tt->panic_task) &&
+		    (!bt->machdep ||
 		     (extra_stacks_regs[extra_stacks_idx]->ur.sp !=
 		      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.sp &&
 		      extra_stacks_regs[extra_stacks_idx]->ur.pc !=
-		      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.pc)) {
+		      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.pc))) {
 			gdb_add_substack (extra_stacks_idx++);
 		}		
 	}
@@ -4221,6 +4246,46 @@ arm64_in_kdump_text_on_irq_stack(struct bt_info *bt)
 	return FALSE;
 }
 
+static void
+arm64_gdb_add_next_frame_substack(struct bt_info *bt, const struct arm64_stackframe *frame)
+{
+	struct machine_specific *ms = machdep->machspec;
+	struct user_regs_bitmap_struct *ur_ptr;
+	ulong next_fp, next_pc, next_sp;
+
+	if (!extra_stacks_regs[extra_stacks_idx]) {
+		extra_stacks_regs[extra_stacks_idx] = (struct user_regs_bitmap_struct *)
+			malloc(sizeof(struct user_regs_bitmap_struct));
+	}
+
+	memset(extra_stacks_regs[extra_stacks_idx], 0, sizeof(struct user_regs_bitmap_struct));
+	ur_ptr = extra_stacks_regs[extra_stacks_idx];
+
+	next_fp = GET_STACK_ULONG(frame->fp);
+	next_pc = GET_STACK_ULONG(frame->fp + 8);
+	next_sp = frame->fp + 16;
+
+	if (is_kernel_text(next_pc | ms->CONFIG_ARM64_KERNELPACMASK))
+		next_pc |= ms->CONFIG_ARM64_KERNELPACMASK;
+
+	ur_ptr->ur.pc = next_pc;
+	ur_ptr->ur.sp = next_sp;
+	ur_ptr->ur.regs[29] = next_fp;
+
+	SET_BIT(ur_ptr->bitmap, REG_SEQ(arm64_pt_regs, pc));
+	SET_BIT(ur_ptr->bitmap, REG_SEQ(arm64_pt_regs, sp));
+	SET_BIT(ur_ptr->bitmap, REG_SEQ(arm64_pt_regs, regs[0]) + 29);
+
+	if (ur_ptr->ur.pc &&
+	    (!bt->machdep ||
+	     (ur_ptr->ur.sp !=
+	      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.sp &&
+	      ur_ptr->ur.pc !=
+	      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.pc))) {
+		gdb_add_substack(extra_stacks_idx++);
+	}
+}
+
 static int 
 arm64_switch_stack(struct bt_info *bt, struct arm64_stackframe *frame, FILE *ofp)
 {
@@ -4252,8 +4317,11 @@ arm64_switch_stack(struct bt_info *bt, struct arm64_stackframe *frame, FILE *ofp
 	if (frame->fp == 0)
 		return USER_MODE;
 
-	if (!(machdep->flags & UNW_4_14))
+	if (!(machdep->flags & UNW_4_14)) {
 		arm64_print_exception_frame(bt, frame->sp, KERNEL_MODE, ofp);
+	} else {
+		arm64_gdb_add_next_frame_substack(bt, frame);
+	}
 
 	return KERNEL_MODE;
 }
@@ -4289,8 +4357,11 @@ arm64_switch_stack_from_overflow(struct bt_info *bt, struct arm64_stackframe *fr
 	if (frame->fp == 0)
 		return USER_MODE;
 
-	if (!(machdep->flags & UNW_4_14))
+	if (!(machdep->flags & UNW_4_14)) {
 		arm64_print_exception_frame(bt, frame->sp, KERNEL_MODE, ofp);
+	} else {
+		arm64_gdb_add_next_frame_substack(bt, frame);
+	}
 
 	return KERNEL_MODE;
 }
@@ -4538,6 +4609,9 @@ arm64_print_exception_frame(struct bt_info *bt, ulong pt_regs, int mode, FILE *o
 				(ulong)regs->orig_x0, (ulong)regs->syscallno);
 			fprintf(ofp, "  PSTATE: %08lx\n", (ulong)regs->pstate);
 		} else if (!(bt->flags & BT_EFRAME_SEARCH)) {
+			struct user_regs_bitmap_struct *ur_ptr;
+			int i;
+
 			if (!extra_stacks_regs[extra_stacks_idx]) {
 				extra_stacks_regs[extra_stacks_idx] =
 					(struct user_regs_bitmap_struct *)
@@ -4545,17 +4619,26 @@ arm64_print_exception_frame(struct bt_info *bt, ulong pt_regs, int mode, FILE *o
 			}
 			memset(extra_stacks_regs[extra_stacks_idx], 0,
 				sizeof(struct user_regs_bitmap_struct));
-			memcpy(&extra_stacks_regs[extra_stacks_idx]->ur, regs,
-				sizeof(struct arm64_pt_regs));
-			for (int i = 0; i < sizeof(struct arm64_pt_regs)/sizeof(long); i++)
-				SET_BIT(extra_stacks_regs[extra_stacks_idx]->bitmap, i);
-			if (!bt->machdep ||
-			     (extra_stacks_regs[extra_stacks_idx]->ur.sp !=
+
+			ur_ptr = extra_stacks_regs[extra_stacks_idx];
+
+			ur_ptr->ur.pc = regs->pc;
+			ur_ptr->ur.sp = regs->sp;
+			ur_ptr->ur.pstate = regs->pstate;
+			for (i = 0; i < 31; i++)
+				ur_ptr->ur.regs[i] = regs->regs[i];
+
+			for (i = 0; i < 34; i++)
+				SET_BIT(ur_ptr->bitmap, i);
+
+			if (ur_ptr->ur.pc &&
+			    (!bt->machdep ||
+			     (ur_ptr->ur.sp !=
 			      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.sp &&
-			      extra_stacks_regs[extra_stacks_idx]->ur.pc !=
-			      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.pc)) {
-				gdb_add_substack (extra_stacks_idx++);
-			}			
+			      ur_ptr->ur.pc !=
+			      ((struct user_regs_bitmap_struct *)(bt->machdep))->ur.pc))) {
+				gdb_add_substack(extra_stacks_idx++);
+			}
 		}
 	}
 

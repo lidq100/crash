@@ -49,7 +49,7 @@ static int match_file_string(char *, char *, char *);
 static ulong get_root_vfsmount(char *);
 static void check_live_arch_mismatch(void);
 static long get_inode_nrpages(ulong);
-static void dump_inode_page_cache_info(ulong);
+static void dump_inode_page_cache_info(ulong, void *callback);
 
 #define DENTRY_CACHE (20)
 #define INODE_CACHE  (20)
@@ -2240,8 +2240,38 @@ get_inode_nrpages(ulong i_mapping)
 	return nrpages;
 }
 
+/* Used to collect the numa information for an inode */
+static ulong *numa_node;
+
 static void
-dump_inode_page_cache_info(ulong inode)
+print_inode_summary_info(void)
+{
+       int i;
+
+       fprintf(fp, "     NODE           PAGES\n");
+       for (i = 0; i < vt->numnodes; i++)
+               fprintf(fp, "     %2d          %8ld\n", i, numa_node[i]);
+}
+
+static int
+summary_inode_page(ulong page)
+{
+       int node;
+
+       if (!is_page_ptr(page, NULL))
+               error(FATAL, "Invalid inode page(0x%lx)\n", page);
+
+       node = page_to_nid(page);
+       if (node < 0 || node >= vt->numnodes)
+               error(FATAL, "Invalid node(%d) for page(0x%lx)\n", node, page);
+
+       numa_node[node] += 1 << folio_order(page);
+
+       return 1;
+}
+
+static void
+dump_inode_page_cache_info(ulong inode, void *callback)
 {
 	char *inode_buf;
 	ulong i_mapping, nrpages, root_rnode, xarray, count;
@@ -2284,12 +2314,12 @@ dump_inode_page_cache_info(ulong inode)
 		root_rnode = i_mapping + OFFSET(address_space_page_tree);
 
 	lp.index = 0;
-	lp.value = (void *)&dump_inode_page;
+	lp.value = callback;
 
 	if (root_rnode)
 		count = do_radix_tree(root_rnode, RADIX_TREE_DUMP_CB, &lp);
 	else if (xarray)
-		count = do_xarray(xarray, XARRAY_DUMP_CB, &lp);
+		count = do_xarray(xarray, XARRAY_DUMP_CB | XARRAY_TYPE_PAGE_CACHE, &lp);
 
 	if (count != nrpages)
 		error(INFO, "%s page count: %ld  nrpages: %ld\n",
@@ -2324,7 +2354,7 @@ cmd_files(void)
         ref = NULL;
         refarg = NULL;
 
-        while ((c = getopt(argcnt, args, "d:R:p:c")) != EOF) {
+        while ((c = getopt(argcnt, args, "d:n:R:p:c")) != EOF) {
                 switch(c)
 		{
 		case 'R':
@@ -2343,11 +2373,31 @@ cmd_files(void)
 			display_dentry_info(value);
 			return;
 
+                case 'n':
+                       if (VALID_MEMBER(address_space_page_tree) &&
+                           VALID_MEMBER(inode_i_mapping)) {
+                               value = htol(optarg, FAULT_ON_ERROR, NULL);
+
+                               /* Allocate the array for this inode */
+                               numa_node = (ulong *)GETBUF(sizeof(ulong) * vt->numnodes);
+                               BZERO(numa_node, sizeof(ulong) * vt->numnodes);
+
+                               dump_inode_page_cache_info(value, (void *)&summary_inode_page);
+
+                               /* Print out the NUMA node information for this inode */
+                               print_inode_summary_info();
+
+                               FREEBUF(numa_node);
+                               numa_node = NULL;
+                       } else
+                               option_not_supported('n');
+                       return;
+
 		case 'p':
 			if (VALID_MEMBER(address_space_page_tree) &&
 			    VALID_MEMBER(inode_i_mapping)) {
 				value = htol(optarg, FAULT_ON_ERROR, NULL);
-				dump_inode_page_cache_info(value);
+				dump_inode_page_cache_info(value, (void *)&dump_inode_page);
 			} else
 				option_not_supported('p');
 			return;
@@ -4217,12 +4267,46 @@ struct do_xarray_info {
 	ulong maxcount;
 	ulong count;
 	void *data;
+	ulong (*update_count)(ulong);
 };
+
+static ulong
+folio_update_count(ulong slot)
+{
+	return 1 << folio_order(slot);
+}
+
+static uint folio_xarray_update_off(ulong node, uint height, char *path, ulong index,
+       ulong slot, uint off, ulong shift, struct xarray_ops *ops, bool *should_continue)
+{
+	uint order;
+
+       *should_continue = false;
+
+	if (height == 1) {
+	       order = folio_order(slot) % XA_CHUNK_SHIFT;
+	       return 1 << order;
+	}
+
+	/* height > 1 */
+	if ((slot & XARRAY_TAG_MASK) == 0) {
+	       ops->entry(node, slot, path, index | off, ops->private);
+	       *should_continue = true;
+	       order = folio_order(slot) % XA_CHUNK_SHIFT;
+	       return 1 << order;
+	}
+	return 1;
+}
+
 static void do_xarray_count(ulong node, ulong slot, const char *path,
 				ulong index, void *private)
 {
 	struct do_xarray_info *info = private;
-	info->count++;
+
+	if (info->update_count)
+		info->count += info->update_count(slot);
+	else
+		info->count++;
 }
 static void do_xarray_search(ulong node, ulong slot, const char *path,
 				 ulong index, void *private)
@@ -4239,8 +4323,9 @@ static void do_xarray_dump(ulong node, ulong slot, const char *path,
 			       ulong index, void *private)
 {
 	struct do_xarray_info *info = private;
+
 	fprintf(fp, "[%ld] %lx\n", index, slot);
-	info->count++;
+	do_xarray_count(node, slot, path, index, private);
 }
 static void do_xarray_gather(ulong node, ulong slot, const char *path,
 				 ulong index, void *private)
@@ -4274,7 +4359,8 @@ static void do_xarray_dump_cb(ulong node, ulong slot, const char *path,
 		      "operation failed: entry: %ld  item: %lx\n",
 		      info->count, slot);
 	}
-	info->count++;
+
+	do_xarray_count(node, slot, path, index, private);
 }
 
 /*
@@ -4318,7 +4404,12 @@ do_xarray(ulong root, int flag, struct list_pair *xp)
 		.private	= &info,
 	};
 
-	switch (flag)
+	if (flag & XARRAY_TYPE_PAGE_CACHE) {
+		info.update_count = folio_update_count;
+		ops.update_off = folio_xarray_update_off;
+	}
+
+	switch (flag & 0x7)
 	{
 	case XARRAY_COUNT:
 		ops.entry = do_xarray_count;

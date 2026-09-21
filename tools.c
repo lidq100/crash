@@ -4728,7 +4728,7 @@ error_height:
 	return -1;
 }
 
-static ulong XA_CHUNK_SHIFT = UNINITIALIZED;
+ulong XA_CHUNK_SHIFT = UNINITIALIZED;
 static ulong XA_CHUNK_SIZE = UNINITIALIZED;
 static ulong XA_CHUNK_MASK = UNINITIALIZED;
 
@@ -4737,20 +4737,31 @@ do_xarray_iter(ulong node, uint height, char *path,
 	       ulong index, struct xarray_ops *ops)
 {
 	uint off;
+	uint update_off;
+	bool should_continue;
 
 	if (!hq_enter(node))
 		error(FATAL,
 			"\nduplicate tree node: %lx\n", node);
 
-	for (off = 0; off < XA_CHUNK_SIZE; off++) {
+	for (off = 0; off < XA_CHUNK_SIZE; off += update_off) {
 		ulong slot;
 		ulong shift = (height - 1) * XA_CHUNK_SHIFT;
+
+		update_off = 1;
 
 		readmem(node + OFFSET(xa_node_slots) +
 			sizeof(void *) * off, KVADDR, &slot, sizeof(void *),
 			"xa_node.slots[off]", FAULT_ON_ERROR);
 		if (!slot)
 			continue;
+
+		if (ops->update_off) {
+			update_off = ops->update_off(node, height, path, index,
+				       slot, off, shift, ops, &should_continue);
+			if (should_continue)
+				continue;
+		}
 
 		if ((slot & XARRAY_TAG_MASK) == XARRAY_TAG_INTERNAL)
 			slot &= ~XARRAY_TAG_INTERNAL;
@@ -5698,7 +5709,7 @@ ll_power(long long base, long long exp)
 #define B32K (4)
 
 #define SHARED_BUF_SIZES  (B32K+1)
-#define MAX_MALLOC_BUFS   (2000)
+int MAX_MALLOC_BUFS  = 3072; /* can be changed from command line args */
 #define MAX_CACHE_SIZE    (KILOBYTES(32))
 
 struct shared_bufs {
@@ -5723,7 +5734,7 @@ struct shared_bufs {
         long buf_8K_ovf;
         long buf_32K_ovf;
 	int buf_inuse[SHARED_BUF_SIZES];
-	char *malloc_bp[MAX_MALLOC_BUFS];
+	char **malloc_bp;
 	long smallest;
 	long largest;
 	long embedded;
@@ -5744,6 +5755,7 @@ buf_init(void)
 
 	bp->smallest = 0x7fffffff; 
 	bp->total = 0.0;
+	bp->malloc_bp = (char**) calloc(MAX_MALLOC_BUFS * sizeof(char*), 1);
 
 #ifdef VALGRIND
 	VALGRIND_MAKE_MEM_NOACCESS(&bp->buf_1K, sizeof(bp->buf_1K));
@@ -6130,7 +6142,9 @@ getbuf(long reqsize)
 	dump_shared_bufs();
 	
 	return ((char *)(long)
-		error(FATAL, "cannot allocate any more memory!\n"));
+		error(FATAL, "cannot allocate any more memory!\n"
+				"try increasing --max-malloc-bufs (current  value : %d)\n",
+				MAX_MALLOC_BUFS));
 }
 
 /*

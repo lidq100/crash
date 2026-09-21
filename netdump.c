@@ -50,6 +50,7 @@ static int proc_kcore_init_64(FILE *, int);
 static char *get_regs_from_note(char *, ulong *, ulong *);
 static void kdump_get_osrelease(void);
 static char *vmcoreinfo_read_string(const char *);
+static void kdump_get_build_id(void);
 
 
 #define ELFSTORE 1
@@ -476,6 +477,10 @@ is_netdump(char *file, ulong source_query)
 		pc->flags |= KDUMP;
 		get_log_from_vmcoreinfo(file);
 	}
+
+	if ((source_query == KDUMP_LOCAL) &&
+	    (pc->flags2 & GET_BUILD_ID))
+		kdump_get_build_id();
 
 	return nd->header_size;
 
@@ -1972,8 +1977,9 @@ vmcoreinfo_read_string(const char *key)
 		size_vmcoreinfo = 0;
 	}
 
-	if (!vmcoreinfo)
-		return NULL;
+	if (!vmcoreinfo) {
+		return vmcoreinfo_read_from_memory(key);
+	}
 
 	/* the '+ 1' is the equal sign */
 	for (i = 0; i < (int)(size_vmcoreinfo - key_length + 1); i++) {
@@ -4658,7 +4664,12 @@ proc_kcore_init_32(FILE *fp, int kcore_fd)
 		clean_exit(1);
 	}
 
-	BCOPY(&eheader[0], &pkd->elf_header[0], pkd->header_size);	
+	if (read(fd, pkd->elf_header, pkd->header_size) != pkd->header_size) {
+		sprintf(buf, "/proc/kcore: read");
+		perror(buf);
+		goto bailout;
+	}
+
 	pkd->notes32 = (Elf32_Phdr *)&pkd->elf_header[elf32->e_phoff];
 	pkd->load32 = pkd->notes32 + 1;
 	pkd->flags |= KCORE_ELF32;
@@ -4732,7 +4743,12 @@ proc_kcore_init_64(FILE *fp, int kcore_fd)
 		clean_exit(1);
 	}
 
-	BCOPY(&eheader[0], &pkd->elf_header[0], pkd->header_size);	
+	if (read(fd, pkd->elf_header, pkd->header_size) != pkd->header_size) {
+		sprintf(buf, "/proc/kcore: read");
+		perror(buf);
+		goto bailout;
+	}
+
 	pkd->notes64 = (Elf64_Phdr *)&pkd->elf_header[elf64->e_phoff];
 	pkd->load64 = pkd->notes64 + 1;
 	pkd->flags |= KCORE_ELF64;
@@ -4994,6 +5010,18 @@ kdump_get_osrelease(void)
 		free(string);
 	} else 
 		pc->flags2 &= ~GET_OSRELEASE;
+}
+
+static void
+kdump_get_build_id(void)
+{
+	char *string;
+
+	if ((string = vmcoreinfo_read_string("BUILD-ID"))) {
+		fprintf(fp, "%s\n", string);
+		free(string);
+	} else
+		pc->flags2 &= ~GET_BUILD_ID;
 }
 
 void
