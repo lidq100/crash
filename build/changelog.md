@@ -53,3 +53,22 @@
          -d: set debug level. Default 0, and set to 1 to output more logs.
          -h: show this help info.
 ```
+
+## v1.3 2025.10.22 build on ubuntu22 (glibc v2.35), fix for BFD(no support zstd):
+```
+error info:
+warning: BFD: /home/lidq/3_ramdump_bin/bug_fix/t7c_no_zstd/vmlinux: section .debug_aranges is compressed with zstd, but BFD is not built with zstd support
+"/home/lidq/3_ramdump_bin/bug_fix/t7c_no_zstd/./vmlinux": not in executable format: file format not recognized
+
+fix :
+sudo apt update && sudo apt install -y build-essential pkg-config libzstd-dev libzstd1 liblzma-dev zlib1g-dev
+```
+
+## v1.4 2026.09.22  update crash v9.0.3, fix irq -s, kmem -i error
+```
+aml: add aml_patch apply script and hook into mk.sh
+    aml_patch list:
+    - aml_patch/0001-support-irq-s-for-aarch32.patch
+    - aml_patch/0002-fix-kmem-i-s-error.patch
+```
+

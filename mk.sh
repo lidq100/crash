@@ -51,7 +51,7 @@
 # Manually apply the a.patch to the corresponding files in gdb-16.2.patch
 #=================================================================
 
-LAST_VER="v1.3"
+LAST_VER="v1.4"
 
 show_help() {
 	echo ""
@@ -65,6 +65,7 @@ show_help() {
 	echo "  v1.1: 2025.06.12 build on ubuntu22, fix for glibc float error."
 	echo "  v1.2: 2025.06.20 add tools uncompress. with parameter --umcompress."
 	echo "  v1.3: 2025.10.20 update src code from crash master. crash v9.0.0"
+	echo "  v1.4: 2026.09.22 update crash v9.0.3, fix irq -s, kmem -i error."
 	echo ""
 	exit 1
 }
