@@ -1,0 +1,281 @@
+From 59d64a2127a70344ed48694130e5d3593f29a548 Mon Sep 17 00:00:00 2001
+From: tuan zhang <tuan.zhang@amlogic.com>
+Date: Mon, 21 Sep 2026 15:54:36 +0800
+Subject: [PATCH 1/2] support irq -s for aarch32
+
+Signed-off-by: tuan.zhang <tuan.zhang@amlogic.com>
+---
+ defs.h   |  26 ++++++++
+ kernel.c | 193 ++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 218 insertions(+), 1 deletion(-)
+
+diff --git a/defs.h b/defs.h
+index 51eaeed..2aa4220 100644
+--- a/defs.h
++++ b/defs.h
+@@ -2300,9 +2300,35 @@ struct offset_table {                    /* stash of commonly-used offsets */
+ 	long page_compound_info;
+ 	long kmem_cache_per_node;
+ 	long kmem_cache_per_node_ptrs_node;
++#ifdef ARM
++	/* irq_domain members */
++	long irq_domain_link;
++	long irq_domain_name;
++	long irq_domain_ops;
++	long irq_domain_host_data;
++	long irq_domain_flags;
++	long irq_domain_mapcount;
++	long irq_domain_fwnode;
++	long irq_domain_bus_token;
++	long irq_domain_gc;
++	long irq_domain_parent;
++	long irq_domain_hwirq_max;
++	long irq_domain_revmap_size;
++	long irq_domain_revmap_tree;
++	long irq_domain_revmap_mutex;
++	long irq_domain_revmap;
++	long irq_domain_size;
++	long irq_desc_kstat_irqs;
++	long irq_desc_action;
++	long irq_chip_name;
++#endif
+ };
+ 
+ struct size_table {         /* stash of commonly-used sizes */
++#ifdef ARM     //for irq
++	long irq_domain;
++	long irq_desc;
++#endif
+ 	long page;
+ 	long free_area_struct;
+ 	long zone_struct;
+diff --git a/kernel.c b/kernel.c
+index 6efd625..f49d42c 100644
+--- a/kernel.c
++++ b/kernel.c
+@@ -29,6 +29,14 @@
+ #endif
+ #include "bfd.h"
+ 
++#ifdef ARM
++#ifndef NR_IRQS
++#define NR_IRQS 1024
++#endif
++
++static void show_interrupts_via_domains(ulong *cpus);
++#endif
++
+ #define KERNEL_VERSION_MIN '2'
+ #define KERNEL_VERSION_MAX '7'  /* latest linux mainline kernel major number */
+ 
+@@ -899,6 +907,34 @@ kernel_init()
+ 		source_tree_init();
+ 
+ 	kt->flags &= ~PRE_KERNEL_INIT;
++#ifdef ARM
++	/* irq_domain support for domain-based irq enumeration */
++	MEMBER_OFFSET_INIT(irq_domain_link, "irq_domain", "link");
++	MEMBER_OFFSET_INIT(irq_domain_name, "irq_domain", "name");
++	MEMBER_OFFSET_INIT(irq_domain_ops, "irq_domain", "ops");
++	MEMBER_OFFSET_INIT(irq_domain_host_data, "irq_domain", "host_data");
++	MEMBER_OFFSET_INIT(irq_domain_flags, "irq_domain", "flags");
++	MEMBER_OFFSET_INIT(irq_domain_mapcount, "irq_domain", "mapcount");
++	MEMBER_OFFSET_INIT(irq_domain_fwnode, "irq_domain", "fwnode");
++	MEMBER_OFFSET_INIT(irq_domain_bus_token, "irq_domain", "bus_token");
++	MEMBER_OFFSET_INIT(irq_domain_gc, "irq_domain", "gc");
++	MEMBER_OFFSET_INIT(irq_domain_parent, "irq_domain", "parent");
++	MEMBER_OFFSET_INIT(irq_domain_hwirq_max, "irq_domain", "hwirq_max");
++	MEMBER_OFFSET_INIT(irq_domain_revmap_size, "irq_domain", "revmap_size");
++	MEMBER_OFFSET_INIT(irq_domain_revmap_tree, "irq_domain", "revmap_tree");
++	MEMBER_OFFSET_INIT(irq_domain_revmap_mutex, "irq_domain", "revmap_mutex");
++	MEMBER_OFFSET_INIT(irq_domain_revmap, "irq_domain", "revmap");
++	STRUCT_SIZE_INIT(irq_domain, "irq_domain");
++
++	MEMBER_OFFSET_INIT(irq_desc_action, "irq_desc", "action");
++	MEMBER_OFFSET_INIT(irqaction_name, "irqaction", "name");
++	MEMBER_OFFSET_INIT(irq_data_chip, "irq_data", "chip");
++	MEMBER_OFFSET_INIT(irq_chip_name, "irq_chip", "name");
++	MEMBER_OFFSET_INIT(irq_data_irq, "irq_data", "irq");
++	MEMBER_OFFSET_INIT(irq_desc_kstat_irqs, "irq_desc", "kstat_irqs");
++	MEMBER_OFFSET_INIT(irq_desc_irq_data, "irq_desc", "irq_data");
++	STRUCT_SIZE_INIT(irq_desc, "irq_desc");
++#endif
+ }
+ 
+ /*
+@@ -6812,9 +6848,12 @@ cmd_irq(void)
+ 		}
+ 		fprintf(fp, "\n");
+ 
++#ifdef ARM
++		show_interrupts_via_domains(cpus);
++#else
+ 		for (i = 0; i < nr_irqs; i++)
+ 			machdep->show_interrupts(i, cpus);
+-
++#endif
+ 		if (choose_cpu)
+ 			FREEBUF(cpus);
+ 		return;
+@@ -7592,6 +7631,158 @@ generic_get_irq_affinity(int irq)
+ 	FREEBUF(affinity);
+ }
+ 
++#ifdef ARM
++static ulong get_per_cpu_offset(int cpu)
++{
++	ulong offset;
++	readmem(symbol_value("__per_cpu_offset") + cpu * sizeof(ulong), KVADDR,
++		&offset, sizeof(ulong), "__per_cpu_offset", FAULT_ON_ERROR);
++
++	return offset;
++}
++
++/*
++ *  Enumerate all interrupts via irq_domain_list, traversing each domain's
++ *  revmap (linear or radix tree) to discover all mapped virqs.
++ */
++static void show_interrupts_via_domains(ulong *cpus)
++{
++	ulong domain_addr, first_domain_addr, name_addr;
++	ulong hwirq_max, revmap_size;
++	ulong revmap_array_addr;
++	ulong irq_data_ptr, irq_desc_addr;
++	ulong kstat_base, action_addr, chip_name_addr;
++	char buf[BUFSIZE], action_name[64], chip_name[64];
++	int i, cpu, virq;
++	int ncpus = 4;
++	int irq_count = 0;
++	char domain_name[128];
++	int first_iter = 1;
++
++	struct irq_info {
++		int virq;
++		unsigned int counts[4];
++		char chip_name[64];
++		char action_name[64];
++	} *irq_list = NULL;
++	int max_irqs = 512;
++
++	irq_list = calloc(max_irqs, sizeof(struct irq_info));
++	if (!irq_list) {
++		error(FATAL, "cannot allocate irq_info array\n");
++		return;
++	}
++
++	readmem(symbol_value("irq_domain_list"), KVADDR, &domain_addr,
++		sizeof(ulong), "irq_domain_list", FAULT_ON_ERROR);
++
++	while (domain_addr && is_kvaddr(domain_addr)) {
++		if (first_iter) {
++			first_domain_addr = domain_addr;
++			first_iter = 0;
++		}
++
++		domain_addr -= OFFSET(irq_domain_link);
++		readmem(domain_addr + OFFSET(irq_domain_revmap_size), KVADDR, &revmap_size,
++			sizeof(ulong), "irq_domain revmap_size", FAULT_ON_ERROR);
++
++		revmap_array_addr = domain_addr + SIZE(irq_domain);
++		for (i = 0; i < revmap_size; i++) {
++			readmem(revmap_array_addr + i * sizeof(ulong), KVADDR, &irq_data_ptr,
++				sizeof(ulong), "irq_domain revmap[] entry", FAULT_ON_ERROR);
++
++			if (!irq_data_ptr || !is_kvaddr(irq_data_ptr))
++				continue;
++
++			readmem(irq_data_ptr + OFFSET(irq_data_irq), KVADDR, &virq,
++				sizeof(int), "irq_data.irq", FAULT_ON_ERROR);
++
++			if (virq <= 0)
++				continue;
++
++			irq_desc_addr = irq_data_ptr - OFFSET(irq_desc_irq_data);
++
++			action_name[0] = '\0';
++			chip_name[0] = '\0';
++
++			readmem(irq_desc_addr + OFFSET(irq_desc_action), KVADDR, &action_addr,
++				sizeof(ulong), "irq_desc.action", FAULT_ON_ERROR);
++			if (action_addr && is_kvaddr(action_addr)) {
++				ulong action_name_addr;
++				readmem(action_addr + OFFSET(irqaction_name), KVADDR, &action_name_addr,
++					sizeof(ulong), "irqaction.name", FAULT_ON_ERROR);
++				if (action_name_addr && is_kvaddr(action_name_addr)) {
++					read_string(action_name_addr, action_name, sizeof(action_name)-1);
++				}
++			}
++
++			if (action_name[0] == '\0')
++				continue;
++
++			ulong chip_addr;
++			readmem(irq_data_ptr + OFFSET(irq_data_chip), KVADDR, &chip_addr,
++				sizeof(ulong), "irq_data.chip", FAULT_ON_ERROR);
++			if (chip_addr && is_kvaddr(chip_addr)) {
++				readmem(chip_addr + OFFSET(irq_chip_name), KVADDR, &chip_name_addr,
++					sizeof(ulong), "irq_chip.name", FAULT_ON_ERROR);
++				if (chip_name_addr && is_kvaddr(chip_name_addr)) {
++					read_string(chip_name_addr, chip_name, sizeof(chip_name)-1);
++				}
++			}
++
++			readmem(irq_desc_addr + OFFSET(irq_desc_kstat_irqs), KVADDR, &kstat_base,
++				sizeof(ulong), "irq_desc.kstat_irqs", FAULT_ON_ERROR);
++
++			if (!kstat_base || !is_kvaddr(kstat_base))
++				continue;
++
++			if (irq_count < max_irqs) {
++				irq_list[irq_count].virq = virq;
++				strncpy(irq_list[irq_count].chip_name, chip_name, sizeof(chip_name)-1);
++				strncpy(irq_list[irq_count].action_name, action_name, sizeof(action_name)-1);
++
++				for (cpu = 0; cpu < ncpus; cpu++) {
++					unsigned int count = 0;
++					ulong pcpu_off = get_per_cpu_offset(cpu);
++					ulong kstat_cpu_addr = kstat_base + pcpu_off;
++					readmem(kstat_cpu_addr, KVADDR, &count, sizeof(unsigned int),
++						"per-CPU kstat", FAULT_ON_ERROR);
++					irq_list[irq_count].counts[cpu] = count;
++				}
++				irq_count++;
++			}
++		}
++
++		readmem(domain_addr + OFFSET(irq_domain_link), KVADDR, &domain_addr,
++			sizeof(ulong), "irq_domain link.next", FAULT_ON_ERROR);
++
++		if (domain_addr == first_domain_addr)
++			break;
++	}
++
++	for (i = 0; i < irq_count - 1; i++) {
++		int j;
++		for (j = 0; j < irq_count - 1 - i; j++) {
++			if (irq_list[j].virq > irq_list[j+1].virq) {
++				struct irq_info tmp = irq_list[j];
++				irq_list[j] = irq_list[j+1];
++				irq_list[j+1] = tmp;
++			}
++		}
++	}
++
++	for (i = 0; i < irq_count; i++) {
++		fprintf(fp, "%4d:", irq_list[i].virq);
++		for (cpu = 0; cpu < ncpus; cpu++) {
++			fprintf(fp, " %10u", irq_list[i].counts[cpu]);
++		}
++		fprintf(fp, "    %s %s\n", irq_list[i].chip_name, irq_list[i].action_name);
++	}
++
++	free(irq_list);
++}
++#endif  //for irq
++
+ void
+ generic_show_interrupts(int irq, ulong *cpus)
+ {
+-- 
+2.43.0
+

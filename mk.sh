@@ -95,6 +95,13 @@ if [ $# -eq 0 ]; then
     show_help
 fi
 
+# Apply AML patches before building.
+# Idempotent: patches already applied will be skipped.
+if ! bash ./aml_patch/apply_patchs.sh; then
+	echo "ERROR: failed to apply AML patches, abort build."
+	exit 1
+fi
+
 for arg in "$@"; do
 	case $arg in
 		32)

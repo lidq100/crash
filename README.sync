@@ -1,0 +1,279 @@
+可以精简成一个纯操作版，重点标明**当前分支**、**同步点**和**提交信息**。
+
+# README.sync
+
+## 1. Branches
+
+```text
+upstream/crash.git
+       ↓
+     master
+       ↓
+      aml
+       ↓
+Amlogic modifications
+```
+
+* `master`：同步 `crash-utility/crash.git` 的 upstream master
+* `aml`：基于 `master`，包含 Amlogic 修改
+* `<SYNC_POINT>`：上一次同步的 `master` commit
+
+---
+
+## 2. First-time Setup
+
+### [Any branch] Add upstream remote
+
+```bash
+git remote add upstream https://github.com/crash-utility/crash.git
+git remote -v
+```
+
+Expected:
+
+```text
+origin    <your repository>
+upstream  https://github.com/crash-utility/crash.git
+```
+
+---
+
+## 3. Sync crash.git/master → Local master
+
+### [master] Fetch upstream
+
+```bash
+git checkout master
+git status
+
+git fetch upstream master
+```
+
+Check upstream updates:
+
+```bash
+git log --oneline master..upstream/master
+```
+
+### [master] Update local master
+
+```bash
+git merge --ff-only upstream/master
+```
+
+Verify:
+
+```bash
+git log --oneline -5
+```
+
+---
+
+## 4. Sync master → aml
+
+Assume the previous synchronization point is:
+
+```text
+abc1234
+Merge master updates since 1234567
+```
+
+The new `master` is:
+
+```text
+def5678
+upstream commit message
+```
+
+Therefore, this synchronization contains:
+
+```text
+abc1234 → def5678
+```
+
+### [Create temp branch] Start from previous sync point
+
+```bash
+git checkout -b temp_merge abc1234
+```
+
+### [temp_merge] Squash master updates
+
+```bash
+git merge --squash master
+```
+
+Check changes:
+
+```bash
+git status
+git diff --stat
+```
+
+### [temp_merge] Commit synchronized changes
+
+```bash
+git add .
+git commit -m "Merge master updates since abc1234"
+```
+
+Example:
+
+```text
+[ temp_merge 789abcd ] Merge master updates since abc1234
+```
+
+---
+
+## 5. Merge Sync Commit into aml
+
+### [aml]
+
+```bash
+git checkout aml
+git status
+
+git merge temp_merge
+```
+
+Example:
+
+```text
+abc1234 ── Amlogic changes ── Amlogic changes
+   \
+    789abcd  Merge master updates since abc1234
+                         ↓
+                        aml
+```
+
+If there are conflicts:
+
+```bash
+# Resolve conflicts first
+
+git status
+git add <resolved-files>
+git commit
+```
+
+---
+
+## 6. Delete Temporary Branch
+
+### [aml]
+
+```bash
+git branch -D temp_merge
+```
+
+---
+
+## 7. Record New Synchronization Point
+
+### [master]
+
+```bash
+git checkout master
+git rev-parse HEAD
+```
+
+Example:
+
+```text
+def5678
+```
+
+Record:
+
+```text
+Previous sync point:
+abc1234
+
+New sync point:
+def5678
+```
+
+The next synchronization starts from:
+
+```bash
+git checkout -b temp_merge def5678
+```
+
+---
+
+# Complete Example
+
+Assume:
+
+```text
+Previous sync point:
+abc1234
+
+Current upstream/master:
+def5678
+```
+
+### [master] Update from crash.git
+
+```bash
+git checkout master
+git status
+
+git fetch upstream master
+git merge --ff-only upstream/master
+```
+
+### [temp_merge] Create sync branch
+
+```bash
+git checkout -b temp_merge abc1234
+git merge --squash master
+```
+
+### [temp_merge] Create sync commit
+
+```bash
+git add .
+git commit -m "Merge master updates since abc1234"
+```
+
+Example:
+
+```text
+789abcd Merge master updates since abc1234
+```
+
+### [aml] Merge synchronized changes
+
+```bash
+git checkout aml
+git merge temp_merge
+```
+
+### [aml] Delete temporary branch
+
+```bash
+git branch -D temp_merge
+```
+
+### [master] Get new sync point
+
+```bash
+git checkout master
+git rev-parse HEAD
+```
+
+Result:
+
+```text
+def5678
+```
+
+Next time:
+
+```bash
+git checkout -b temp_merge def5678
+```
+
+---
+

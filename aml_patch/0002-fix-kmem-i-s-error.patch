@@ -1,0 +1,94 @@
+From 490b70220f5ecca3e57a394a44db97ba2840b799 Mon Sep 17 00:00:00 2001
+From: "dongqing.li" <dongqing.li@amlogic.com>
+Date: Tue, 22 Sep 2026 08:51:43 +0800
+Subject: [PATCH 2/2] ramdump: fix crash kmem -i error.
+
+Signed-off-by: dongqing.li <dongqing.li@amlogic.com>
+---
+ memory.c | 46 +++++++++++++++++++++++++++++++---------------
+ 1 file changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/memory.c b/memory.c
+index 3529c25..7891978 100644
+--- a/memory.c
++++ b/memory.c
+@@ -9007,7 +9007,8 @@ nr_blockdev_pages(void)
+ 	ulong nrpages;
+ 	char *block_device_buf, *inode_buf, *address_space_buf;
+ 
+-	if (!kernel_symbol_exists("all_bdevs"))
++	if (!kernel_symbol_exists("all_bdevs") ||
++	    INVALID_MEMBER(block_device_bd_inode))
+ 		return nr_blockdev_pages_v2();
+ 
+         ld = &list_data;
+@@ -9031,17 +9032,24 @@ nr_blockdev_pages(void)
+ 	 *      ret += bdev->bd_inode->i_mapping->nrpages;
+ 	 */
+ 	for (i = nrpages = 0; i < bdevcnt; i++) {
+-                readmem(ld->list_ptr[i], KVADDR, block_device_buf, 
+-			SIZE(block_device), "block_device buffer", 
+-			FAULT_ON_ERROR);
++		if (!readmem(ld->list_ptr[i], KVADDR, block_device_buf,
++			SIZE(block_device), "block_device buffer",
++			RETURN_ON_ERROR))
++			continue;
+ 		inode = ULONG(block_device_buf + OFFSET(block_device_bd_inode));
+-                readmem(inode, KVADDR, inode_buf, SIZE(inode), "inode buffer", 
+-			FAULT_ON_ERROR);
++		if (!inode)
++			continue;
++		if (!readmem(inode, KVADDR, inode_buf, SIZE(inode),
++			"inode buffer", RETURN_ON_ERROR))
++			continue;
+ 		address_space = ULONG(inode_buf + OFFSET(inode_i_mapping));
+-                readmem(address_space, KVADDR, address_space_buf, 
+-			SIZE(address_space), "address_space buffer", 
+-			FAULT_ON_ERROR);
+-		nrpages += ULONG(address_space_buf + 
++		if (!address_space)
++			continue;
++		if (!readmem(address_space, KVADDR, address_space_buf,
++			SIZE(address_space), "address_space buffer",
++			RETURN_ON_ERROR))
++			continue;
++		nrpages += ULONG(address_space_buf +
+ 			OFFSET(address_space_nrpages));
+ 	}
+ 
+@@ -9069,6 +9077,8 @@ nr_blockdev_pages_v2(void)
+ 	BZERO(ld, sizeof(struct list_data));
+ 
+ 	get_symbol_data("blockdev_superblock", sizeof(void *), &bd_sb);
++	if (!bd_sb)
++		return 0;
+ 	readmem(bd_sb + OFFSET(super_block_s_inodes), KVADDR, &ld->start,
+ 		sizeof(ulong), "blockdev_superblock.s_inodes", FAULT_ON_ERROR);
+ 
+@@ -9089,12 +9099,18 @@ nr_blockdev_pages_v2(void)
+ 	 *      ret += inode->i_mapping->nrpages;
+ 	 */
+ 	for (i = nrpages = 0; i < inode_count; i++) {
+-		readmem(ld->list_ptr[i], KVADDR, inode_buf, SIZE(inode), "inode buffer",
+-			FAULT_ON_ERROR);
++		if (!readmem(ld->list_ptr[i], KVADDR, inode_buf, SIZE(inode),
++			"inode buffer", RETURN_ON_ERROR))
++			continue;
+ 		address_space = ULONG(inode_buf + OFFSET(inode_i_mapping));
+-		readmem(address_space, KVADDR, address_space_buf, SIZE(address_space),
+-			"address_space buffer", FAULT_ON_ERROR);
+-		nrpages += ULONG(address_space_buf + OFFSET(address_space_nrpages));
++		if (!address_space)
++			continue;
++		if (!readmem(address_space, KVADDR, address_space_buf,
++			SIZE(address_space), "address_space buffer",
++			RETURN_ON_ERROR))
++			continue;
++		nrpages += ULONG(address_space_buf +
++			OFFSET(address_space_nrpages));
+ 	}
+ 
+ 	FREEBUF(ld->list_ptr);
+-- 
+2.43.0
+
